@@ -463,6 +463,17 @@ def test_config_parses_worldserver_conf(tmp_path) -> None:
     assert config.budget_usd == 52.95
 
 
+def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
+    # AzerothCore .conf convention quotes string values (the shipped .dist does);
+    # worldserver's ConfigMgr strips them, so the sidecar must too.
+    quoted = str(tmp_path / "quoted path.sqlite")
+    conf = write_conf(
+        tmp_path,
+        CONF_TEXT + f'PlayerbotClaude.SidecarDatabase = "{quoted}"\n',
+    )
+    assert app.SidecarConfig.load(conf).database_path == quoted
+
+
 def test_config_defaults_fail_closed(tmp_path) -> None:
     config = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\n"))
     assert config.enable is False

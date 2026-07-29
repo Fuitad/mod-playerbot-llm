@@ -45,7 +45,12 @@ class SidecarConfig:
             parser.read_file(handle)
 
         def option(name: str, fallback: str) -> str:
-            return parser.get(CONFIG_SECTION, CONFIG_PREFIX + name, fallback=fallback).strip()
+            value = parser.get(CONFIG_SECTION, CONFIG_PREFIX + name, fallback=fallback).strip()
+            # AzerothCore .conf convention quotes string values; worldserver's
+            # ConfigMgr strips the surrounding quotes, so the sidecar must too.
+            if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            return value
 
         return cls(
             enable=option("Enable", "0") == "1",
