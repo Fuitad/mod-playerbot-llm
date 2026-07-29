@@ -16,7 +16,7 @@ worldserver (C++)                     sidecar (Python)              Anthropic AP
 
 All game state lives on the world thread. The bridge worker thread never touches it.
 
-- `ClaudeChatScripts.cpp` runs only on the world thread. It observes `llm` prefixed whispers and party chat, quest, level, and rare loot milestones, and copies everything the sidecar needs into an immutable `ChatRequest` value snapshot (names, personality numbers, message text). No pointers cross the thread boundary.
+- `ClaudeChatScripts.cpp` runs only on the world thread. It observes whispers to bots (any whisper the playerbot command system does not recognize becomes conversation; the `llm ` prefix forces Claude even for command-shaped text), `llm` prefixed party chat, and quest, level, and rare loot milestones, then copies everything the sidecar needs into an immutable `ChatRequest` value snapshot (names, personality numbers, message text). Command recognition uses `ExternalEventHelper::IsChatCommand`, a non-executing mirror of mod-playerbots' own command resolution. No pointers cross the thread boundary.
 - `ClaudeChat.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
 - Delivery happens back on the world thread during world update. The bot GUID is re-resolved through `ObjectAccessor` immediately before speaking; if the bot is gone, offline, or the deadline (`ResponseDeadlineMs`) has passed, the response is dropped.
 - The model cannot act. Responses carry exactly one field, `message`, and the only thing the module ever does with it is have the bot say it.

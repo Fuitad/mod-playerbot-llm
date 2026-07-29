@@ -531,6 +531,24 @@ bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
 
 // --- Explicit chat capture ---
 
+std::optional<std::string> ClaudeChat::WhisperClaudeText(std::string const& message,
+                                                         bool isKnownPlayerbotCommand)
+{
+    // An explicit llm attempt always wins (even for command-shaped text), and a
+    // malformed one ("llm", "llm ") stays silent rather than leaking the word "llm".
+    if (message == "llm" || message.rfind("llm ", 0) == 0)
+        return ParseLlmWhisper(message);
+
+    if (isKnownPlayerbotCommand)
+        return std::nullopt;
+
+    // Whitespace-only text never costs tokens.
+    if (message.find_first_not_of(" \t") == std::string::npos)
+        return std::nullopt;
+
+    return message;
+}
+
 std::optional<std::string> ClaudeChat::ParseLlmWhisper(std::string const& message)
 {
     static constexpr char PREFIX[] = "llm ";

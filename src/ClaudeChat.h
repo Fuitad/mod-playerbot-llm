@@ -195,6 +195,12 @@ namespace ClaudeChat
 
     // --- Explicit chat capture ---
 
+    // Whisper routing: explicit "llm <text>" always goes to Claude (even command-shaped
+    // text); a malformed explicit attempt ("llm", "llm ") stays silent. Unprefixed text
+    // goes to Claude only when the playerbot command system does not recognize it, so
+    // commands keep costing nothing.
+    std::optional<std::string> WhisperClaudeText(std::string const& message, bool isKnownPlayerbotCommand);
+
     // "llm <message>" in a direct whisper: returns the message. Anything else, including
     // different case or leading whitespace, is not a capture.
     std::optional<std::string> ParseLlmWhisper(std::string const& message);

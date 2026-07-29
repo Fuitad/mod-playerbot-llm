@@ -559,6 +559,25 @@ TEST(ClaudeChatPolicyTest, WhisperLlmSyntaxIsExplicit)
     EXPECT_FALSE(ParseLlmWhisper("llmhello").has_value());
 }
 
+TEST(ClaudeChatPolicyTest, WhisperRoutingPrefersCommandsOverClaude)
+{
+    // Explicit llm prefix always routes to Claude, even for command-shaped text.
+    EXPECT_EQ(WhisperClaudeText("llm follow", true), std::optional<std::string>("follow"));
+    EXPECT_EQ(WhisperClaudeText("llm What do you enjoy doing?", false),
+              std::optional<std::string>("What do you enjoy doing?"));
+
+    // Unprefixed text goes to Claude only when it is NOT a known playerbot command.
+    EXPECT_EQ(WhisperClaudeText("What do you enjoy doing?", false),
+              std::optional<std::string>("What do you enjoy doing?"));
+    EXPECT_FALSE(WhisperClaudeText("follow", true).has_value());
+    EXPECT_FALSE(WhisperClaudeText("grind loot", true).has_value());
+
+    // Degenerate input never routes.
+    EXPECT_FALSE(WhisperClaudeText("", false).has_value());
+    EXPECT_FALSE(WhisperClaudeText("   ", false).has_value());
+    EXPECT_FALSE(WhisperClaudeText("llm ", false).has_value());
+}
+
 TEST(ClaudeChatPolicyTest, PartyLlmSyntaxNamesExactlyOneBot)
 {
     std::optional<std::pair<std::string, std::string>> const parsed =

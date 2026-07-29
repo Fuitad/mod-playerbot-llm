@@ -83,8 +83,8 @@ uv run playerbot-claude profile --config /path/to/mod_playerbot_claude.conf --bo
 
 ## Talking to bots
 
-- **Whisper** a bot: `llm <message>`. Anything without the `llm ` prefix is ignored by this module and handled by mod-playerbots as usual.
-- **Party chat**: `llm <bot-name> <message>` addresses one bot in your group.
+- **Whisper** a bot naturally: any whisper that mod-playerbots does not recognize as a bot command becomes Claude conversation. Known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. Prefixing with `llm ` forces Claude even for command-shaped text (`llm follow` asks the bot about following instead of ordering it to).
+- **Party chat**: `llm <bot-name> <message>` addresses one bot in your group. Party chat keeps the explicit prefix so ordinary group conversation never reaches the API.
 - **Milestones**: after a quest completion, a level gain, or a rare or epic loot drop, one deterministically selected group bot may react, at most once per `GroupCooldownSeconds` per group.
 
 Replies are one short line (at most 240 bytes), in the bot's fixed voice. If anything fails (budget, timeout, provider error, invalid output), the bot simply stays silent.
@@ -103,7 +103,7 @@ When a bot replies, the sidecar sends the following to the Anthropic API, and no
 - The player's `llm` message text, marked as untrusted
 - Up to 20 prior turns of that bot's stored conversation memory
 
-Never sent: account names, GUIDs, IP addresses, positions, inventories, combat state, the bridge token, or any chat that does not start with the `llm ` prefix. Chat observation is opt-in per message by construction: only text explicitly addressed to the module leaves the machine.
+Never sent: account names, GUIDs, IP addresses, positions, inventories, combat state, the bridge token, recognized bot commands, or any party/group chat without the `llm ` prefix. Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. If you want the stricter opt-in-per-message behavior back, whisper traffic is exactly the `llm `-prefixed subset.
 
 ## Budgeting
 

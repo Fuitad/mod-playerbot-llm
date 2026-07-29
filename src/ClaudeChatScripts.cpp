@@ -16,6 +16,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 
+#include "ExternalEventHelper.h"
 #include "PlayerbotAI.h"
 #include "Playerbots.h"
 
@@ -141,11 +142,20 @@ namespace
             if (!_bridge)
                 return;
 
-            std::optional<std::string> text = ParseLlmWhisper(message);
-            if (!text)
+            if (!IsRealPlayerActor(speaker) || !IsMachineBot(receiver))
                 return;
 
-            if (!IsRealPlayerActor(speaker) || !IsMachineBot(receiver))
+            // Known playerbot commands keep executing as commands (and cost nothing);
+            // only unrecognized whispers become Claude conversation.
+            bool isKnownCommand = false;
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(receiver))
+            {
+                ExternalEventHelper helper(botAI->GetAiObjectContext());
+                isKnownCommand = helper.IsChatCommand(message);
+            }
+
+            std::optional<std::string> text = WhisperClaudeText(message, isKnownCommand);
+            if (!text)
                 return;
 
             EnqueueConversation(ChatChannel::Whisper, receiver, speaker, BoundedText(std::move(*text)));
