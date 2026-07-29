@@ -1,0 +1,77 @@
+# Architecture
+
+Three processes, two trust boundaries, one direction of trust: the game never trusts the model, and the machine never trusts the network.
+
+```
+worldserver (C++)                     sidecar (Python)              Anthropic API
++---------------------+   loopback    +--------------------+   TLS  +-----------+
+| world thread        |     TCP       | asyncio server     | -----> | Claude    |
+|  ClaudeChatScripts  | <-----------> |  protocol.py       | <----- | Haiku 4.5 |
+| bridge worker       |  length-      |  claude.py         |        +-----------+
+|  ClaudeChat/Bridge  |  prefixed     |  storage.py (SQLite)|
++---------------------+  JSON frames  +--------------------+
+```
+
+## Worldserver side (C++)
+
+All game state lives on the world thread. The bridge worker thread never touches it.
+
+- `ClaudeChatScripts.cpp` runs only on the world thread. It observes `llm` prefixed whispers and party chat, quest, level, and rare loot milestones, and copies everything the sidecar needs into an immutable `ChatRequest` value snapshot (names, personality numbers, message text). No pointers cross the thread boundary.
+- `ClaudeChat.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
+- Delivery happens back on the world thread during world update. The bot GUID is re-resolved through `ObjectAccessor` immediately before speaking; if the bot is gone, offline, or the deadline (`ResponseDeadlineMs`) has passed, the response is dropped.
+- The model cannot act. Responses carry exactly one field, `message`, and the only thing the module ever does with it is have the bot say it.
+
+## Wire protocol (loopback TCP)
+
+- Frame: 4-byte network order length prefix, then a UTF-8 JSON payload. Payloads above 64 KiB are rejected.
+- Payloads are strict flat JSON objects: schema version 1, no nesting, no arrays, no booleans, no null, no floats, no duplicate keys, no trailing bytes. Both sides validate independently (`ClaudeChat.cpp` and `protocol.py`); the Python and C++ test suites share byte-for-byte fixtures so the implementations cannot drift.
+- Every payload carries the bridge token from `PLAYERBOT_CLAUDE_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
+- The socket binds to 127.0.0.1 only. The token exists to stop other local processes from injecting bot speech or draining budget.
+
+## Sidecar (Python)
+
+- `app.py` serializes the whole request pipeline behind one lock, so socket concurrency can never race the budget: record profile, count tokens, reserve, generate, settle, append memory.
+- `claude.py` is the only file that talks to Anthropic. The trusted personality profile is rendered into the system prompt; the player's text is delivered as a separate, explicitly untrusted user message. The model gets no tools. Structured output (`output_format`) restricts the reply to a single `message` field, and the adapter additionally enforces non-empty, single-line, at most 240 UTF-8 bytes.
+- The API key is read from `MOD_PLAYERBOT_CLAUDE_APIKEY` only and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
+
+## Budget ledger
+
+All money is integer nano-USD (1 USD = 1,000,000,000 nano), so documented examples reproduce exactly and no float rounding can leak into the ledger.
+
+Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at the default Haiku 4.5 rates. Tested examples (see `test_documented_cost_examples_are_exact`):
+
+- `2,500` input plus `80` output tokens: `2,900,000` nano, rendered `0.0029` USD
+- `4,095` input plus `96` output tokens: `4,575,000` nano, rendered `0.004575` USD
+
+The reserve-then-settle cycle, one SQLite WAL transaction per step:
+
+1. **Count.** The exact prompt is counted via the API. Input above 4,095 tokens is rejected before any money moves.
+2. **Reserve.** The maximum possible cost (counted input plus 96 output tokens) is charged. If spent plus outstanding plus this maximum would exceed `BudgetUsd`, no reservation is created and no provider call happens.
+3. **Submit.** The reservation is marked submitted before the provider call.
+4. **Settle.** After a successful reply, actual usage atomically replaces the maximum charge and an append-only usage row records tokens, price snapshot, and cost.
+
+A crash or provider failure at any point leaves the reservation charged at its maximum. Restart never forgets a reservation and never un-charges one, so the ceiling holds across crashes. The crash matrix is tested: before reservation, after reservation, after submission, before settlement.
+
+## Storage schema
+
+| Table | Contents | Bound |
+| --- | --- | --- |
+| `profiles` | Latest observed trusted profile per bot | One row per bot |
+| `conversation_turns` | Rolling dialogue memory | 20 turns per bot, older rows deleted |
+| `reservations` | Budget reservations with state `reserved`, `submitted`, or `settled` | Append and update |
+| `usage_log` | Actual usage with price snapshots | Append only |
+
+## Failure modes
+
+Every failure ends in bot silence. There is no fallback text anywhere in the pipeline.
+
+| Failure | Behavior |
+| --- | --- |
+| Sidecar not running | Bridge reconnects with backoff; pending requests expire |
+| Token mismatch | Connection closed; nothing processed |
+| Malformed frame or JSON | Connection closed |
+| Prompt above 4,095 tokens | Dropped before reservation |
+| Budget exhausted | Dropped before the provider call |
+| Provider timeout, auth, rate limit, or error | Dropped; reservation stays charged at maximum |
+| Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped |
+| Bot despawned or deadline passed | Response discarded at delivery |

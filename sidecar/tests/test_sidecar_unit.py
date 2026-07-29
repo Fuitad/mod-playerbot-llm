@@ -1,0 +1,773 @@
+"""Offline unit tests for the sidecar.
+
+Every byte fixture here mirrors the C++ contract tests in tests/ClaudeChatTest.cpp so
+the two implementations cannot drift silently. No test makes a real HTTP request.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import anthropic
+import httpx
+import pytest
+
+from playerbot_claude import app, claude, protocol, storage
+
+TEST_TOKEN = "0123456789abcdef0123456789abcdef"
+
+# Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
+CPP_REQUEST_FIXTURE = (
+    '{"schema_version":1,'
+    '"token":"0123456789abcdef0123456789abcdef",'
+    '"request_id":7,'
+    '"channel":"whisper",'
+    '"bot_guid":42,'
+    '"speaker_guid":9001,'
+    '"bot_name":"Botname",'
+    '"speaker_name":"Speaker",'
+    '"profile_version":1,'
+    '"crafting_affinity":65,'
+    '"exploration_affinity":91,'
+    '"sociability":82,'
+    '"voice":"earnest",'
+    '"event_kind":0,'
+    '"subject_id":0,'
+    '"occurrence":0,'
+    '"message":"What do you enjoy doing?"}'
+)
+
+
+def valid_request_dict() -> dict[str, object]:
+    return json.loads(CPP_REQUEST_FIXTURE)
+
+
+def parse(payload_dict: dict[str, object], token: str = TEST_TOKEN) -> protocol.ChatRequest:
+    return protocol.parse_request(json.dumps(payload_dict).encode(), token)
+
+
+def make_reader(*chunks: bytes) -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    for chunk in chunks:
+        reader.feed_data(chunk)
+    reader.feed_eof()
+    return reader
+
+
+# --- Framing ---
+
+
+def test_encode_frame_uses_network_order_prefix() -> None:
+    frame = protocol.encode_frame(b"abc")
+    assert frame == b"\x00\x00\x00\x03abc"
+
+
+def test_encode_frame_rejects_oversized_payload() -> None:
+    protocol.encode_frame(b"x" * protocol.MAX_FRAME_PAYLOAD_BYTES)
+    with pytest.raises(protocol.FrameError):
+        protocol.encode_frame(b"x" * (protocol.MAX_FRAME_PAYLOAD_BYTES + 1))
+
+
+async def test_read_frame_reassembles_fragmented_reads() -> None:
+    payload = b'{"hello":"world"}'
+    frame = protocol.encode_frame(payload)
+    # Split mid-header and mid-payload.
+    reader = make_reader(frame[:2], frame[2:7], frame[7:])
+    assert await protocol.read_frame(reader) == payload
+
+
+async def test_read_frame_handles_consecutive_frames() -> None:
+    first = protocol.encode_frame(b"one")
+    second = protocol.encode_frame(b"two")
+    reader = make_reader(first + second)
+    assert await protocol.read_frame(reader) == b"one"
+    assert await protocol.read_frame(reader) == b"two"
+
+
+async def test_read_frame_rejects_oversized_length() -> None:
+    oversized = (protocol.MAX_FRAME_PAYLOAD_BYTES + 1).to_bytes(4, "big") + b"x"
+    reader = make_reader(oversized)
+    with pytest.raises(protocol.FrameError):
+        await protocol.read_frame(reader)
+
+
+async def test_read_frame_rejects_truncated_stream() -> None:
+    frame = protocol.encode_frame(b"full payload")
+    reader = make_reader(frame[: len(frame) - 3])
+    with pytest.raises(protocol.FrameError):
+        await protocol.read_frame(reader)
+
+
+# --- Request parsing ---
+
+
+def test_accepts_exact_cpp_fixture() -> None:
+    request = protocol.parse_request(CPP_REQUEST_FIXTURE.encode(), TEST_TOKEN)
+    assert request.request_id == 7
+    assert request.channel == "whisper"
+    assert request.bot_guid == 42
+    assert request.speaker_guid == 9001
+    assert request.bot_name == "Botname"
+    assert request.crafting_affinity == 65
+    assert request.exploration_affinity == 91
+    assert request.sociability == 82
+    assert request.voice == "earnest"
+    assert request.event_kind == 0
+    assert request.message == "What do you enjoy doing?"
+
+
+def test_rejects_invalid_utf8_payload() -> None:
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_request(b'{"schema_version":1,"bad":"\xff"}', TEST_TOKEN)
+
+
+def test_rejects_non_object_payload() -> None:
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_request(b"[1,2,3]", TEST_TOKEN)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_request(b"not json", TEST_TOKEN)
+
+
+def test_rejects_wrong_schema_version() -> None:
+    payload = valid_request_dict()
+    payload["schema_version"] = 2
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+
+def test_rejects_missing_and_extra_fields() -> None:
+    missing = valid_request_dict()
+    del missing["message"]
+    with pytest.raises(protocol.ProtocolError):
+        parse(missing)
+
+    extra = valid_request_dict()
+    extra["action"] = "cast fireball"
+    with pytest.raises(protocol.ProtocolError):
+        parse(extra)
+
+
+def test_rejects_invalid_guids() -> None:
+    for field in ("bot_guid", "speaker_guid"):
+        payload = valid_request_dict()
+        payload[field] = 0
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+        payload[field] = 2**64
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+
+def test_rejects_out_of_bounds_profile() -> None:
+    for field in ("crafting_affinity", "exploration_affinity", "sociability"):
+        payload = valid_request_dict()
+        payload[field] = 101
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+        payload[field] = -1
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+    payload = valid_request_dict()
+    payload["profile_version"] = 2
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+    payload = valid_request_dict()
+    payload["voice"] = "sarcastic"
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+
+def test_rejects_unknown_event_kinds_and_channels() -> None:
+    payload = valid_request_dict()
+    payload["event_kind"] = 4
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+    payload = valid_request_dict()
+    payload["channel"] = "guild"
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+
+def test_rejects_oversized_or_empty_message() -> None:
+    payload = valid_request_dict()
+    payload["message"] = ""
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+    payload["message"] = "x" * (protocol.MAX_REQUEST_MESSAGE_BYTES + 1)
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+    # Multibyte characters count in bytes, exactly like the C++ bound.
+    payload["message"] = "é" * (protocol.MAX_REQUEST_MESSAGE_BYTES // 2 + 1)
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
+
+
+def test_wrong_token_rejected_without_leaking_expected_value() -> None:
+    payload = valid_request_dict()
+    payload["token"] = "z" * 32
+    with pytest.raises(protocol.TokenMismatchError) as excinfo:
+        parse(payload)
+
+    assert TEST_TOKEN not in str(excinfo.value)
+    assert TEST_TOKEN not in repr(excinfo.value)
+
+
+# --- Response encoding ---
+
+
+def test_response_payload_matches_cpp_accepted_shape() -> None:
+    payload = protocol.encode_response(7, "I enjoy fishing.", TEST_TOKEN)
+    # Byte-for-byte the shape the C++ ValidResponseRoundTrips fixture accepts.
+    assert payload == (
+        b'{"schema_version":1,"token":"0123456789abcdef0123456789abcdef",'
+        b'"request_id":7,"message":"I enjoy fishing."}'
+    )
+
+
+# --- Claude adapter (mocked HTTP transport; no real requests) ---
+
+
+def make_mock_client(handler) -> anthropic.Anthropic:
+    """Anthropic client whose HTTP layer is a local httpx.MockTransport."""
+
+    return anthropic.Anthropic(
+        api_key="test-key-never-used-for-real",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=0,
+    )
+
+
+def make_request_model(**overrides: object) -> protocol.ChatRequest:
+    data = valid_request_dict()
+    data.update(overrides)
+    return protocol.parse_request(json.dumps(data).encode(), TEST_TOKEN)
+
+
+def messages_response(message_text: str, usage: dict[str, int] | None = None) -> httpx.Response:
+    body = {
+        "id": "msg_test_01",
+        "type": "message",
+        "role": "assistant",
+        "model": claude.MODEL_ID,
+        "content": [{"type": "text", "text": json.dumps({"message": message_text})}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": usage
+        or {
+            "input_tokens": 2500,
+            "output_tokens": 80,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+    return httpx.Response(200, json=body)
+
+
+def test_sdk_pin_matches_contract() -> None:
+    # The offline contract tests below are written against this exact SDK version.
+    assert anthropic.__version__ == "0.120.2"
+
+
+def test_generate_reply_conditions_on_trusted_personality() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return messages_response("I do enjoy a good fishing spot.")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    reply, usage = adapter.generate_reply(make_request_model(), history=[])
+
+    assert reply == "I do enjoy a good fishing spot."
+    assert usage.input_tokens == 2500
+    assert usage.output_tokens == 80
+    assert usage.cache_creation_input_tokens == 0
+    assert usage.cache_read_input_tokens == 0
+
+    body = captured["body"]
+    assert captured["path"] == "/v1/messages"
+    assert body["model"] == "claude-haiku-4-5-20251001"
+    assert body["max_tokens"] == claude.MAX_OUTPUT_TOKENS == 96
+    assert "tools" not in body  # the model never receives tools
+
+    # Trusted personality lives in the system prompt.
+    system_text = body["system"]
+    assert "65" in system_text and "91" in system_text and "82" in system_text
+    assert "earnest" in system_text
+    assert "Botname" in system_text
+
+    # Player text stays a separate, explicitly untrusted user message.
+    user_message = body["messages"][-1]
+    assert user_message["role"] == "user"
+    assert "What do you enjoy doing?" in user_message["content"]
+    assert "What do you enjoy doing?" not in system_text
+
+    # The bridge token never reaches Anthropic.
+    assert TEST_TOKEN not in json.dumps(body)
+
+
+def test_generate_reply_includes_bounded_history() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return messages_response("Aye, as I said before.")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    history = [("user", "Hello there"), ("assistant", "Well met, Speaker.")]
+    adapter.generate_reply(make_request_model(), history=history)
+
+    roles = [m["role"] for m in captured["body"]["messages"]]
+    assert roles == ["user", "assistant", "user"]
+
+
+def test_count_input_tokens_uses_count_tokens_endpoint() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/messages/count_tokens"
+        return httpx.Response(200, json={"input_tokens": 1234})
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    assert adapter.count_input_tokens(make_request_model(), history=[]) == 1234
+
+
+def test_generate_reply_maps_provider_failures_to_bounded_errors() -> None:
+    def auth_error(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401, json={"type": "error", "error": {"type": "authentication_error", "message": "bad key"}}
+        )
+
+    def rate_limited(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}
+        )
+
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(auth_error))
+    with pytest.raises(claude.ClaudeAuthError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(rate_limited))
+    with pytest.raises(claude.ClaudeRateLimitError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(timeout))
+    with pytest.raises(claude.ClaudeTimeoutError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+
+def test_generate_reply_rejects_malformed_or_oversized_output() -> None:
+    def not_schema(request: httpx.Request) -> httpx.Response:
+        body = {
+            "id": "msg_test_02",
+            "type": "message",
+            "role": "assistant",
+            "model": claude.MODEL_ID,
+            "content": [{"type": "text", "text": "not json at all"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        return httpx.Response(200, json=body)
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(not_schema))
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+    def oversized(request: httpx.Request) -> httpx.Response:
+        return messages_response("a" * (protocol.MAX_RESPONSE_MESSAGE_BYTES + 1))
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(oversized))
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+    def multiline(request: httpx.Request) -> httpx.Response:
+        return messages_response("two\nlines")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(multiline))
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        adapter.generate_reply(make_request_model(), history=[])
+
+
+def test_adapter_ignores_global_anthropic_api_key(monkeypatch) -> None:
+    # The default client must only ever read MOD_PLAYERBOT_CLAUDE_APIKEY; a
+    # machine-wide ANTHROPIC_API_KEY must never be picked up implicitly.
+    monkeypatch.delenv("MOD_PLAYERBOT_CLAUDE_APIKEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-global-key")
+    assert claude.ClaudeAdapter()._client.api_key == ""
+
+    monkeypatch.setenv("MOD_PLAYERBOT_CLAUDE_APIKEY", "sk-module-key")
+    assert claude.ClaudeAdapter()._client.api_key == "sk-module-key"
+
+
+# --- App: configuration, doctor, and request processing ---
+
+
+CONF_TEXT = """[worldserver]
+
+PlayerbotClaude.Enable = 1
+PlayerbotClaude.BridgePort = 40123
+PlayerbotClaude.BudgetUsd = 52.95
+PlayerbotClaude.ResponseDeadlineMs = 10000
+PlayerbotClaude.QueueSize = 16
+PlayerbotClaude.GroupCooldownSeconds = 120
+"""
+
+
+def write_conf(tmp_path, text: str = CONF_TEXT) -> str:
+    conf = tmp_path / "mod_playerbot_claude.conf"
+    conf.write_text(text)
+    return str(conf)
+
+
+def test_config_parses_worldserver_conf(tmp_path) -> None:
+    config = app.SidecarConfig.load(write_conf(tmp_path))
+    assert config.enable is True
+    assert config.bridge_port == 40123
+    assert config.budget_usd == 52.95
+
+
+def test_config_defaults_fail_closed(tmp_path) -> None:
+    config = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\n"))
+    assert config.enable is False
+    assert config.bridge_port == 0
+    assert config.budget_usd == 0.0
+
+
+def test_doctor_reports_status_without_secrets(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("MOD_PLAYERBOT_CLAUDE_APIKEY", "sk-ant-super-secret")
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    serialized = json.dumps(report)
+    assert TEST_TOKEN not in serialized
+    assert "sk-ant-super-secret" not in serialized
+    assert report["bridge_token_present"] is True
+    assert report["anthropic_api_key_present"] is True
+    assert report["bridge_port"] == 40123
+
+
+def test_doctor_ignores_global_anthropic_api_key(tmp_path, monkeypatch) -> None:
+    # The module never uses a machine-wide key: only MOD_PLAYERBOT_CLAUDE_APIKEY counts.
+    monkeypatch.delenv("MOD_PLAYERBOT_CLAUDE_APIKEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-global-key")
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    assert report["anthropic_api_key_present"] is False
+
+
+def test_doctor_flags_missing_token(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", raising=False)
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    assert report["bridge_token_present"] is False
+    assert report["ok"] is False
+
+
+class FakeAdapter(claude.ClaudeAdapter):
+    def __init__(self, reply: str = "A fine day for fishing.") -> None:
+        # Deliberately no super().__init__(): the fake never builds a real client.
+        self.reply = reply
+        self.requests: list[protocol.ChatRequest] = []
+        self.histories: list[list[tuple[str, str]]] = []
+        self.input_tokens = 100
+
+    def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
+        return self.input_tokens
+
+    def generate_reply(
+        self, request: protocol.ChatRequest, history: list[tuple[str, str]]
+    ) -> tuple[str, claude.UsageTotals]:
+        self.requests.append(request)
+        self.histories.append(list(history))
+        return self.reply, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
+
+
+def make_service(tmp_path, adapter=None, budget: float = 10.0) -> app.SidecarService:
+    conf = write_conf(
+        tmp_path,
+        CONF_TEXT.replace("52.95", str(budget)),
+    )
+    return app.SidecarService(
+        config=app.SidecarConfig.load(conf),
+        token=TEST_TOKEN,
+        adapter=adapter or FakeAdapter(),
+    )
+
+
+async def test_service_processes_valid_request(tmp_path) -> None:
+    service = make_service(tmp_path)
+    payload = await service.process_payload(CPP_REQUEST_FIXTURE.encode())
+    assert payload is not None
+
+    response = json.loads(payload)
+    assert response["schema_version"] == 1
+    assert response["request_id"] == 7
+    assert response["message"] == "A fine day for fishing."
+    assert response["token"] == TEST_TOKEN
+
+
+async def test_service_stays_silent_on_bad_token(tmp_path) -> None:
+    adapter = FakeAdapter()
+    service = make_service(tmp_path, adapter=adapter)
+    bad = valid_request_dict()
+    bad["token"] = "z" * 32
+    with pytest.raises(protocol.TokenMismatchError):
+        await service.process_payload(json.dumps(bad).encode())
+    assert adapter.requests == []
+
+
+async def test_service_stays_silent_when_generation_fails(tmp_path) -> None:
+    class FailingAdapter(FakeAdapter):
+        def generate_reply(self, request, history):
+            raise claude.ClaudeTimeoutError("provider timed out")
+
+    service = make_service(tmp_path, adapter=FailingAdapter())
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+
+
+async def test_service_makes_no_generation_call_without_budget(tmp_path) -> None:
+    adapter = FakeAdapter()
+    service = make_service(tmp_path, adapter=adapter, budget=0.0)
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert adapter.requests == []
+
+
+# --- Storage: profiles, bounded memory, crash-safe budget ---
+
+
+HAIKU_PRICES = storage.PriceSnapshot.from_usd_per_mtok(1.00, 5.00)
+
+
+def make_storage(tmp_path) -> storage.Storage:
+    return storage.Storage(str(tmp_path / "sidecar.sqlite"))
+
+
+def test_prices_convert_exactly() -> None:
+    assert HAIKU_PRICES.input_nano_per_token == 1000
+    assert HAIKU_PRICES.output_nano_per_token == 5000
+
+
+def test_documented_cost_examples_are_exact() -> None:
+    # Literal examples from the approved plan: 2,500 + 80 tokens cost 0.0029 USD and
+    # 4,095 + 96 tokens cost 0.004575 USD.
+    assert HAIKU_PRICES.cost_nano(2500, 80) == 2_900_000
+    assert storage.nano_to_usd_string(HAIKU_PRICES.cost_nano(2500, 80)) == "0.0029"
+    assert HAIKU_PRICES.cost_nano(4095, 96) == 4_575_000
+    assert storage.nano_to_usd_string(HAIKU_PRICES.cost_nano(4095, 96)) == "0.004575"
+
+
+def test_profile_persists_across_reopen(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    store.record_profile(make_request_model())
+    store.close()
+
+    reopened = make_storage(tmp_path)
+    profile = reopened.get_profile(42)
+    assert profile is not None
+    assert profile["profile_version"] == 1
+    assert profile["crafting_affinity"] == 65
+    assert profile["exploration_affinity"] == 91
+    assert profile["sociability"] == 82
+    assert profile["voice"] == "earnest"
+    assert reopened.get_profile(9999) is None
+
+
+def test_conversation_memory_is_bounded_to_20_turns(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    for index in range(25):
+        role = "user" if index % 2 == 0 else "assistant"
+        store.append_turn(42, role, f"turn {index}")
+
+    turns = store.recent_turns(42)
+    assert len(turns) == 20
+    assert turns[0] == ("user" if 5 % 2 == 0 else "assistant", "turn 5")
+    assert turns[-1] == ("user", "turn 24")
+
+    # Other bots are unaffected and isolated.
+    assert store.recent_turns(7) == []
+
+
+def test_reservation_settlement_produces_exact_spend(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    budget_nano = storage.usd_to_nano(52.95)
+
+    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, budget_nano)
+    assert reservation is not None
+    assert store.outstanding_nano() == 4_575_000
+    assert store.spent_nano() == 0
+
+    store.mark_submitted(reservation)
+    store.settle(reservation, 2500, 80, HAIKU_PRICES)
+    assert store.outstanding_nano() == 0
+    assert store.spent_nano() == 2_900_000
+
+
+def test_reservation_rejected_when_budget_cannot_fit(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    budget_nano = storage.usd_to_nano(0.0046)  # 4,600,000 nano
+
+    first = store.reserve(1, 4095, 96, HAIKU_PRICES, budget_nano)  # max 4,575,000
+    assert first is not None
+
+    # Outstanding reservation blocks a second one.
+    assert store.reserve(2, 10, 96, HAIKU_PRICES, budget_nano) is None
+
+    store.mark_submitted(first)
+    store.settle(first, 2500, 80, HAIKU_PRICES)  # actual spend 2,900,000
+
+    # A small follow-up fits (2,900,000 + 1,000*10 + 5,000*96 = 3,390,000).
+    assert store.reserve(3, 10, 96, HAIKU_PRICES, budget_nano) is not None
+    # A full-size one does not (2,900,000 + 4,575,000 > 4,600,000). The small
+    # reservation above is still outstanding, which blocks it further.
+    assert store.reserve(4, 4095, 96, HAIKU_PRICES, budget_nano) is None
+
+
+def test_crash_before_reservation_charges_nothing(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    store.close()
+    reopened = make_storage(tmp_path)
+    assert reopened.spent_nano() == 0
+    assert reopened.outstanding_nano() == 0
+
+
+def test_crash_after_reservation_remains_charged_at_maximum(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    assert reservation is not None
+    store.close()  # crash before mark_submitted
+
+    reopened = make_storage(tmp_path)
+    assert reopened.outstanding_nano() == 4_575_000
+
+
+def test_crash_after_submission_remains_charged_at_maximum(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    assert reservation is not None
+    store.mark_submitted(reservation)
+    store.close()  # crash before settlement
+
+    reopened = make_storage(tmp_path)
+    assert reopened.outstanding_nano() == 4_575_000
+    assert reopened.spent_nano() == 0
+
+
+def test_settlement_survives_restart(tmp_path) -> None:
+    store = make_storage(tmp_path)
+    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    assert reservation is not None
+    store.mark_submitted(reservation)
+    store.settle(reservation, 2500, 80, HAIKU_PRICES)
+    store.close()
+
+    reopened = make_storage(tmp_path)
+    assert reopened.spent_nano() == 2_900_000
+    assert reopened.outstanding_nano() == 0
+
+
+# --- Service integration with storage ---
+
+
+def make_stored_service(
+    tmp_path, adapter=None, budget: float = 10.0, input_tokens: int = 100
+) -> tuple[app.SidecarService, storage.Storage, FakeAdapter]:
+    fake = adapter or FakeAdapter()
+    fake.input_tokens = input_tokens
+    store = make_storage(tmp_path)
+    conf = write_conf(tmp_path, CONF_TEXT.replace("52.95", str(budget)))
+    service = app.SidecarService(
+        config=app.SidecarConfig.load(conf),
+        token=TEST_TOKEN,
+        adapter=fake,
+        store=store,
+    )
+    return service, store, fake
+
+
+async def test_service_records_profile_memory_and_settlement(tmp_path) -> None:
+    service, store, fake = make_stored_service(tmp_path)
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is not None
+
+    profile = store.get_profile(42)
+    assert profile is not None and profile["voice"] == "earnest"
+
+    turns = store.recent_turns(42)
+    assert len(turns) == 2
+    assert turns[0][0] == "user"
+    assert turns[1] == ("assistant", "A fine day for fishing.")
+
+    assert store.spent_nano() == HAIKU_PRICES.cost_nano(100, 10)
+    assert store.outstanding_nano() == 0
+
+    # The next request carries the stored history to the adapter.
+    second = valid_request_dict()
+    second["request_id"] = 8
+    assert await service.process_payload(json.dumps(second).encode()) is not None
+    assert len(fake.histories[-1]) == 2
+
+
+async def test_service_rejects_oversized_prompt_without_generation(tmp_path) -> None:
+    service, store, fake = make_stored_service(tmp_path, input_tokens=claude.MAX_INPUT_TOKENS + 1)
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert fake.requests == []
+    assert store.outstanding_nano() == 0
+
+
+async def test_service_makes_no_call_when_reservation_cannot_fit(tmp_path) -> None:
+    service, _store, fake = make_stored_service(tmp_path, budget=0.000001)
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert fake.requests == []
+
+
+async def test_generation_failure_leaves_reservation_charged(tmp_path) -> None:
+    class FailingAdapter(FakeAdapter):
+        def generate_reply(self, request, history):
+            raise claude.ClaudeTimeoutError("provider timed out")
+
+    service, store, _fake = make_stored_service(tmp_path, adapter=FailingAdapter())
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    # Fail closed: the reservation stays charged at maximum until reconciled.
+    assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
+
+
+def test_doctor_reports_budget_numbers(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", TEST_TOKEN)
+    store = make_storage(tmp_path)
+    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    assert reservation is not None
+    store.mark_submitted(reservation)
+    store.settle(reservation, 2500, 80, HAIKU_PRICES)
+
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), store=store)
+    budget = report["budget"]
+    assert isinstance(budget, dict)
+    assert budget["spent_usd"] == "0.0029"
+    assert budget["reserved_usd"] == "0"
+    assert budget["remaining_usd"] == "52.9471"
+
+
+def test_response_rejects_invalid_messages() -> None:
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_response(7, "", TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_response(7, "a" * (protocol.MAX_RESPONSE_MESSAGE_BYTES + 1), TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_response(7, "two\nlines", TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_response(7, "control\x01char", TEST_TOKEN)
+
+    # 240 bytes exactly is accepted.
+    protocol.encode_response(7, "a" * protocol.MAX_RESPONSE_MESSAGE_BYTES, TEST_TOKEN)

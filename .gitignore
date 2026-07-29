@@ -1,0 +1,32 @@
+# Local configuration: only the .dist template is tracked.
+conf/*.conf
+
+# Secrets and environment files. Tokens and API keys live only in the
+# process environment, never in tracked files.
+.env
+.env.*
+
+# Python caches and virtual environments.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state (sidecar SQLite database and journals).
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Build artifacts.
+build/
+*.o
+*.a
+
+# OS noise.
+.DS_Store
+
+# graphify knowledge graph output.
+graphify-out/

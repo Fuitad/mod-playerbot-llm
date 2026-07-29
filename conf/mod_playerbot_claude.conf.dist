@@ -1,0 +1,90 @@
+[worldserver]
+
+###################################################################################################
+#    mod-playerbot-claude configuration
+#
+#    Everything is disabled by default. The module sends chat text, bounded context, and the
+#    deterministic personality profile of addressed bots to the Anthropic API through a local
+#    sidecar. Read the README privacy section before enabling anything.
+#
+#    Secrets are never read from this file. The bridge token comes from the
+#    PLAYERBOT_CLAUDE_BRIDGE_TOKEN environment variable (required, minimum 32 bytes) and the
+#    Anthropic API key from MOD_PLAYERBOT_CLAUDE_APIKEY (read by the sidecar only; the global
+#    ANTHROPIC_API_KEY variable is deliberately ignored).
+###################################################################################################
+
+#
+#    PlayerbotClaude.Enable
+#        Description: Enables the Claude chat module hooks in worldserver.
+#        Default:     0 - Disabled
+#                     1 - Enabled
+
+PlayerbotClaude.Enable = 0
+
+#
+#    PlayerbotClaude.BridgePort
+#        Description: Loopback TCP port of the sidecar bridge. Both worldserver and the sidecar
+#                     use this value. 0 disables both processes. The sidecar binds only to
+#                     127.0.0.1.
+#        Default:     0 - Disabled
+
+PlayerbotClaude.BridgePort = 0
+
+#
+#    PlayerbotClaude.BudgetUsd
+#        Description: Hard spending ceiling in USD for the sidecar. When the reserved plus spent
+#                     amount would exceed this ceiling, no generation request is made. 0 disables
+#                     all generation.
+#        Default:     0
+
+PlayerbotClaude.BudgetUsd = 0
+
+#
+#    PlayerbotClaude.InputUsdPerMTok
+#        Description: Price of one million input tokens in USD, used by the sidecar budget
+#                     ledger. Must match the current Anthropic pricing for the configured
+#                     model. 0 disables all generation.
+#        Default:     1.00 (Claude Haiku 4.5 input)
+
+PlayerbotClaude.InputUsdPerMTok = 1.00
+
+#
+#    PlayerbotClaude.OutputUsdPerMTok
+#        Description: Price of one million output tokens in USD, used by the sidecar budget
+#                     ledger. Must match the current Anthropic pricing for the configured
+#                     model. 0 disables all generation.
+#        Default:     5.00 (Claude Haiku 4.5 output)
+
+PlayerbotClaude.OutputUsdPerMTok = 5.00
+
+#
+#    PlayerbotClaude.SidecarDatabase
+#        Description: Path of the sidecar's SQLite database (profiles, bounded conversation
+#                     memory, budget ledger). Relative paths resolve against the sidecar's
+#                     working directory. Only the sidecar reads this file.
+#        Default:     "playerbot_claude.sqlite"
+
+PlayerbotClaude.SidecarDatabase = "playerbot_claude.sqlite"
+
+#
+#    PlayerbotClaude.ResponseDeadlineMs
+#        Description: Milliseconds a pending conversation waits for the sidecar before the
+#                     request expires. Expired requests are dropped without any fallback text.
+#        Default:     10000
+
+PlayerbotClaude.ResponseDeadlineMs = 10000
+
+#
+#    PlayerbotClaude.QueueSize
+#        Description: Maximum pending requests between the world thread and the bridge worker.
+#                     A full queue rejects new requests immediately.
+#        Default:     16
+
+PlayerbotClaude.QueueSize = 16
+
+#
+#    PlayerbotClaude.GroupCooldownSeconds
+#        Description: Minimum seconds between milestone reactions for the same group.
+#        Default:     120
+
+PlayerbotClaude.GroupCooldownSeconds = 120

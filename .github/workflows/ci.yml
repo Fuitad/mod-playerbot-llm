@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sidecar:
+    name: Sidecar (Python)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sidecar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked environment
+        run: uv sync --locked --dev
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run basedpyright src tests
+
+      - name: Tests (unit and socket integration, fully offline)
+        run: uv run pytest -q
+
+  worldserver-module:
+    name: Worldserver module (C++)
+    runs-on: ubuntu-24.04
+    env:
+      # The playerbot-compatible AzerothCore. Must match what Fuitad/mod-playerbots targets.
+      CORE_REPOSITORY: mod-playerbots/azerothcore-wotlk
+      CORE_REF: Playerbot
+    steps:
+      - name: Check out mod-playerbot-claude
+        uses: actions/checkout@v4
+        with:
+          path: module
+
+      - name: Validate PLAYERBOTS_REVISION before anything else
+        id: pin
+        run: |
+          REV="$(tr -d '[:space:]' < module/PLAYERBOTS_REVISION)"
+          if ! printf '%s' "$REV" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "PLAYERBOTS_REVISION is malformed: expected exactly one 40-hex SHA" >&2
+            exit 1
+          fi
+          echo "revision=$REV" >> "$GITHUB_OUTPUT"
+
+      - name: Require the read-only deploy key
+        env:
+          PLAYERBOTS_DEPLOY_KEY: ${{ secrets.PLAYERBOTS_DEPLOY_KEY }}
+        run: |
+          # Presence check only. The value is never printed and is used solely by the
+          # private checkout below. The key pair must be a READ-ONLY deploy key
+          # installed on Fuitad/mod-playerbots, stored as the PLAYERBOTS_DEPLOY_KEY
+          # Actions secret of Fuitad/mod-playerbot-claude.
+          if [ -z "$PLAYERBOTS_DEPLOY_KEY" ]; then
+            echo "The PLAYERBOTS_DEPLOY_KEY secret is not configured" >&2
+            exit 1
+          fi
+          echo "deploy key present"
+
+      - name: Check out the playerbot core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: azerothcore
+
+      - name: Check out Fuitad/mod-playerbots at the pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: Fuitad/mod-playerbots
+          ref: ${{ steps.pin.outputs.revision }}
+          ssh-key: ${{ secrets.PLAYERBOTS_DEPLOY_KEY }}
+          path: azerothcore/modules/mod-playerbots
+
+      - name: Verify the pinned revision resolved exactly
+        run: test "$(git -C azerothcore/modules/mod-playerbots rev-parse HEAD)" = "${{ steps.pin.outputs.revision }}"
+
+      - name: Place this module in the core tree
+        run: cp -R module azerothcore/modules/mod-playerbot-claude
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang libmysqlclient-dev libssl-dev \
+            libbz2-dev libreadline-dev libncurses-dev libboost-all-dev
+
+      - name: Configure
+        run: |
+          cmake -S azerothcore -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
+            -DSCRIPTS=static -DMODULES=static -DNOPCH=1
+
+      - name: Build unit tests
+        run: cmake --build build --target unit_tests --parallel "$(nproc)"
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure -R '^unit$'
