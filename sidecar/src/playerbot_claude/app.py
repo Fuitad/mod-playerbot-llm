@@ -128,7 +128,9 @@ class SidecarService:
     ) -> None:
         self._config = config
         self._token = token
-        self._adapter = adapter or claude.ClaudeAdapter()
+        # The default SDK client's own timeout is capped at the response deadline so
+        # a provider call cannot outlive the request that paid for it.
+        self._adapter = adapter or claude.ClaudeAdapter(timeout_seconds=config.response_deadline_ms / 1000)
         self._store = store
         self._generation_lock = asyncio.Lock()
 
@@ -145,6 +147,18 @@ class SidecarService:
             _log(f"request {request.request_id}: no budget configured, staying silent")
             return None
 
+        # ResponseDeadlineMs bounds the whole pipeline, queueing included: the
+        # worldserver side has already expired this request by then, so finishing
+        # late would only spend budget on a reply nobody can receive. A reservation
+        # made before the cut stays charged at maximum (fail closed on money).
+        try:
+            async with asyncio.timeout(self._config.response_deadline_ms / 1000):
+                return await self._process_within_deadline(request)
+        except TimeoutError:
+            _log(f"request {request.request_id}: response deadline exceeded, staying silent")
+            return None
+
+    async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:
         async with self._generation_lock:
             if self._store is not None:
                 self._store.record_profile(request)

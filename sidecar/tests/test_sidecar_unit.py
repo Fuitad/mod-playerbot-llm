@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from typing import Any
 
 import anthropic
@@ -338,6 +340,29 @@ def test_count_input_tokens_uses_count_tokens_endpoint() -> None:
 
     adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
     assert adapter.count_input_tokens(make_request_model(), history=[]) == 1234
+
+
+def test_count_and_generate_bill_the_same_structured_output_schema() -> None:
+    # The budget reservation is priced from the counted prompt, so counting must
+    # bill the exact request shape generation sends, including the structured
+    # output schema. A mismatch lets actual input usage exceed the reservation
+    # and settlement could then cross the configured hard ceiling.
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/v1/messages/count_tokens":
+            captured["count"] = body
+            return httpx.Response(200, json={"input_tokens": 2500})
+        captured["generate"] = body
+        return messages_response("A reply.")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    adapter.count_input_tokens(make_request_model(), history=[])
+    adapter.generate_reply(make_request_model(), history=[])
+
+    assert captured["generate"].get("output_config") is not None
+    assert captured["count"].get("output_config") == captured["generate"]["output_config"]
 
 
 def test_generate_reply_maps_provider_failures_to_bounded_errors() -> None:
@@ -738,6 +763,39 @@ async def test_generation_failure_leaves_reservation_charged(tmp_path) -> None:
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
     # Fail closed: the reservation stays charged at maximum until reconciled.
     assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
+
+
+async def test_process_payload_enforces_response_deadline(tmp_path) -> None:
+    # ResponseDeadlineMs bounds the whole sidecar pipeline. A provider call that
+    # outlives it must not produce a response, settle as delivered conversation,
+    # or block later requests for its full provider timeout.
+    release = threading.Event()
+
+    class BlockingAdapter(FakeAdapter):
+        def generate_reply(self, request, history):
+            release.wait(timeout=30)
+            return super().generate_reply(request, history)
+
+    store = make_storage(tmp_path)
+    conf = write_conf(tmp_path, CONF_TEXT.replace("10000", "200"))
+    service = app.SidecarService(
+        config=app.SidecarConfig.load(conf),
+        token=TEST_TOKEN,
+        adapter=BlockingAdapter(),
+        store=store,
+    )
+
+    started = time.monotonic()
+    try:
+        assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+        # Returned near the 0.2s deadline, nowhere near the 30s block.
+        assert time.monotonic() - started < 5.0
+        # Money fails closed: the reservation stays charged at maximum, and the
+        # dead exchange never enters conversation memory.
+        assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
+        assert store.recent_turns(42) == []
+    finally:
+        release.set()
 
 
 def test_doctor_reports_budget_numbers(tmp_path, monkeypatch) -> None:

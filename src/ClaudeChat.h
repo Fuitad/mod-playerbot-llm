@@ -214,6 +214,7 @@ namespace ClaudeChat
         bool botIsStillBot = false;
         bool botInCombat = true;
         bool sameGroup = false;
+        bool expired = true;
     };
 
     // True only when every policy gate passes for the channel. Party delivery

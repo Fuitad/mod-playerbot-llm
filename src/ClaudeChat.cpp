@@ -566,6 +566,9 @@ std::optional<std::pair<std::string, std::string>> ClaudeChat::ParseLlmParty(std
 
 bool ClaudeChat::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snapshot)
 {
+    if (snapshot.expired)
+        return false;
+
     if (!snapshot.botOnline || !snapshot.speakerOnline || !snapshot.botIsStillBot || snapshot.botInCombat)
         return false;
 
@@ -702,6 +705,13 @@ struct ClaudeChat::ClaudeBridge::Impl
         // Reads intentionally run without the mutex so Stop can shut the socket down
         // concurrently (AbortSocket). The socket object itself is only ever destroyed by
         // the worker (DiscardSocket), so this read never touches freed memory.
+        //
+        // Do NOT "fix" this by holding socketMutex across the read: AbortSocket takes the
+        // same mutex, so a blocked read would deadlock shutdown. The concurrency here is
+        // the POSIX guarantee that shutdown()/close() on a socket fd wakes a thread
+        // blocked in a synchronous read on that fd with an error; Asio's basic_socket
+        // does not promise general concurrent-call safety, which is why the ONLY
+        // concurrent calls ever made are AbortSocket's shutdown+close.
         boost::asio::read(*socket, boost::asio::buffer(header), ec);
         if (ec)
             return std::nullopt;

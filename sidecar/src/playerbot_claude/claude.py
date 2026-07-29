@@ -118,21 +118,29 @@ def _build_messages(request: protocol.ChatRequest, history: list[tuple[str, str]
 class ClaudeAdapter:
     """Synchronous Anthropic SDK wrapper with bounded, typed failures."""
 
-    def __init__(self, client: anthropic.Anthropic | None = None) -> None:
+    def __init__(
+        self,
+        client: anthropic.Anthropic | None = None,
+        timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
         # api_key is always passed explicitly: an empty value fails authentication
         # instead of silently falling back to the SDK's ANTHROPIC_API_KEY lookup.
         self._client = client or anthropic.Anthropic(
             api_key=os.environ.get(API_KEY_ENV_VAR, ""),
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             max_retries=1,
         )
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         try:
+            # output_format must match generate_reply exactly: the structured output
+            # schema is billed as input, and the budget reservation is priced from
+            # this count.
             result = self._client.messages.count_tokens(
                 model=MODEL_ID,
                 system=build_system_prompt(request),
                 messages=_build_messages(request, history),
+                output_format=ChatReply,
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error

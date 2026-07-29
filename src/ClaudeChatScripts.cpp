@@ -262,6 +262,7 @@ namespace
                 Player* speaker = ObjectAccessor::FindPlayer(delivery.speakerGuid);
 
                 DeliverySnapshot snapshot;
+                snapshot.expired = SteadyNowMs() > delivery.expiresAtSteadyMs;
                 snapshot.botOnline = bot && bot->IsInWorld();
                 snapshot.speakerOnline = speaker && speaker->IsInWorld();
                 snapshot.botIsStillBot = IsMachineBot(bot);

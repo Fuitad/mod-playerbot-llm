@@ -581,7 +581,17 @@ TEST(ClaudeChatPolicyTest, WhisperDeliveryRequiresValidRevalidatedState)
     good.botIsStillBot = true;
     good.botInCombat = false;
     good.sameGroup = false;  // irrelevant for whispers
+    good.expired = false;
     EXPECT_TRUE(ShouldDeliver(ChatChannel::Whisper, good));
+
+    // A response drained after its deadline must never be spoken, even when
+    // every other revalidated field still passes.
+    DeliverySnapshot expired = good;
+    expired.expired = true;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::Whisper, expired));
+
+    // Every field of a default snapshot sits on the blocking side.
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::Whisper, DeliverySnapshot{}));
 
     DeliverySnapshot botOffline = good;
     botOffline.botOnline = false;
@@ -608,6 +618,7 @@ TEST(ClaudeChatPolicyTest, PartyDeliveryAlsoRequiresSameGroup)
     good.botIsStillBot = true;
     good.botInCombat = false;
     good.sameGroup = true;
+    good.expired = false;
     EXPECT_TRUE(ShouldDeliver(ChatChannel::Party, good));
 
     DeliverySnapshot leftGroup = good;

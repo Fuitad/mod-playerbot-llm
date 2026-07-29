@@ -31,6 +31,7 @@ All game state lives on the world thread. The bridge worker thread never touches
 ## Sidecar (Python)
 
 - `app.py` serializes the whole request pipeline behind one lock, so socket concurrency can never race the budget: record profile, count tokens, reserve, generate, settle, append memory.
+- The entire pipeline (queueing included) runs under an end-to-end `ResponseDeadlineMs` deadline, and the SDK client's own timeout is capped at the same value. A request that cannot finish in time is dropped silently; its reservation stays charged at maximum, and the dead exchange never enters conversation memory.
 - `claude.py` is the only file that talks to Anthropic. The trusted personality profile is rendered into the system prompt; the player's text is delivered as a separate, explicitly untrusted user message. The model gets no tools. Structured output (`output_format`) restricts the reply to a single `message` field, and the adapter additionally enforces non-empty, single-line, at most 240 UTF-8 bytes.
 - The API key is read from `MOD_PLAYERBOT_CLAUDE_APIKEY` only and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
 
@@ -45,7 +46,7 @@ Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at 
 
 The reserve-then-settle cycle, one SQLite WAL transaction per step:
 
-1. **Count.** The exact prompt is counted via the API. Input above 4,095 tokens is rejected before any money moves.
+1. **Count.** The exact prompt is counted via the API, with the same structured output schema the generation request sends (the schema is billed as input). Input above 4,095 tokens is rejected before any money moves.
 2. **Reserve.** The maximum possible cost (counted input plus 96 output tokens) is charged. If spent plus outstanding plus this maximum would exceed `BudgetUsd`, no reservation is created and no provider call happens.
 3. **Submit.** The reservation is marked submitted before the provider call.
 4. **Settle.** After a successful reply, actual usage atomically replaces the maximum charge and an append-only usage row records tokens, price snapshot, and cost.
@@ -73,5 +74,6 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Prompt above 4,095 tokens | Dropped before reservation |
 | Budget exhausted | Dropped before the provider call |
 | Provider timeout, auth, rate limit, or error | Dropped; reservation stays charged at maximum |
+| Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation stays charged at maximum |
 | Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped |
 | Bot despawned or deadline passed | Response discarded at delivery |
