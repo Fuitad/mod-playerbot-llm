@@ -587,10 +587,12 @@ bool ClaudeChat::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snap
     if (snapshot.expired)
         return false;
 
-    if (!snapshot.botOnline || !snapshot.speakerOnline || !snapshot.botIsStillBot || snapshot.botInCombat)
+    if (!snapshot.botOnline || !snapshot.speakerOnline || !snapshot.botIsStillBot)
         return false;
 
-    if (channel == ChatChannel::Party && !snapshot.sameGroup)
+    // Whispering while fighting is normal play, so combat only mutes the noisier
+    // party milestone reactions.
+    if (channel == ChatChannel::Party && (snapshot.botInCombat || !snapshot.sameGroup))
         return false;
 
     return true;

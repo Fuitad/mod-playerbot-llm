@@ -624,9 +624,10 @@ TEST(ClaudeChatPolicyTest, WhisperDeliveryRequiresValidRevalidatedState)
     notBotAnymore.botIsStillBot = false;
     EXPECT_FALSE(ShouldDeliver(ChatChannel::Whisper, notBotAnymore));
 
+    // Players whisper mid-fight all the time; a fighting bot still replies.
     DeliverySnapshot inCombat = good;
     inCombat.botInCombat = true;
-    EXPECT_FALSE(ShouldDeliver(ChatChannel::Whisper, inCombat));
+    EXPECT_TRUE(ShouldDeliver(ChatChannel::Whisper, inCombat));
 }
 
 TEST(ClaudeChatPolicyTest, PartyDeliveryAlsoRequiresSameGroup)
@@ -643,6 +644,11 @@ TEST(ClaudeChatPolicyTest, PartyDeliveryAlsoRequiresSameGroup)
     DeliverySnapshot leftGroup = good;
     leftGroup.sameGroup = false;
     EXPECT_FALSE(ShouldDeliver(ChatChannel::Party, leftGroup));
+
+    // Party milestone reactions stay quiet during a fight (unlike whispers).
+    DeliverySnapshot inCombat = good;
+    inCombat.botInCombat = true;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::Party, inCombat));
 }
 
 TEST(ClaudeChatPolicyTest, GroupCooldownAllowsOneMilestonePerWindow)

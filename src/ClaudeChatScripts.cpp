@@ -281,7 +281,14 @@ namespace
                     bot && speaker && bot->GetGroup() && bot->GetGroup() == speaker->GetGroup();
 
                 if (!ShouldDeliver(delivery.channel, snapshot))
+                {
+                    LOG_INFO("playerbot.claude",
+                             "mod-playerbot-claude: dropped response for request {} (expired={} botOnline={} "
+                             "speakerOnline={} stillBot={} inCombat={} sameGroup={})",
+                             response.requestId, snapshot.expired, snapshot.botOnline, snapshot.speakerOnline,
+                             snapshot.botIsStillBot, snapshot.botInCombat, snapshot.sameGroup);
                     continue;
+                }
 
                 if (delivery.channel == ChatChannel::Whisper)
                     bot->Whisper(response.message, LANG_UNIVERSAL, speaker);
