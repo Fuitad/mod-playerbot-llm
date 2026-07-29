@@ -3,7 +3,7 @@
 Created: 2026-07-29
 Author: magitekrr@gmail.com
 Agent: Codex
-Status: COMPLETE
+Status: VERIFIED
 Approved: Yes
 Iterations: 4
 Worktree: No
@@ -488,6 +488,20 @@ These runtime scenarios use the WoW 3.3.5a client rather than browser automation
 - **2026-07-29, Task 1:** `BUILD_TESTING=ON` was broken at the pinned parent revision before any plan change: `src/test/mocks/WorldMock.h` in the playerbots AzerothCore fork was missing overrides for `IWorld::AddQueryHolderCallback` and the `MOD_PLAYERBOTS`-gated `IWorld::GetPlayerbotsDBRevision`, so every core test instantiating `NiceMock<WorldMock>` failed to compile. Fixed inline by adding the two missing `MOCK_METHOD` entries (test-only, parent repository working tree; not part of either module commit). The plan's "AzerothCore core changes" exclusion targets runtime code; without this repair no C++ test in this plan can build.
 
 - **2026-07-29, Task 9 (user-directed):** Pierre asked mid-run for the sidecar to read its Anthropic API key from `MOD_PLAYERBOT_CLAUDE_APIKEY` instead of the global `ANTHROPIC_API_KEY`, so a machine-wide key can never be used implicitly by this module. This supersedes the "Claude credentials" line in Constraints. `ClaudeAdapter` now passes `api_key` explicitly (an unset variable yields an empty key that fails authentication rather than falling back to the SDK's `ANTHROPIC_API_KEY` lookup), `serve` refuses to start when the variable is missing, and `doctor` reports presence of the module-scoped variable only. Covered by `test_adapter_ignores_global_anthropic_api_key` and `test_doctor_ignores_global_anthropic_api_key`.
+
+## E2E Results
+
+Live-target probe: the sidecar half ran LIVE (real `playerbot-claude serve` process on 127.0.0.1:41977, exercised over a real socket). The worldserver plus WoW 3.3.5a game-client half is unavailable in this environment (no game client, no provisioned world/characters/auth databases), so those steps are recorded as UNIT_VERIFIED with their offline equivalents. Tier 3 deploy backends: NOT_APPLICABLE (server emulator, no deploy markers).
+
+| Scenario | Priority | Result | Fix Attempts | Notes |
+|----------|----------|--------|--------------|-------|
+| TS-001 | Critical | UNIT_VERIFIED + partial LIVE | 0 | Literal profile fixtures (C++), profile persistence across store reopen (Python), and a LIVE `profile` CLI call against a real serve process returned the stored trusted profile. |
+| TS-002 | Critical | UNIT_VERIFIED | 0 | Profession pool and pair weighting plus exploration chance covered by PlayerbotPersonalityTest fixtures; valid stored professions are never rerolled (factory diff preserves them). |
+| TS-003 | Critical | UNIT_VERIFIED + partial LIVE | 0 | Byte-identical C++/Python protocol fixtures; socket round trip with personality-conditioned prompt asserted offline; LIVE serve process stayed silent on provider auth failure; model output can only become chat text. |
+| TS-004 | High | UNIT_VERIFIED | 0 | Deterministic milestone speaker selection fixtures, group cooldown, and event dedup tests. |
+| TS-005 | Critical | LIVE (sidecar) + UNIT_VERIFIED (worldserver) | 0 | LIVE: real serve process silent on bad token and provider failure, doctor reported exact spent/reserved/remaining without secrets, clean SIGTERM. Worldserver expiry covered by the new expired-delivery policy test. |
+
+Verification fixes applied during this phase (commit 7f1c216 in mod-playerbot-claude, from the adversarial changes review): structured-output schema now billed identically in token counting and generation; ResponseDeadlineMs enforced end to end in the sidecar; expired responses rejected before world-thread delivery.
 
 ## Deferred Ideas
 
