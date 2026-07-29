@@ -30,8 +30,9 @@ All game state lives on the world thread. The bridge worker thread never touches
 
 ## Sidecar (Python)
 
-- `app.py` serializes the whole request pipeline behind one lock, so socket concurrency can never race the budget: record profile, count tokens, reserve, generate, settle, append memory.
+- `app.py` serializes all budget bookkeeping behind one lock, so socket concurrency can never race the ledger: record profile, count tokens, reserve, generate, settle, append memory.
 - The entire pipeline (queueing included) runs under an end-to-end `ResponseDeadlineMs` deadline, and the SDK client's own timeout is capped at the same value. A request that cannot finish in time is dropped silently; its reservation stays charged at maximum, and the dead exchange never enters conversation memory.
+- One residual overlap exists by design: a deadline cancellation releases the lock while the abandoned synchronous SDK call finishes in its worker thread (Python cannot interrupt it; the capped client timeout bounds it). This is safe because httpx clients are thread-safe and an abandoned call can never settle or write memory, but it does mean a new provider call may start while the abandoned one is still physically in flight.
 - `claude.py` is the only file that talks to Anthropic. The trusted personality profile is rendered into the system prompt; the player's text is delivered as a separate, explicitly untrusted user message. The model gets no tools. Structured output (`output_format`) restricts the reply to a single `message` field, and the adapter additionally enforces non-empty, single-line, at most 240 UTF-8 bytes.
 - The API key is read from `MOD_PLAYERBOT_CLAUDE_APIKEY` only and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
 

@@ -115,8 +115,14 @@ def doctor_report(config: SidecarConfig, store: storage.Storage | None = None) -
 class SidecarService:
     """Parses, validates, and answers one request payload at a time.
 
-    Generation is serialized with a single lock so provider calls, and later the
-    budget bookkeeping, can never race each other across connections.
+    All budget bookkeeping (count, reserve, settle, memory) is serialized with a
+    single lock, so socket concurrency can never race the ledger. One residual
+    overlap exists by design: when the deadline cancels a request mid-generation,
+    the lock is released while the abandoned synchronous SDK call finishes in its
+    worker thread (Python cannot interrupt it; the client timeout, capped at the
+    same deadline, bounds it). That is safe: httpx clients are thread-safe, and a
+    cancelled request can never settle or write conversation memory, so its
+    reservation stays charged at maximum.
     """
 
     def __init__(

@@ -765,6 +765,15 @@ async def test_generation_failure_leaves_reservation_charged(tmp_path) -> None:
     assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
 
 
+def test_default_adapter_client_timeout_is_capped_at_deadline(tmp_path, monkeypatch) -> None:
+    # The default SDK client's own timeout must track ResponseDeadlineMs so an
+    # abandoned provider call cannot outlive the deadline by more than one request.
+    monkeypatch.delenv("MOD_PLAYERBOT_CLAUDE_APIKEY", raising=False)
+    conf = write_conf(tmp_path, CONF_TEXT.replace("10000", "2500"))
+    service = app.SidecarService(config=app.SidecarConfig.load(conf), token=TEST_TOKEN)
+    assert service._adapter._client.timeout == 2.5
+
+
 async def test_process_payload_enforces_response_deadline(tmp_path) -> None:
     # ResponseDeadlineMs bounds the whole sidecar pipeline. A provider call that
     # outlives it must not produce a response, settle as delivered conversation,
