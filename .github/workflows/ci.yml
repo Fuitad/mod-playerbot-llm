@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # The playerbot-compatible AzerothCore. Must match what Fuitad/mod-playerbots targets.
-      CORE_REPOSITORY: mod-playerbots/azerothcore-wotlk
+      CORE_REPOSITORY: Fuitad/azerothcore-wotlk
       CORE_REF: Playerbot
     steps:
       - name: Check out mod-playerbot-claude
