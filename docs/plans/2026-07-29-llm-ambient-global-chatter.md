@@ -259,9 +259,9 @@ These scenarios use the WoW 3.3.5a client, worldserver logs, and sidecar logs. T
 
 **Definition of Done:**
 
-- [ ] README and configuration describe identical defaults, hard maximums, fail closed conditions, and activation order.
-- [ ] Architecture documents protocol version 2, World thread checks, persistent rate state, rolling all Claude budget accounting, retained history, and privacy isolation.
-- [ ] All changed non Markdown files contain no decorative non ASCII characters.
+- [x] README and configuration describe identical defaults, hard maximums, fail closed conditions, and activation order.
+- [x] Architecture documents protocol version 2, World thread checks, persistent rate state, rolling all Claude budget accounting, retained history, and privacy isolation.
+- [x] All changed non Markdown files contain no decorative non ASCII characters.
 - [ ] Python tests, Ruff, BasedPyright, the incremental C++ test target, and C++ codestyle complete with zero failures.
 - [ ] Verify: `(cd modules/mod-playerbot-claude/sidecar && uv run pytest -q && uv run ruff format --check . && uv run ruff check . && uv run basedpyright src tests) && cmake --build build-playerbot-claude-tests --target unit_tests --parallel "$(sysctl -n hw.logicalcpu)" && build-playerbot-claude-tests/src/test/unit_tests --gtest_filter='ClaudeChat*' && python apps/codestyle/codestyle-cpp.py`
 
@@ -273,7 +273,11 @@ These scenarios use the WoW 3.3.5a client, worldserver logs, and sidecar logs. T
 
 - The sidecar suite passed with 73 tests. Ruff formatting, Ruff lint, and BasedPyright also passed.
 - The isolated C++ harness passed all 44 `ClaudeChat*` tests, and `ClaudeChatScripts.cpp` compiled from the isolated worktree.
-- The existing CMake test tree targets the other checkout, so the approved incremental target was reproduced with its compile commands against the isolated sources instead of rebuilding the other session's files.
+- The isolated static worldserver compiled and linked successfully after selecting the same Homebrew Readline paths as the known good build.
+- The combined native suite ran 11,468 tests with 5,982 passes, 5,486 intentional skips, and zero failures. The focused ambient and stuck recovery filter passed all 50 tests.
 - The repository wide C++ style command still reports existing failures in unrelated AzerothCore core files. The module diff has no whitespace errors, decorative non ASCII additions, or unresolved `SHORTCUT` markers.
 - Changes review findings were fixed by rejecting duplicate or coerced JSON fields and adding one byte exact ambient fixture to both protocol suites.
-- Live TS-001 through TS-004 remain gated on separate authorization to build, install, configure, and exercise the change through a WoW client.
+- The installed worldserver hash is `4612bcec051bf836cad150a0ad6ad4533c51c70c9ba83b4ad99bd9570b2eed16`. Startup logged ambient World chat enabled at six messages per hour, the bridge worker connected on loopback, and 153 random bots online. The previous binary is preserved as `worldserver.pre-ambient-20260730`.
+- The deployed sidecar doctor reported a healthy shared rolling budget with `0.010835 USD` spent, `0 USD` reserved, and `4.989165 USD` remaining.
+- TS-002 step 1 passed over 639 seconds across one complete ambient interval. With no human connected, ambient attempts remained zero and reservation and usage row counts both remained unchanged at 16.
+- TS-001, TS-002 steps 2 and 3, TS-003, and TS-004 still require a WoW client session.
