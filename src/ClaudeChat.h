@@ -26,16 +26,20 @@
 // bridge worker. Responses carry text only; nothing in a response can invoke gameplay.
 namespace ClaudeChat
 {
-    inline constexpr uint32 SCHEMA_VERSION = 1;
+    inline constexpr uint32 SCHEMA_VERSION = 2;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
     inline constexpr size_t MIN_BRIDGE_TOKEN_BYTES = 32;
+    inline constexpr uint32 MAX_AMBIENT_MESSAGES_PER_HOUR = 6;
+    inline constexpr uint8 AMBIENT_EVENT_KIND = 4;
+    inline constexpr char AMBIENT_EVENT_MARKER[] = "ambient_world";
 
     enum class ChatChannel : uint8
     {
         Whisper = 0,
-        Party = 1
+        Party = 1,
+        World = 2
     };
 
     // Immutable snapshot captured on the world thread. expiresAtSteadyMs is a steady-clock
@@ -179,6 +183,25 @@ namespace ClaudeChat
     std::optional<uint64> SelectMilestoneSpeaker(MilestoneEventId const& eventId,
                                                  std::vector<SpeakerCandidate> candidates);
 
+    // Deterministic personality-weighted choice for one ambient occurrence. The
+    // selected bot is stable for the same occurrence and eligible candidate set.
+    std::optional<uint64> SelectAmbientSpeaker(uint64 occurrence, std::vector<SpeakerCandidate> candidates);
+
+    // Local steady-clock scheduler. A newly configured cadence waits one full
+    // interval, and a late evaluation advances from now so no catch-up burst occurs.
+    class AmbientCadence
+    {
+    public:
+        AmbientCadence(uint32 messagesPerHour, int64 startMs);
+
+        bool IsValid() const;
+        bool TryConsumeDueSlot(int64 nowMs);
+
+    private:
+        int64 _intervalMs = 0;
+        int64 _nextDueMs = 0;
+    };
+
     // Bounded set of recently enqueued event identifiers with FIFO eviction. Insert
     // returns false for an exact duplicate still tracked.
     class RecentEventIdSet
@@ -218,8 +241,11 @@ namespace ClaudeChat
         bool botOnline = false;
         bool speakerOnline = false;
         bool botIsStillBot = false;
+        bool botAlive = false;
         bool botInCombat = true;
         bool sameGroup = false;
+        bool humanOnline = false;
+        bool worldChannelAvailable = false;
         bool expired = true;
     };
 

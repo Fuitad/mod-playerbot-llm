@@ -47,7 +47,7 @@ namespace
     }
 
     std::string ValidResponsePayload(uint64 requestId, std::string const& message,
-                                     std::string const& token = TEST_TOKEN, uint32 schemaVersion = 1)
+                                     std::string const& token = TEST_TOKEN, uint32 schemaVersion = 2)
     {
         return "{\"schema_version\":" + std::to_string(schemaVersion) + ",\"token\":\"" + token +
                "\",\"request_id\":" + std::to_string(requestId) + ",\"message\":\"" + message + "\"}";
@@ -203,7 +203,7 @@ TEST(ClaudeChatProtocolTest, FrameLengthDecodeRejectsOversizedLength)
 TEST(ClaudeChatProtocolTest, RequestSerializesToExactContractJson)
 {
     std::string const expected =
-        "{\"schema_version\":1,"
+        "{\"schema_version\":2,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":7,"
         "\"channel\":\"whisper\","
@@ -240,6 +240,17 @@ TEST(ClaudeChatProtocolTest, PartyChannelSerializesAsParty)
     EXPECT_NE(SerializeRequest(request, TEST_TOKEN).find("\"channel\":\"party\""), std::string::npos);
 }
 
+TEST(ClaudeChatProtocolTest, WorldChannelSerializesAsWorld)
+{
+    ChatRequest request = MakeFixtureRequest();
+    request.channel = ChatChannel::World;
+    request.speakerGuidCounter = 0;
+    request.speakerName.clear();
+    request.message = AMBIENT_EVENT_MARKER;
+    request.eventKind = AMBIENT_EVENT_KIND;
+    EXPECT_NE(SerializeRequest(request, TEST_TOKEN).find("\"channel\":\"world\""), std::string::npos);
+}
+
 // --- Protocol: response parsing ---
 
 TEST(ClaudeChatProtocolTest, ValidResponseRoundTrips)
@@ -261,7 +272,7 @@ TEST(ClaudeChatProtocolTest, ResponseUnescapesMessage)
 
 TEST(ClaudeChatProtocolTest, ResponseRejectsWrongSchemaVersion)
 {
-    EXPECT_FALSE(ParseResponsePayload(ValidResponsePayload(7, "hello", TEST_TOKEN, 2), TEST_TOKEN).has_value());
+    EXPECT_FALSE(ParseResponsePayload(ValidResponsePayload(7, "hello", TEST_TOKEN, 1), TEST_TOKEN).has_value());
 }
 
 TEST(ClaudeChatProtocolTest, ResponseRejectsWrongToken)
@@ -520,6 +531,46 @@ TEST(ClaudeChatSelectionTest, EmptyCandidateListSelectsNothing)
     EXPECT_FALSE(SelectMilestoneSpeaker(quest, {}).has_value());
 }
 
+TEST(ClaudeChatSelectionTest, AmbientLiteralFixturesMatchContract)
+{
+    std::vector<SpeakerCandidate> candidates{{30, 0}, {10, 0}, {20, 0}};
+    EXPECT_EQ(SelectAmbientSpeaker(0, candidates), std::optional<uint64>(30));
+    EXPECT_EQ(SelectAmbientSpeaker(1, candidates), std::optional<uint64>(20));
+    EXPECT_EQ(SelectAmbientSpeaker(2, candidates), std::optional<uint64>(10));
+}
+
+TEST(ClaudeChatSelectionTest, AmbientSelectionIsStableAcrossCandidateOrder)
+{
+    std::optional<uint64> const sorted = SelectAmbientSpeaker(17, {{10, 91}, {20, 8}, {30, 34}});
+    std::optional<uint64> const shuffled = SelectAmbientSpeaker(17, {{30, 34}, {10, 91}, {20, 8}});
+    EXPECT_EQ(sorted, shuffled);
+    EXPECT_EQ(sorted, std::optional<uint64>(10));
+    EXPECT_FALSE(SelectAmbientSpeaker(17, {}).has_value());
+}
+
+TEST(ClaudeChatPolicyTest, AmbientCadenceHasNoStartupOrCatchUpBurst)
+{
+    AmbientCadence cadence(6, 1000);
+    EXPECT_TRUE(cadence.IsValid());
+    EXPECT_FALSE(cadence.TryConsumeDueSlot(1000));
+    EXPECT_FALSE(cadence.TryConsumeDueSlot(600999));
+    EXPECT_TRUE(cadence.TryConsumeDueSlot(601000));
+    EXPECT_FALSE(cadence.TryConsumeDueSlot(601000));
+
+    EXPECT_TRUE(cadence.TryConsumeDueSlot(3601000));
+    EXPECT_FALSE(cadence.TryConsumeDueSlot(3601000));
+    EXPECT_FALSE(cadence.TryConsumeDueSlot(4200999));
+    EXPECT_TRUE(cadence.TryConsumeDueSlot(4201000));
+}
+
+TEST(ClaudeChatPolicyTest, AmbientCadenceRejectsRatesOutsideHardLimit)
+{
+    EXPECT_FALSE(AmbientCadence(0, 0).IsValid());
+    EXPECT_TRUE(AmbientCadence(1, 0).IsValid());
+    EXPECT_TRUE(AmbientCadence(MAX_AMBIENT_MESSAGES_PER_HOUR, 0).IsValid());
+    EXPECT_FALSE(AmbientCadence(MAX_AMBIENT_MESSAGES_PER_HOUR + 1, 0).IsValid());
+}
+
 TEST(ClaudeChatSelectionTest, ExactDuplicateEventIdCannotEnqueueTwice)
 {
     RecentEventIdSet recent(8);
@@ -649,6 +700,35 @@ TEST(ClaudeChatPolicyTest, PartyDeliveryAlsoRequiresSameGroup)
     DeliverySnapshot inCombat = good;
     inCombat.botInCombat = true;
     EXPECT_FALSE(ShouldDeliver(ChatChannel::Party, inCombat));
+}
+
+TEST(ClaudeChatPolicyTest, WorldDeliveryRequiresHumanAndQuietAvailableBot)
+{
+    DeliverySnapshot good;
+    good.botOnline = true;
+    good.botAlive = true;
+    good.botIsStillBot = true;
+    good.botInCombat = false;
+    good.humanOnline = true;
+    good.worldChannelAvailable = true;
+    good.expired = false;
+    EXPECT_TRUE(ShouldDeliver(ChatChannel::World, good));
+
+    DeliverySnapshot noHuman = good;
+    noHuman.humanOnline = false;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::World, noHuman));
+
+    DeliverySnapshot dead = good;
+    dead.botAlive = false;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::World, dead));
+
+    DeliverySnapshot fighting = good;
+    fighting.botInCombat = true;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::World, fighting));
+
+    DeliverySnapshot noChannel = good;
+    noChannel.worldChannelAvailable = false;
+    EXPECT_FALSE(ShouldDeliver(ChatChannel::World, noChannel));
 }
 
 TEST(ClaudeChatPolicyTest, GroupCooldownAllowsOneMilestonePerWindow)

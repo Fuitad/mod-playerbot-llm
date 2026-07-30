@@ -94,6 +94,21 @@ namespace
         AppendEscapedJsonString(out, value);
     }
 
+    std::string ChatChannelName(ClaudeChat::ChatChannel channel)
+    {
+        switch (channel)
+        {
+            case ClaudeChat::ChatChannel::Whisper:
+                return "whisper";
+            case ClaudeChat::ChatChannel::Party:
+                return "party";
+            case ClaudeChat::ChatChannel::World:
+                return "world";
+        }
+
+        return "";
+    }
+
     // Strict flat JSON value: unsigned integer or string only.
     struct FlatJsonValue
     {
@@ -418,7 +433,7 @@ std::string ClaudeChat::SerializeRequest(ChatRequest const& request, std::string
     AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
     AppendJsonField(out, "token", token);
     AppendJsonField(out, "request_id", request.requestId);
-    AppendJsonField(out, "channel", std::string(request.channel == ChatChannel::Party ? "party" : "whisper"));
+    AppendJsonField(out, "channel", ChatChannelName(request.channel));
     AppendJsonField(out, "bot_guid", request.botGuidCounter);
     AppendJsonField(out, "speaker_guid", request.speakerGuidCounter);
     AppendJsonField(out, "bot_name", request.botName);
@@ -481,6 +496,7 @@ std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::st
 namespace
 {
     constexpr uint64 MILESTONE_NAMESPACE = 0x4D494C4553544F4EULL;
+    constexpr uint64 AMBIENT_NAMESPACE = 0x414D4249454E5400ULL;
 }
 
 std::optional<uint64> ClaudeChat::SelectMilestoneSpeaker(MilestoneEventId const& eventId,
@@ -514,6 +530,59 @@ std::optional<uint64> ClaudeChat::SelectMilestoneSpeaker(MilestoneEventId const&
     }
 
     return candidates.back().guidCounter;
+}
+
+std::optional<uint64> ClaudeChat::SelectAmbientSpeaker(uint64 occurrence,
+                                                       std::vector<SpeakerCandidate> candidates)
+{
+    if (candidates.empty())
+        return std::nullopt;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](SpeakerCandidate const& a, SpeakerCandidate const& b) { return a.guidCounter < b.guidCounter; });
+
+    uint64 seed = PlayerbotPersonality::SplitMix64(occurrence ^ AMBIENT_NAMESPACE ^
+                                                   static_cast<uint64>(MILESTONE_SELECTION_VERSION));
+    for (SpeakerCandidate const& candidate : candidates)
+        seed = PlayerbotPersonality::SplitMix64(seed ^ candidate.guidCounter);
+
+    uint64 totalWeight = 0;
+    for (SpeakerCandidate const& candidate : candidates)
+        totalWeight += 1u + candidate.sociability;
+
+    uint64 const roll = seed % totalWeight;
+    uint64 cumulative = 0;
+    for (SpeakerCandidate const& candidate : candidates)
+    {
+        cumulative += 1u + candidate.sociability;
+        if (cumulative > roll)
+            return candidate.guidCounter;
+    }
+
+    return candidates.back().guidCounter;
+}
+
+ClaudeChat::AmbientCadence::AmbientCadence(uint32 messagesPerHour, int64 startMs)
+{
+    if (!messagesPerHour || messagesPerHour > MAX_AMBIENT_MESSAGES_PER_HOUR)
+        return;
+
+    _intervalMs = 60 * 60 * 1000 / messagesPerHour;
+    _nextDueMs = startMs + _intervalMs;
+}
+
+bool ClaudeChat::AmbientCadence::IsValid() const
+{
+    return _intervalMs > 0;
+}
+
+bool ClaudeChat::AmbientCadence::TryConsumeDueSlot(int64 nowMs)
+{
+    if (!IsValid() || nowMs < _nextDueMs)
+        return false;
+
+    _nextDueMs = nowMs + _intervalMs;
+    return true;
 }
 
 bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
@@ -587,7 +656,13 @@ bool ClaudeChat::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snap
     if (snapshot.expired)
         return false;
 
-    if (!snapshot.botOnline || !snapshot.speakerOnline || !snapshot.botIsStillBot)
+    if (!snapshot.botOnline || !snapshot.botIsStillBot)
+        return false;
+
+    if (channel == ChatChannel::World)
+        return snapshot.botAlive && !snapshot.botInCombat && snapshot.humanOnline && snapshot.worldChannelAvailable;
+
+    if (!snapshot.speakerOnline)
         return false;
 
     // Whispering while fighting is normal play, so combat only mutes the noisier
