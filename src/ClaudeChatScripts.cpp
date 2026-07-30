@@ -360,19 +360,21 @@ namespace
 
         // Observation only: the original message is never modified or blocked, so the
         // playerbot command path sees exactly what it would without this module.
-        bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*language*/, std::string& message,
+        // LANG_ADDON traffic (DBM sync pings and similar hidden addon whispers) is
+        // machine chatter, never conversation.
+        bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& message,
                                 Player* receiver) override
         {
-            if (type == CHAT_MSG_WHISPER)
+            if (type == CHAT_MSG_WHISPER && language != LANG_ADDON)
                 ClaudeChatState::Instance().CaptureWhisper(player, receiver, message);
 
             return true;
         }
 
-        bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*language*/, std::string& message,
+        bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& message,
                                 Group* group) override
         {
-            if (type == CHAT_MSG_PARTY)
+            if (type == CHAT_MSG_PARTY && language != LANG_ADDON)
                 ClaudeChatState::Instance().CaptureParty(player, group, message);
 
             return true;
