@@ -22,7 +22,7 @@ TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
 # Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
 CPP_REQUEST_FIXTURE = (
-    '{"schema_version":1,'
+    '{"schema_version":2,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":7,'
     '"channel":"whisper",'
@@ -44,6 +44,23 @@ CPP_REQUEST_FIXTURE = (
 
 def valid_request_dict() -> dict[str, object]:
     return json.loads(CPP_REQUEST_FIXTURE)
+
+
+def ambient_request_dict() -> dict[str, object]:
+    request = valid_request_dict()
+    request.update(
+        {
+            "request_id": 8,
+            "channel": "world",
+            "speaker_guid": 0,
+            "speaker_name": "",
+            "event_kind": 4,
+            "subject_id": 0,
+            "occurrence": 9,
+            "message": "ambient_world",
+        }
+    )
+    return request
 
 
 def parse(payload_dict: dict[str, object], token: str = TEST_TOKEN) -> protocol.ChatRequest:
@@ -122,7 +139,7 @@ def test_accepts_exact_cpp_fixture() -> None:
 
 def test_rejects_invalid_utf8_payload() -> None:
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_request(b'{"schema_version":1,"bad":"\xff"}', TEST_TOKEN)
+        protocol.parse_request(b'{"schema_version":2,"bad":"\xff"}', TEST_TOKEN)
 
 
 def test_rejects_non_object_payload() -> None:
@@ -134,7 +151,7 @@ def test_rejects_non_object_payload() -> None:
 
 def test_rejects_wrong_schema_version() -> None:
     payload = valid_request_dict()
-    payload["schema_version"] = 2
+    payload["schema_version"] = 1
     with pytest.raises(protocol.ProtocolError):
         parse(payload)
 
@@ -187,7 +204,7 @@ def test_rejects_out_of_bounds_profile() -> None:
 
 def test_rejects_unknown_event_kinds_and_channels() -> None:
     payload = valid_request_dict()
-    payload["event_kind"] = 4
+    payload["event_kind"] = 5
     with pytest.raises(protocol.ProtocolError):
         parse(payload)
 
@@ -195,6 +212,35 @@ def test_rejects_unknown_event_kinds_and_channels() -> None:
     payload["channel"] = "guild"
     with pytest.raises(protocol.ProtocolError):
         parse(payload)
+
+
+def test_accepts_only_the_trusted_ambient_field_combination() -> None:
+    request = parse(ambient_request_dict())
+    assert request.channel == "world"
+    assert request.event_kind == 4
+    assert request.speaker_guid == 0
+    assert request.speaker_name == ""
+
+    for field, invalid in (
+        ("channel", "party"),
+        ("speaker_guid", 9001),
+        ("speaker_name", "Speaker"),
+        ("event_kind", 0),
+        ("subject_id", 42),
+        ("message", "player supplied text"),
+    ):
+        payload = ambient_request_dict()
+        payload[field] = invalid
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+
+def test_rejects_ambient_identity_fields_on_direct_chat() -> None:
+    for field, invalid in (("speaker_guid", 0), ("speaker_name", "")):
+        payload = valid_request_dict()
+        payload[field] = invalid
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
 
 
 def test_rejects_oversized_or_empty_message() -> None:
@@ -230,7 +276,7 @@ def test_response_payload_matches_cpp_accepted_shape() -> None:
     payload = protocol.encode_response(7, "I enjoy fishing.", TEST_TOKEN)
     # Byte-for-byte the shape the C++ ValidResponseRoundTrips fixture accepts.
     assert payload == (
-        b'{"schema_version":1,"token":"0123456789abcdef0123456789abcdef",'
+        b'{"schema_version":2,"token":"0123456789abcdef0123456789abcdef",'
         b'"request_id":7,"message":"I enjoy fishing."}'
     )
 
@@ -331,6 +377,33 @@ def test_generate_reply_includes_bounded_history() -> None:
 
     roles = [m["role"] for m in captured["body"]["messages"]]
     assert roles == ["user", "assistant", "user"]
+
+
+def test_ambient_provider_payload_uses_only_bot_personality() -> None:
+    captured: dict[str, Any] = {}
+    private_marker = "PRIVATE-WHISPER-MARKER-7E31"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return messages_response("The road has its own kind of rhythm.")
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    ambient = protocol.parse_request(json.dumps(ambient_request_dict()).encode(), TEST_TOKEN)
+    adapter.generate_reply(ambient, history=[("user", private_marker), ("assistant", "Private reply")])
+
+    body = captured["body"]
+    serialized = json.dumps(body)
+    assert "Botname" in serialized
+    assert "65" in serialized and "91" in serialized and "82" in serialized
+    assert "earnest" in serialized
+    assert private_marker not in serialized
+    assert "Speaker" not in serialized
+    assert "9001" not in serialized
+    assert "ambient_world" not in serialized
+    assert "tools" not in body
+    assert len(body["messages"]) == 1
+    assert "observation" in body["messages"][0]["content"]
+    assert "current game facts" in body["messages"][0]["content"]
 
 
 def test_count_input_tokens_uses_count_tokens_endpoint() -> None:
@@ -545,7 +618,7 @@ async def test_service_processes_valid_request(tmp_path) -> None:
     assert payload is not None
 
     response = json.loads(payload)
-    assert response["schema_version"] == 1
+    assert response["schema_version"] == 2
     assert response["request_id"] == 7
     assert response["message"] == "A fine day for fishing."
     assert response["token"] == TEST_TOKEN
@@ -750,6 +823,19 @@ async def test_service_records_profile_memory_and_settlement(tmp_path) -> None:
     second["request_id"] = 8
     assert await service.process_payload(json.dumps(second).encode()) is not None
     assert len(fake.histories[-1]) == 2
+
+
+async def test_ambient_service_never_reads_or_appends_conversation_history(tmp_path) -> None:
+    service, store, fake = make_stored_service(tmp_path)
+    private_marker = "PRIVATE-WHISPER-MARKER-7E31"
+    store.append_turn(42, "user", private_marker)
+    before = store.recent_turns(42)
+
+    payload = json.dumps(ambient_request_dict()).encode()
+    assert await service.process_payload(payload) is not None
+
+    assert fake.histories[-1] == []
+    assert store.recent_turns(42) == before
 
 
 async def test_service_rejects_oversized_prompt_without_generation(tmp_path) -> None:

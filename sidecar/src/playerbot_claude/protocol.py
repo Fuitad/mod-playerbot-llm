@@ -12,15 +12,25 @@ import asyncio
 import hmac
 import json
 import struct
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_RESPONSE_MESSAGE_BYTES = 240
 MIN_BRIDGE_TOKEN_BYTES = 32
+AMBIENT_EVENT_KIND = 4
+AMBIENT_EVENT_MARKER = "ambient_world"
 
 VOICES = ("reserved", "pragmatic", "earnest", "wry", "boisterous")
 
@@ -49,20 +59,20 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
-    channel: Literal["whisper", "party"]
+    channel: Literal["whisper", "party", "world"]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
-    speaker_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    speaker_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     bot_name: Annotated[str, StringConstraints(min_length=1, max_length=48)]
-    speaker_name: Annotated[str, StringConstraints(min_length=1, max_length=48)]
+    speaker_name: Annotated[str, StringConstraints(max_length=48)]
     profile_version: Literal[1]
     crafting_affinity: Annotated[int, Field(ge=0, le=100)]
     exploration_affinity: Annotated[int, Field(ge=0, le=100)]
     sociability: Annotated[int, Field(ge=0, le=100)]
     voice: Literal["reserved", "pragmatic", "earnest", "wry", "boisterous"]
-    event_kind: Literal[0, 1, 2, 3]
+    event_kind: Literal[0, 1, 2, 3, 4]
     subject_id: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     occurrence: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     message: str
@@ -74,6 +84,27 @@ class ChatRequest(BaseModel):
             raise ValueError("message must be 1 to 512 UTF-8 bytes")
 
         return value
+
+    @model_validator(mode="after")
+    def _validate_ambient_fields(self) -> Self:
+        if self.channel == "world" or self.event_kind == AMBIENT_EVENT_KIND:
+            if (
+                self.channel != "world"
+                or self.event_kind != AMBIENT_EVENT_KIND
+                or self.speaker_guid != 0
+                or self.speaker_name
+                or self.subject_id != 0
+                or self.message != AMBIENT_EVENT_MARKER
+            ):
+                raise ValueError("ambient World request fields do not match the trusted contract")
+        elif self.speaker_guid == 0 or not self.speaker_name:
+            raise ValueError("direct chat requires a human speaker identity")
+
+        return self
+
+    @property
+    def is_ambient(self) -> bool:
+        return self.channel == "world"
 
 
 def encode_frame(payload: bytes) -> bytes:

@@ -411,7 +411,8 @@ namespace
             if (!ShouldEnqueueAmbient(humanOnline, snapshots))
                 return;
 
-            std::optional<uint64> const selected = SelectAmbientSpeaker(_ambientOccurrence++, candidates);
+            uint64 const occurrence = _ambientOccurrence++;
+            std::optional<uint64> const selected = SelectAmbientSpeaker(occurrence, candidates);
             if (!selected)
                 return;
 
@@ -430,6 +431,7 @@ namespace
             request.profile = PlayerbotPersonality::DeriveProfile(request.botGuidCounter);
             request.message = AMBIENT_EVENT_MARKER;
             request.eventKind = AMBIENT_EVENT_KIND;
+            request.occurrence = occurrence;
             request.expiresAtSteadyMs = SteadyNowMs() + _responseDeadlineMs;
             Enqueue(std::move(request), bot, nullptr, ChatChannel::World);
         }

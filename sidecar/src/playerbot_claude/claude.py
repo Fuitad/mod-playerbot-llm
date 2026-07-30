@@ -33,6 +33,7 @@ EVENT_KIND_NAMES = {
     1: "quest completion",
     2: "level gain",
     3: "rare loot",
+    4: "ambient World chatter",
 }
 
 
@@ -79,9 +80,13 @@ class UsageTotals:
 def build_system_prompt(request: protocol.ChatRequest) -> str:
     """Stable, trusted-only system prompt. Player text never enters it."""
 
+    audience = (
+        "speaking in character to the World channel"
+        if request.is_ambient
+        else f"speaking in character over {request.channel} chat with {request.speaker_name}"
+    )
     return (
-        f"You are {request.bot_name}, an adventurer in the world of Azeroth, speaking in "
-        f"character over {request.channel} chat with {request.speaker_name}.\n"
+        f"You are {request.bot_name}, an adventurer in the world of Azeroth, {audience}.\n"
         f"Your fixed personality (each trait 0 to 100): crafting affinity {request.crafting_affinity}, "
         f"exploration affinity {request.exploration_affinity}, sociability {request.sociability}. "
         f"Your voice is {request.voice}: let that tone color every reply.\n"
@@ -96,6 +101,12 @@ def build_system_prompt(request: protocol.ChatRequest) -> str:
 
 
 def build_user_message(request: protocol.ChatRequest) -> str:
+    if request.is_ambient:
+        return (
+            "Offer one brief in-character World observation. Do not claim current game facts, "
+            "address a specific player, or promise any action."
+        )
+
     if request.event_kind == 0:
         return f"{request.speaker_name} says to you: {request.message}"
 
@@ -108,6 +119,9 @@ def build_user_message(request: protocol.ChatRequest) -> str:
 
 def _build_messages(request: protocol.ChatRequest, history: list[tuple[str, str]]) -> list[MessageParam]:
     # History roles are constrained to user/assistant by storage's CHECK clause.
+    if request.is_ambient:
+        history = []
+
     messages: list[MessageParam] = [
         cast(MessageParam, {"role": role, "content": text}) for role, text in history
     ]

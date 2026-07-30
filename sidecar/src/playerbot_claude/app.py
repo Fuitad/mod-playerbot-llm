@@ -215,14 +215,15 @@ class SidecarService:
                     self._store.settle(
                         reservation, usage.input_tokens, usage.output_tokens, self._config.prices
                     )
-                self._store.append_turn(request.bot_guid, "user", claude.build_user_message(request))
-                self._store.append_turn(request.bot_guid, "assistant", reply)
+                if not request.is_ambient:
+                    self._store.append_turn(request.bot_guid, "user", claude.build_user_message(request))
+                    self._store.append_turn(request.bot_guid, "assistant", reply)
 
         _log(f"request {request.request_id}: replied ({usage.input_tokens} in, {usage.output_tokens} out)")
         return protocol.encode_response(request.request_id, reply, self._token)
 
     def _history_for(self, request: protocol.ChatRequest) -> list[tuple[str, str]]:
-        if self._store is None:
+        if self._store is None or request.is_ambient:
             return []
 
         return self._store.recent_turns(request.bot_guid)
