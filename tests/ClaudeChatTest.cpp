@@ -571,6 +571,44 @@ TEST(ClaudeChatPolicyTest, AmbientCadenceRejectsRatesOutsideHardLimit)
     EXPECT_FALSE(AmbientCadence(MAX_AMBIENT_MESSAGES_PER_HOUR + 1, 0).IsValid());
 }
 
+TEST(ClaudeChatPolicyTest, AmbientEligibilityRequiresHumanAndAvailableQuietBot)
+{
+    AmbientCandidateSnapshot good;
+    good.botOnline = true;
+    good.botAlive = true;
+    good.botIsMachine = true;
+    good.botInCombat = false;
+    good.worldChannelAvailable = true;
+
+    EXPECT_TRUE(ShouldEnqueueAmbient(true, {good}));
+    EXPECT_FALSE(ShouldEnqueueAmbient(false, {good}));
+    EXPECT_FALSE(ShouldEnqueueAmbient(true, {}));
+
+    AmbientCandidateSnapshot noChannel = good;
+    noChannel.worldChannelAvailable = false;
+    EXPECT_FALSE(ShouldEnqueueAmbient(true, {noChannel}));
+
+    AmbientCandidateSnapshot fighting = good;
+    fighting.botInCombat = true;
+    EXPECT_FALSE(ShouldEnqueueAmbient(true, {fighting}));
+}
+
+TEST(ClaudeChatBridgeTest, DeclinedAmbientSnapshotProducesNoOutboundFrame)
+{
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string>
+    {
+        return ValidResponsePayload(1, "unexpected");
+    });
+
+    ClaudeBridge bridge(MakeBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ASSERT_FALSE(ShouldEnqueueAmbient(false, {}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(server.HandledRequests(), 0u);
+    bridge.Stop();
+}
+
 TEST(ClaudeChatSelectionTest, ExactDuplicateEventIdCannotEnqueueTwice)
 {
     RecentEventIdSet recent(8);

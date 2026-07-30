@@ -202,6 +202,19 @@ namespace ClaudeChat
         int64 _nextDueMs = 0;
     };
 
+    struct AmbientCandidateSnapshot
+    {
+        bool botOnline = false;
+        bool botAlive = false;
+        bool botIsMachine = false;
+        bool botInCombat = true;
+        bool worldChannelAvailable = false;
+    };
+
+    // True only when a human is online and at least one candidate passes every
+    // preflight gate required for a World request.
+    bool ShouldEnqueueAmbient(bool humanOnline, std::vector<AmbientCandidateSnapshot> const& candidates);
+
     // Bounded set of recently enqueued event identifiers with FIFO eviction. Insert
     // returns false for an exact duplicate still tracked.
     class RecentEventIdSet

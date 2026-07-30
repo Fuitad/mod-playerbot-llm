@@ -585,6 +585,19 @@ bool ClaudeChat::AmbientCadence::TryConsumeDueSlot(int64 nowMs)
     return true;
 }
 
+bool ClaudeChat::ShouldEnqueueAmbient(bool humanOnline,
+                                      std::vector<AmbientCandidateSnapshot> const& candidates)
+{
+    if (!humanOnline)
+        return false;
+
+    return std::any_of(candidates.begin(), candidates.end(), [](AmbientCandidateSnapshot const& candidate)
+    {
+        return candidate.botOnline && candidate.botAlive && candidate.botIsMachine && !candidate.botInCombat &&
+               candidate.worldChannelAvailable;
+    });
+}
+
 bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
 {
     for (MilestoneEventId const& seen : _order)

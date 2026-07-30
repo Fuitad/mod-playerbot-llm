@@ -22,6 +22,23 @@
 PlayerbotClaude.Enable = 0
 
 #
+#    PlayerbotClaude.AmbientWorldEnable
+#        Description: Enables personality shaped ambient messages in the World channel. Requires
+#                     AiPlayerbot.EnableBroadcasts = 0 so canned and Claude chatter cannot overlap.
+#        Default:     0 - Disabled
+#                     1 - Enabled
+
+PlayerbotClaude.AmbientWorldEnable = 0
+
+#
+#    PlayerbotClaude.AmbientMaxMessagesPerHour
+#        Description: Maximum accepted ambient attempts in any rolling hour. Values from 1 through
+#                     6 are valid. Values outside that range disable ambient World chat.
+#        Default:     6
+
+PlayerbotClaude.AmbientMaxMessagesPerHour = 6
+
+#
 #    PlayerbotClaude.BridgePort
 #        Description: Loopback TCP port of the sidecar bridge. Both worldserver and the sidecar
 #                     use this value. 0 disables both processes. The sidecar binds only to

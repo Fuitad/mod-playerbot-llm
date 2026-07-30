@@ -4,6 +4,7 @@
 
 #include "ClaudeChat.h"
 
+#include "ChannelMgr.h"
 #include "Chat.h"
 #include "Config.h"
 #include "Group.h"
@@ -18,7 +19,9 @@
 
 #include "ExternalEventHelper.h"
 #include "PlayerbotAI.h"
+#include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+#include "RandomPlayerbotMgr.h"
 
 #include <cctype>
 #include <unordered_map>
@@ -56,6 +59,27 @@ namespace
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(actor);
         return !botAI || botAI->IsRealPlayer();
+    }
+
+    bool HasOnlineHuman()
+    {
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* player = entry.second;
+            if (player && player->IsInWorld() && IsRealPlayerActor(player))
+                return true;
+        }
+
+        return false;
+    }
+
+    bool HasWorldChannel(Player* player)
+    {
+        if (!player)
+            return false;
+
+        ChannelMgr* channelManager = ChannelMgr::forTeam(player->GetTeamId());
+        return channelManager && channelManager->GetChannel("World", player);
     }
 
     bool EqualNamesCaseInsensitive(std::string const& a, std::string const& b)
@@ -116,6 +140,7 @@ namespace
                 std::max<int64>(1000, sConfigMgr->GetOption<int32>("PlayerbotClaude.ResponseDeadlineMs", 10000));
             _groupCooldownMs =
                 std::max<int64>(0, sConfigMgr->GetOption<int32>("PlayerbotClaude.GroupCooldownSeconds", 120)) * 1000;
+            ConfigureAmbient();
 
             BridgeConfig config;
             config.port = static_cast<uint16>(port);
@@ -135,6 +160,7 @@ namespace
                 _bridge->Stop();
             _bridge.reset();
             _pending.clear();
+            _ambientCadence.reset();
         }
 
         void CaptureWhisper(Player* speaker, Player* receiver, std::string const& message)
@@ -269,16 +295,21 @@ namespace
                 _pending.erase(it);
 
                 Player* bot = ObjectAccessor::FindPlayer(delivery.botGuid);
-                Player* speaker = ObjectAccessor::FindPlayer(delivery.speakerGuid);
+                Player* speaker = delivery.channel == ChatChannel::World
+                    ? nullptr
+                    : ObjectAccessor::FindPlayer(delivery.speakerGuid);
 
                 DeliverySnapshot snapshot;
                 snapshot.expired = SteadyNowMs() > delivery.expiresAtSteadyMs;
                 snapshot.botOnline = bot && bot->IsInWorld();
                 snapshot.speakerOnline = speaker && speaker->IsInWorld();
                 snapshot.botIsStillBot = IsMachineBot(bot);
+                snapshot.botAlive = bot && bot->IsAlive();
                 snapshot.botInCombat = !bot || bot->IsInCombat();
                 snapshot.sameGroup =
                     bot && speaker && bot->GetGroup() && bot->GetGroup() == speaker->GetGroup();
+                snapshot.humanOnline = delivery.channel == ChatChannel::World && HasOnlineHuman();
+                snapshot.worldChannelAvailable = delivery.channel == ChatChannel::World && HasWorldChannel(bot);
 
                 if (!ShouldDeliver(delivery.channel, snapshot))
                 {
@@ -290,7 +321,15 @@ namespace
                     continue;
                 }
 
-                if (delivery.channel == ChatChannel::Whisper)
+                if (delivery.channel == ChatChannel::World)
+                {
+                    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+                    if (!botAI || !botAI->SayToWorld(response.message))
+                        LOG_INFO("playerbot.claude",
+                                 "mod-playerbot-claude: World delivery failed for request {}",
+                                 response.requestId);
+                }
+                else if (delivery.channel == ChatChannel::Whisper)
                     bot->Whisper(response.message, LANG_UNIVERSAL, speaker);
                 else
                 {
@@ -303,9 +342,98 @@ namespace
 
             int64 const now = SteadyNowMs();
             std::erase_if(_pending, [now](auto const& entry) { return now > entry.second.expiresAtSteadyMs; });
+
+            if (_ambientCadence && _ambientCadence->TryConsumeDueSlot(now))
+                TryEnqueueAmbient();
         }
 
     private:
+        void ConfigureAmbient()
+        {
+            if (!sConfigMgr->GetOption<bool>("PlayerbotClaude.AmbientWorldEnable", false))
+                return;
+
+            int32 const messagesPerHour =
+                sConfigMgr->GetOption<int32>("PlayerbotClaude.AmbientMaxMessagesPerHour", 6);
+            if (messagesPerHour < 1 ||
+                messagesPerHour > static_cast<int32>(MAX_AMBIENT_MESSAGES_PER_HOUR))
+            {
+                LOG_ERROR("playerbot.claude",
+                          "mod-playerbot-claude: ambient World chat disabled "
+                          "(PlayerbotClaude.AmbientMaxMessagesPerHour must be from 1 through {})",
+                          MAX_AMBIENT_MESSAGES_PER_HOUR);
+                return;
+            }
+
+            if (sPlayerbotAIConfig.enableBroadcasts)
+            {
+                LOG_ERROR("playerbot.claude",
+                          "mod-playerbot-claude: ambient World chat disabled "
+                          "(set AiPlayerbot.EnableBroadcasts = 0)");
+                return;
+            }
+
+            _ambientCadence.emplace(static_cast<uint32>(messagesPerHour), SteadyNowMs());
+            LOG_INFO("playerbot.claude",
+                     "mod-playerbot-claude: ambient World chat enabled at up to {} messages per hour",
+                     messagesPerHour);
+        }
+
+        void TryEnqueueAmbient()
+        {
+            bool const humanOnline = HasOnlineHuman();
+            if (!humanOnline)
+                return;
+
+            std::vector<AmbientCandidateSnapshot> snapshots;
+            std::vector<SpeakerCandidate> candidates;
+            std::unordered_map<uint64, Player*> byCounter;
+            for (Player* bot : sRandomPlayerbotMgr.GetPlayers())
+            {
+                AmbientCandidateSnapshot snapshot;
+                snapshot.botOnline = bot && bot->IsInWorld();
+                snapshot.botAlive = bot && bot->IsAlive();
+                snapshot.botIsMachine = IsMachineBot(bot);
+                snapshot.botInCombat = !bot || bot->IsInCombat();
+                snapshot.worldChannelAvailable = HasWorldChannel(bot);
+                snapshots.push_back(snapshot);
+
+                if (!snapshot.botOnline || !snapshot.botAlive || !snapshot.botIsMachine ||
+                    snapshot.botInCombat || !snapshot.worldChannelAvailable)
+                    continue;
+
+                uint64 const counter = bot->GetGUID().GetCounter();
+                PlayerbotPersonalityProfile const profile = PlayerbotPersonality::DeriveProfile(counter);
+                candidates.push_back({counter, profile.sociability});
+                byCounter[counter] = bot;
+            }
+
+            if (!ShouldEnqueueAmbient(humanOnline, snapshots))
+                return;
+
+            std::optional<uint64> const selected = SelectAmbientSpeaker(_ambientOccurrence++, candidates);
+            if (!selected)
+                return;
+
+            auto const selectedIt = byCounter.find(*selected);
+            if (selectedIt == byCounter.end())
+                return;
+
+            Player* bot = selectedIt->second;
+            ChatRequest request;
+            request.requestId = _nextRequestId++;
+            request.channel = ChatChannel::World;
+            request.botGuidCounter = bot->GetGUID().GetCounter();
+            request.speakerGuidCounter = 0;
+            request.botName = bot->GetName();
+            request.speakerName.clear();
+            request.profile = PlayerbotPersonality::DeriveProfile(request.botGuidCounter);
+            request.message = AMBIENT_EVENT_MARKER;
+            request.eventKind = AMBIENT_EVENT_KIND;
+            request.expiresAtSteadyMs = SteadyNowMs() + _responseDeadlineMs;
+            Enqueue(std::move(request), bot, nullptr, ChatChannel::World);
+        }
+
         ChatRequest BuildRequestBase(ChatChannel channel, Player* bot, Player* speaker)
         {
             uint64 const botCounter = bot->GetGUID().GetCounter();
@@ -335,7 +463,8 @@ namespace
             PendingDelivery delivery;
             delivery.channel = channel;
             delivery.botGuid = bot->GetGUID();
-            delivery.speakerGuid = speaker->GetGUID();
+            if (speaker)
+                delivery.speakerGuid = speaker->GetGUID();
             delivery.expiresAtSteadyMs = request.expiresAtSteadyMs;
 
             uint64 const requestId = request.requestId;
@@ -348,7 +477,9 @@ namespace
         std::map<uint64, uint64> _occurrenceByActor;
         RecentEventIdSet _recentEvents{RECENT_EVENT_CAPACITY};
         GroupCooldownTracker _groupCooldowns;
+        std::optional<AmbientCadence> _ambientCadence;
         uint64 _nextRequestId = 1;
+        uint64 _ambientOccurrence = 0;
         int64 _responseDeadlineMs = 10000;
         int64 _groupCooldownMs = 120000;
     };
