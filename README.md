@@ -42,8 +42,10 @@ All keys live in `mod_playerbot_claude.conf` and are read by both worldserver an
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `PlayerbotClaude.Enable` | `0` | Master switch for the worldserver hooks. |
+| `PlayerbotClaude.AmbientWorldEnable` | `0` | Enables personality shaped ambient World chatter. |
+| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | Persistent rolling hourly limit. Values above `6` disable ambient chatter. |
 | `PlayerbotClaude.BridgePort` | `0` | Loopback TCP port shared by worldserver and sidecar. `0` disables both. |
-| `PlayerbotClaude.BudgetUsd` | `0` | Hard spending ceiling. `0` disables all generation. |
+| `PlayerbotClaude.DailyBudgetUsd` | `5` | Rolling 24 hour circuit breaker shared by all Claude generation. |
 | `PlayerbotClaude.InputUsdPerMTok` | `1.00` | Price per million input tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.OutputUsdPerMTok` | `5.00` | Price per million output tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.SidecarDatabase` | `playerbot_claude.sqlite` | SQLite path used by the sidecar. |
@@ -73,7 +75,7 @@ Health check (never prints a secret, exits nonzero when misconfigured):
 uv run playerbot-claude doctor --config /path/to/mod_playerbot_claude.conf
 ```
 
-The report includes current budget numbers: exact spent, reserved, and remaining USD.
+The report includes rolling spent, reserved, remaining, and next expiry values. It never includes prompts, database paths, or secrets.
 
 Inspect the observed personality profile of a bot that has spoken through the bridge:
 
@@ -86,6 +88,7 @@ uv run playerbot-claude profile --config /path/to/mod_playerbot_claude.conf --bo
 - **Whisper** a bot naturally: any whisper that mod-playerbots does not recognize as a bot command becomes Claude conversation. Known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. Prefixing with `llm ` forces Claude even for command-shaped text (`llm follow` asks the bot about following instead of ordering it to).
 - **Party chat**: `llm <bot-name> <message>` addresses one bot in your group. Party chat keeps the explicit prefix so ordinary group conversation never reaches the API.
 - **Milestones**: after a quest completion, a level gain, or a rare or epic loot drop, one deterministically selected group bot may react, at most once per `GroupCooldownSeconds` per group.
+- **Ambient World chatter**: set `PlayerbotClaude.AmbientWorldEnable = 1` and set `AiPlayerbot.EnableBroadcasts = 0` in `playerbots.conf`. The module refuses ambient mode while canned broadcasts remain enabled, but direct Claude conversations continue working. Ambient attempts occur only while a human player is connected, use an eligible online bot that is alive, outside combat, and able to speak in World, and are limited to six accepted attempts in any rolling hour. Delivery checks the human and bot again before speech.
 
 Replies are one short line (at most 240 bytes), in the bot's fixed voice. If anything fails (budget, timeout, provider error, invalid output), the bot simply stays silent.
 
@@ -95,13 +98,15 @@ Bots reuse the deterministic personality profiles defined by mod-playerbots (see
 
 ## What is sent to the cloud
 
-When a bot replies, the sidecar sends the following to the Anthropic API, and nothing else:
+For a direct conversation or milestone, the sidecar sends the following to the Anthropic API:
 
 - The bot's name and its personality numbers and voice (derived data, not player data)
 - The channel kind (whisper or party) and the milestone kind, when applicable
 - The name of the speaking player character
 - The player's `llm` message text, marked as untrusted
 - Up to 20 prior turns of that bot's stored conversation memory
+
+An ambient request sends only the selected bot's name, personality numbers, voice, and a fixed instruction to offer one brief World observation. It sends no human identity, human text, or conversation history. Ambient input and output are never appended to conversation memory.
 
 Never sent: account names, GUIDs, IP addresses, positions, inventories, combat state, the bridge token, recognized bot commands, or any party/group chat without the `llm ` prefix. Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. If you want the stricter opt-in-per-message behavior back, whisper traffic is exactly the `llm `-prefixed subset.
 
@@ -112,9 +117,9 @@ Cost per reply is `(input_tokens * InputUsdPerMTok + output_tokens * OutputUsdPe
 - 2,500 input plus 80 output tokens: `0.0029 USD`
 - 4,095 input plus 96 output tokens (the worst case; input is capped at 4,095 and output at 96 tokens): `0.004575 USD`
 
-A `PlayerbotClaude.BudgetUsd = 52.95` ceiling therefore covers roughly 18,258 typical replies, and at least 11,573 replies even if every single request hits the worst case.
+`PlayerbotClaude.DailyBudgetUsd = 5` is an emergency circuit breaker for all Claude features together. A measured day with about 7,700 input tokens and 610 output tokens costs approximately `0.01075 USD` at the configured rates. The circuit breaker is roughly 465 times that observed usage, so it is not a spending target.
 
-The ledger is conservative by construction. Every request reserves its maximum possible cost before the provider is called, and actual usage replaces the reservation only after a successful reply. A crash or provider failure leaves the reservation charged at maximum until you reconcile it, so the ceiling can never be exceeded, not even across restarts.
+The limit uses a rolling 24 hour window attributed to reservation creation time. Every request reserves its maximum possible cost before the provider is called, and successful settlement replaces that maximum with actual usage. Unsettled reservations keep their maximum charge. Both settled and unsettled commitment leave the active window exactly 24 hours after reservation, while their rows remain available for later reporting. Missing, negative, zero, or above `5` values disable generation. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
 
 ## Data retention and deletion
 
@@ -123,6 +128,7 @@ The sidecar's SQLite database (`PlayerbotClaude.SidecarDatabase`) holds:
 - The latest observed personality profile per bot
 - The most recent 20 conversation turns per bot (older turns are deleted automatically)
 - The budget ledger: reservations and an append-only usage log with price snapshots
+- Accepted ambient attempt timestamps used by the rolling hourly gate
 
 No secrets are ever stored. To delete all retained data, stop the sidecar and delete the SQLite file (including its `-wal` and `-shm` companions). Anthropic's own data handling is governed by their API terms.
 
