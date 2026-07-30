@@ -196,7 +196,7 @@ These scenarios use the WoW 3.3.5a client and worldserver logs because the user 
 - Immediately before a sell packet, re-resolve the selected item by exact GUID and recheck count, bag location, `CanBeTraded`, binding, container contents, conjured flag, duration, and `sAuctionMgr->GetAItem`. Any mismatch ends the cycle without a packet.
 - Before mail collection, refresh mail through the session handler. Restrict the internal path to delivered `MAIL_AUCTION` messages. Refactor the existing take processor so manual `mail take` keeps its master checks and messages while the economy path can silently collect auction items or money.
 - After each take handler returns, recheck the live mail. Remove it only when its money and attachments are gone. A failed item take or full bag leaves the message and remaining attachment intact.
-- Use `MailProcessor::FindMailbox` first. When a mailbox game object is visible but outside interaction range, move toward the nearest visible mailbox through `MovementAction::MoveTo`. When none is loaded, travel to the Auction House and retry on a later cycle.
+- Use `MailProcessor::FindMailbox` first. When the mailbox is not interactable, select the nearest cached same map mailbox as a forced travel destination. Keep auctioneer and mailbox destination storage stable for the server lifetime. Remove the temporary travel strategy and target after the mail operation completes.
 - Perform at most one purchase, sale, or craft cast per cycle. Auction mail collection may process the delivered auction messages that fit current bag space, then ends the cycle.
 - Rely on the per bot cached action instance supplied by `NamedObjectContext<Action>` to hold `nextEligibleTime`. Initialize it with the policy's stable GUID offset, then advance it by the existing `randomBotUpdateInterval` after every attempt. While cooling down, `isUseful` returns false so gathering, exploration, questing, and other noncombat actions retain control.
 - Clear a forced economy travel target after a successful operation or when the live snapshot no longer needs Auction House or mail work. Do not clear unrelated group, quest, or player forced targets.
@@ -204,7 +204,7 @@ These scenarios use the WoW 3.3.5a client and worldserver logs because the user 
 **Definition of Done:**
 
 - [ ] TS-001 proves reserved profession materials are never passed to the sell packet.
-- [ ] TS-002 proves one eligible reagent buyout, normal Auction House mail, mailbox collection, and one normal craft cast.
+- [x] TS-002 proves one eligible reagent buyout, normal Auction House mail, mailbox collection, and one normal craft cast.
 - [ ] TS-003 proves a real bot owned listing, normal purchase by another character, and normal proceeds collection.
 - [ ] TS-005 proves invalid operations leave inventory, gold, auctions, and mail unchanged.
 - [ ] Repeated timer firings between eligible times perform no economy operation and preserve normal gathering or exploration opportunities.
@@ -267,7 +267,7 @@ These scenarios use the WoW 3.3.5a client and worldserver logs because the user 
 
 ### Task 5: Verify, synchronize plans, and pin the compatible playerbot revision
 
-**Objective:** Run the complete available local evidence, commit the playerbot lifecycle with its approved plan, record that exact revision in the Claude module, and leave remote publication and deployment gated.
+**Objective:** Run the complete available local and live evidence, commit the playerbot lifecycle with its approved plan, record that exact revision in the Claude module, and install the authorized build.
 
 **Files:**
 
@@ -279,32 +279,34 @@ These scenarios use the WoW 3.3.5a client and worldserver logs because the user 
 **Key Decisions / Notes:**
 
 - Run the playerbot policy and existing personality suites, C++ codestyle, and `git diff --check` before marking source implementation `COMPLETE`.
-- Keep the plan at `COMPLETE` when no authorized runtime contains the committed revision. Mark it `VERIFIED` only after a separately authorized build and installation or deployment runs TS-001 through TS-005 against that exact revision.
+- Keep the plan at `COMPLETE` while any TS-001 through TS-005 step remains unexecuted. Mark it `VERIFIED` only after every scenario passes against the exact committed revision.
 - Commit `mod-playerbots` first using the required commit workflow. Copy the final plan into that repository in the same commit batch.
 - Write the resulting 40 character playerbot commit SHA to `mod-playerbot-claude/PLAYERBOTS_REVISION`, copy the final plan there, run the exact revision check, then commit the sidecar pin with the required commit workflow.
-- Commit the root plan after its final status is `VERIFIED`.
+- Commit the root plan with the final source status and preserve any remaining live gaps in the verification results.
 - Do not push any repository, install binaries, alter deployed configuration, or install `mod-ah-bot-plus` without separate current permission.
 
 **Definition of Done:**
 
 - [x] The full configured `unit_tests` binary exits with zero failures after the incremental build.
 - [x] C++ codestyle and `git diff --check` exit zero in every changed repository.
-- [ ] TS-001 through TS-005 record the executable playerbot revision and effective economy setting. Without separate deployment permission, they remain blocked and the plan remains `COMPLETE`, not `VERIFIED`.
+- [ ] TS-001 through TS-005 pass against the installed playerbot revision and effective economy setting.
 - [x] `PLAYERBOTS_REVISION` contains the exact committed `mod-playerbots` revision and the local equality check exits zero.
-- [ ] No approved plan remains untracked in the repository whose code or pin it documents.
+- [x] No approved plan remains untracked in the repository whose code or pin it documents.
 - [x] Verify: `test "$(tr -d '[:space:]' < modules/mod-playerbot-claude/PLAYERBOTS_REVISION)" = "$(git -C modules/mod-playerbots rev-parse HEAD)"`
 
 ## Verification Results
 
-Source status remains `COMPLETE`. The installed Worldserver does not contain an authorized deployment of this revision, so the plan is not `VERIFIED`.
+Source status remains `COMPLETE`. The authorized build and live checks prove the critical purchase lifecycle, but TS-001, TS-003, TS-004, and TS-005 still have unexecuted steps. The plan therefore remains `COMPLETE`, not `VERIFIED`.
 
 ### Automated Evidence
 
 | Check | Result | Evidence |
 |---|---|---|
 | Incremental `unit_tests` build | PASS | Exit 0 after compiling the policy, runtime action, guarded mail path, and action registration |
-| Focused personality and economy suites | PASS | 20 tests passed from 5 suites |
-| Full configured `unit_tests` binary | PASS | 11,450 tests ran, 5,964 passed, 5,486 skipped, zero failed, and 1 remained disabled |
+| Focused economy suites | PASS | 11 tests passed from 2 suites |
+| Full configured `unit_tests` binary | PASS | 11,454 tests ran, 5,968 passed, 5,486 skipped, zero failed, and 1 remained disabled |
+| Configured `worldserver` target | PASS | Exit 0 after compiling the forced Auction House and mailbox travel paths |
+| Installed server startup | PASS | Ports 8085 and 8888 opened, and the startup cache reported 40 auctioneers and 198 mailboxes |
 | Changed C++ codestyle | PASS | The repository codestyle script exited 0 against every changed C++ source and header |
 | Diff checks | PASS | Root, playerbot, and sidecar diff checks exited 0 |
 | Changes review | PASS after fixes | The two stack reserve is enforced during selection and immediately before sale. Manual mail take retains its original upfront bag guard. |
@@ -315,17 +317,15 @@ The broad root codestyle invocation remains noisy outside this change. Existing 
 
 | Scenario | Priority | Result | Notes |
 |---|---|---|---|
-| TS-001 | Critical | BLOCKED | Requires the committed revision installed in Worldserver and an observed gathering bot |
-| TS-002 | Critical | BLOCKED | Requires a live Auction House, mailbox, and WoW client |
-| TS-003 | Critical | BLOCKED | Requires a second character to buy a live bot listing |
-| TS-004 | High | BLOCKED | Requires a live run without optional liquidity before any separate module run |
-| TS-005 | Critical | BLOCKED | Static policy guards pass, but live state mutation proof requires the installed revision |
+| TS-001 | Critical | PARTIAL | Runtime bots resumed ordinary movement, questing, and combat around economy opportunities. A controlled gather before and after observation remains |
+| TS-002 | Critical | PASS | Kahoon bought the eligible 39 copper Peacebloom while leaving the 41 copper listing, received auction mail, traveled 57 yards to a mailbox, collected the attachment, and crafted one Minor Healing Potion |
+| TS-003 | Critical | PARTIAL | Bot owned live auctions increased from 57 to 66 through the core sell handler. A human purchase of one bot listing and bot proceeds collection remain |
+| TS-004 | High | PARTIAL | Buying, selling, mail, and crafting ran with no optional liquidity module installed. A separate optional module volume comparison remains |
+| TS-005 | Critical | PARTIAL | Unit guards cover unsafe candidates and the live price ceiling rejected the overpriced listing. A live full bag mail attempt remains |
 
 ### Not Verified
 
 | Not Verified | Reason |
 |---|---|
-| Executable identity and effective economy setting | No build installation or deployed configuration change was authorized |
-| TS-001 through TS-005 | They require the committed playerbot revision in a running Worldserver and game client interaction |
+| Remaining scenario steps | Controlled gathering continuity, a human purchase of a bot listing, optional liquidity comparison, and a live full bag mail attempt have not run |
 | Optional `mod-ah-bot-plus` volume run | Installation and activation are explicitly outside this source pass |
-| Root plan commit | The approved plan requires the root copy to remain uncommitted until its final status is `VERIFIED` |
