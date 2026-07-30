@@ -23,7 +23,7 @@ TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 def request_payload(request_id: int = 7, message: str = "What do you enjoy doing?") -> bytes:
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "token": TEST_TOKEN,
             "request_id": request_id,
             "channel": "whisper",
@@ -76,10 +76,16 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_sidecar(tmp_path, budget: float = 10.0):
+async def running_sidecar(tmp_path, budget: float = 1.0):
     adapter = FakeAdapter()
     store = storage.Storage(str(tmp_path / "integration.sqlite"))
-    config = app.SidecarConfig(enable=True, bridge_port=0, budget_usd=budget)
+    config = app.SidecarConfig(
+        enable=True,
+        bridge_port=0,
+        ambient_world_enable=True,
+        ambient_max_messages_per_hour=6,
+        daily_budget_usd=budget,
+    )
     service = app.SidecarService(config=config, token=TEST_TOKEN, adapter=adapter, store=store)
     server = await asyncio.start_server(service.handle_connection, host="127.0.0.1", port=0)
     port = server.sockets[0].getsockname()[1]
@@ -106,7 +112,7 @@ async def test_authenticated_request_round_trips_over_real_socket(tmp_path) -> N
     async with running_sidecar(tmp_path) as harness:
         response = await round_trip(harness.port, request_payload())
 
-        assert response["schema_version"] == 1
+        assert response["schema_version"] == 2
         assert response["request_id"] == 7
         assert response["message"] == "A fine day for fishing."
         assert response["token"] == TEST_TOKEN

@@ -24,13 +24,16 @@ CONFIG_PREFIX = "PlayerbotClaude."
 # Environment variable *names*, not secret values.
 TOKEN_ENV_VAR = "PLAYERBOT_CLAUDE_BRIDGE_TOKEN"  # noqa: S105
 API_KEY_ENV_VAR = claude.API_KEY_ENV_VAR
+MAX_DAILY_BUDGET_USD = 5.0
 
 
 @dataclass(frozen=True)
 class SidecarConfig:
     enable: bool = False
     bridge_port: int = 0
-    budget_usd: float = 0.0
+    ambient_world_enable: bool = False
+    ambient_max_messages_per_hour: int = 6
+    daily_budget_usd: float = 0.0
     input_usd_per_mtok: float = 1.00
     output_usd_per_mtok: float = 5.00
     database_path: str = "playerbot_claude.sqlite"
@@ -55,7 +58,9 @@ class SidecarConfig:
         return cls(
             enable=option("Enable", "0") == "1",
             bridge_port=int(option("BridgePort", "0")),
-            budget_usd=float(option("BudgetUsd", "0")),
+            ambient_world_enable=option("AmbientWorldEnable", "0") == "1",
+            ambient_max_messages_per_hour=int(option("AmbientMaxMessagesPerHour", "6")),
+            daily_budget_usd=float(option("DailyBudgetUsd", "0")),
             input_usd_per_mtok=float(option("InputUsdPerMTok", "1.00")),
             output_usd_per_mtok=float(option("OutputUsdPerMTok", "5.00")),
             database_path=option("SidecarDatabase", "playerbot_claude.sqlite"),
@@ -70,13 +75,24 @@ class SidecarConfig:
 
     @property
     def budget_nano(self) -> int:
-        return storage.usd_to_nano(self.budget_usd)
+        return storage.usd_to_nano(self.daily_budget_usd)
 
     @property
     def generation_allowed(self) -> bool:
         """Positive budget and positive rates are required for any provider call."""
 
-        return self.budget_usd > 0 and self.input_usd_per_mtok > 0 and self.output_usd_per_mtok > 0
+        return (
+            0 < self.daily_budget_usd <= MAX_DAILY_BUDGET_USD
+            and self.input_usd_per_mtok > 0
+            and self.output_usd_per_mtok > 0
+        )
+
+    @property
+    def ambient_allowed(self) -> bool:
+        return (
+            self.ambient_world_enable
+            and 1 <= self.ambient_max_messages_per_hour <= storage.MAX_AMBIENT_MESSAGES_PER_HOUR
+        )
 
 
 def bridge_token_from_environment() -> str | None:
@@ -98,20 +114,22 @@ def doctor_report(config: SidecarConfig, store: storage.Storage | None = None) -
         "ok": ok,
         "enable": config.enable,
         "bridge_port": config.bridge_port,
-        "budget_usd": config.budget_usd,
+        "daily_budget_usd": config.daily_budget_usd,
         "response_deadline_ms": config.response_deadline_ms,
         "bridge_token_present": token_present,
         "anthropic_api_key_present": api_key_present,
     }
 
     if store is not None:
-        spent = store.spent_nano()
-        reserved = store.outstanding_nano()
-        remaining = max(0, config.budget_nano - spent - reserved)
+        snapshot = store.rolling_budget_snapshot()
+        remaining = max(0, config.budget_nano - snapshot.spent_nano - snapshot.reserved_nano)
         report["budget"] = {
-            "spent_usd": storage.nano_to_usd_string(spent),
-            "reserved_usd": storage.nano_to_usd_string(reserved),
-            "remaining_usd": storage.nano_to_usd_string(remaining),
+            "rolling_spent_usd": storage.nano_to_usd_string(snapshot.spent_nano),
+            "rolling_reserved_usd": storage.nano_to_usd_string(snapshot.reserved_nano),
+            "rolling_remaining_usd": storage.nano_to_usd_string(remaining),
+            "next_expiry_at": (
+                snapshot.next_expiry_at.isoformat() if snapshot.next_expiry_at is not None else None
+            ),
         }
 
     return report
@@ -157,6 +175,9 @@ class SidecarService:
         if not self._config.generation_allowed:
             _log(f"request {request.request_id}: no budget configured, staying silent")
             return None
+        if request.is_ambient and not self._config.ambient_allowed:
+            _log(f"request {request.request_id}: ambient World chat is disabled, staying silent")
+            return None
 
         # ResponseDeadlineMs bounds the whole pipeline, queueing included: the
         # worldserver side has already expired this request by then, so finishing
@@ -171,6 +192,13 @@ class SidecarService:
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:
         async with self._generation_lock:
+            if request.is_ambient:
+                if self._store is None or not self._store.try_begin_ambient(
+                    self._config.ambient_max_messages_per_hour
+                ):
+                    _log(f"request {request.request_id}: ambient rate exhausted, staying silent")
+                    return None
+
             if self._store is not None:
                 self._store.record_profile(request)
             history = self._history_for(request)

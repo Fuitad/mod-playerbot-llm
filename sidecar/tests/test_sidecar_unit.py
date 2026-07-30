@@ -10,6 +10,8 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import anthropic
@@ -516,7 +518,9 @@ CONF_TEXT = """[worldserver]
 
 PlayerbotClaude.Enable = 1
 PlayerbotClaude.BridgePort = 40123
-PlayerbotClaude.BudgetUsd = 52.95
+PlayerbotClaude.AmbientWorldEnable = 1
+PlayerbotClaude.AmbientMaxMessagesPerHour = 6
+PlayerbotClaude.DailyBudgetUsd = 5.0
 PlayerbotClaude.ResponseDeadlineMs = 10000
 PlayerbotClaude.QueueSize = 16
 PlayerbotClaude.GroupCooldownSeconds = 120
@@ -533,7 +537,9 @@ def test_config_parses_worldserver_conf(tmp_path) -> None:
     config = app.SidecarConfig.load(write_conf(tmp_path))
     assert config.enable is True
     assert config.bridge_port == 40123
-    assert config.budget_usd == 52.95
+    assert config.ambient_world_enable is True
+    assert config.ambient_max_messages_per_hour == 6
+    assert config.daily_budget_usd == 5.0
 
 
 def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
@@ -551,7 +557,34 @@ def test_config_defaults_fail_closed(tmp_path) -> None:
     config = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\n"))
     assert config.enable is False
     assert config.bridge_port == 0
-    assert config.budget_usd == 0.0
+    assert config.daily_budget_usd == 0.0
+
+
+def test_config_replaces_lifetime_budget_and_enforces_hard_ceiling(tmp_path) -> None:
+    old_only = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\nPlayerbotClaude.BudgetUsd = 1\n"))
+    assert old_only.daily_budget_usd == 0.0
+    assert old_only.generation_allowed is False
+
+    for value, allowed in ((0, False), (0.5, True), (5, True), (-1, False), (5.01, False)):
+        config = app.SidecarConfig.load(
+            write_conf(tmp_path, f"[worldserver]\nPlayerbotClaude.DailyBudgetUsd = {value}\n")
+        )
+        assert config.generation_allowed is allowed
+
+
+def test_config_bounds_ambient_rate_without_disabling_direct_chat(tmp_path) -> None:
+    for rate, allowed in ((0, False), (1, True), (6, True), (7, False)):
+        config = app.SidecarConfig.load(
+            write_conf(
+                tmp_path,
+                "[worldserver]\n"
+                "PlayerbotClaude.DailyBudgetUsd = 5\n"
+                "PlayerbotClaude.AmbientWorldEnable = 1\n"
+                f"PlayerbotClaude.AmbientMaxMessagesPerHour = {rate}\n",
+            )
+        )
+        assert config.ambient_allowed is allowed
+        assert config.generation_allowed is True
 
 
 def test_doctor_reports_status_without_secrets(tmp_path, monkeypatch) -> None:
@@ -600,10 +633,10 @@ class FakeAdapter(claude.ClaudeAdapter):
         return self.reply, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
 
 
-def make_service(tmp_path, adapter=None, budget: float = 10.0) -> app.SidecarService:
+def make_service(tmp_path, adapter=None, budget: float = 1.0) -> app.SidecarService:
     conf = write_conf(
         tmp_path,
-        CONF_TEXT.replace("52.95", str(budget)),
+        CONF_TEXT.replace("5.0", str(budget)),
     )
     return app.SidecarService(
         config=app.SidecarConfig.load(conf),
@@ -660,6 +693,17 @@ def make_storage(tmp_path) -> storage.Storage:
     return storage.Storage(str(tmp_path / "sidecar.sqlite"))
 
 
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
+
+
 def test_prices_convert_exactly() -> None:
     assert HAIKU_PRICES.input_nano_per_token == 1000
     assert HAIKU_PRICES.output_nano_per_token == 5000
@@ -707,7 +751,7 @@ def test_conversation_memory_is_bounded_to_20_turns(tmp_path) -> None:
 
 def test_reservation_settlement_produces_exact_spend(tmp_path) -> None:
     store = make_storage(tmp_path)
-    budget_nano = storage.usd_to_nano(52.95)
+    budget_nano = storage.usd_to_nano(5)
 
     reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, budget_nano)
     assert reservation is not None
@@ -750,7 +794,7 @@ def test_crash_before_reservation_charges_nothing(tmp_path) -> None:
 
 def test_crash_after_reservation_remains_charged_at_maximum(tmp_path) -> None:
     store = make_storage(tmp_path)
-    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(5))
     assert reservation is not None
     store.close()  # crash before mark_submitted
 
@@ -760,7 +804,7 @@ def test_crash_after_reservation_remains_charged_at_maximum(tmp_path) -> None:
 
 def test_crash_after_submission_remains_charged_at_maximum(tmp_path) -> None:
     store = make_storage(tmp_path)
-    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(5))
     assert reservation is not None
     store.mark_submitted(reservation)
     store.close()  # crash before settlement
@@ -772,7 +816,7 @@ def test_crash_after_submission_remains_charged_at_maximum(tmp_path) -> None:
 
 def test_settlement_survives_restart(tmp_path) -> None:
     store = make_storage(tmp_path)
-    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(5))
     assert reservation is not None
     store.mark_submitted(reservation)
     store.settle(reservation, 2500, 80, HAIKU_PRICES)
@@ -787,12 +831,12 @@ def test_settlement_survives_restart(tmp_path) -> None:
 
 
 def make_stored_service(
-    tmp_path, adapter=None, budget: float = 10.0, input_tokens: int = 100
+    tmp_path, adapter=None, budget: float = 1.0, input_tokens: int = 100
 ) -> tuple[app.SidecarService, storage.Storage, FakeAdapter]:
     fake = adapter or FakeAdapter()
     fake.input_tokens = input_tokens
     store = make_storage(tmp_path)
-    conf = write_conf(tmp_path, CONF_TEXT.replace("52.95", str(budget)))
+    conf = write_conf(tmp_path, CONF_TEXT.replace("5.0", str(budget)))
     service = app.SidecarService(
         config=app.SidecarConfig.load(conf),
         token=TEST_TOKEN,
@@ -862,6 +906,39 @@ async def test_generation_failure_leaves_reservation_charged(tmp_path) -> None:
     assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
 
 
+async def test_failed_ambient_attempt_consumes_rate_before_token_counting(tmp_path) -> None:
+    class FailingCountAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.count_calls = 0
+
+        def count_input_tokens(self, request, history):
+            self.count_calls += 1
+            raise claude.ClaudeProviderError("count failed")
+
+    adapter = FailingCountAdapter()
+    store = make_storage(tmp_path)
+    service = app.SidecarService(
+        config=app.SidecarConfig(
+            enable=True,
+            ambient_world_enable=True,
+            ambient_max_messages_per_hour=1,
+            daily_budget_usd=1,
+        ),
+        token=TEST_TOKEN,
+        adapter=adapter,
+        store=store,
+    )
+
+    first = ambient_request_dict()
+    assert await service.process_payload(json.dumps(first).encode()) is None
+    second = ambient_request_dict()
+    second["request_id"] = 9
+    assert await service.process_payload(json.dumps(second).encode()) is None
+    assert adapter.count_calls == 1
+    store.close()
+
+
 def test_default_adapter_client_timeout_is_capped_at_deadline(tmp_path, monkeypatch) -> None:
     # The default SDK client's own timeout must track ResponseDeadlineMs so an
     # abandoned provider call cannot outlive the deadline by more than one request.
@@ -907,7 +984,7 @@ async def test_process_payload_enforces_response_deadline(tmp_path) -> None:
 def test_doctor_reports_budget_numbers(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", TEST_TOKEN)
     store = make_storage(tmp_path)
-    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(52.95))
+    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(5))
     assert reservation is not None
     store.mark_submitted(reservation)
     store.settle(reservation, 2500, 80, HAIKU_PRICES)
@@ -915,9 +992,111 @@ def test_doctor_reports_budget_numbers(tmp_path, monkeypatch) -> None:
     report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), store=store)
     budget = report["budget"]
     assert isinstance(budget, dict)
-    assert budget["spent_usd"] == "0.0029"
-    assert budget["reserved_usd"] == "0"
-    assert budget["remaining_usd"] == "52.9471"
+    assert budget["rolling_spent_usd"] == "0.0029"
+    assert budget["rolling_reserved_usd"] == "0"
+    assert budget["rolling_remaining_usd"] == "4.9971"
+    assert budget["next_expiry_at"] is not None
+
+
+def test_ambient_rate_gate_is_rolling_persistent_and_exact_at_boundary(tmp_path) -> None:
+    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
+    database = str(tmp_path / "rate.sqlite")
+    store = storage.Storage(database, now=clock)
+
+    for _ in range(6):
+        assert store.try_begin_ambient(6) is True
+    assert store.try_begin_ambient(6) is False
+    store.close()
+
+    reopened = storage.Storage(database, now=clock)
+    assert reopened.try_begin_ambient(6) is False
+    clock.advance(timedelta(seconds=3599, milliseconds=999))
+    assert reopened.try_begin_ambient(6) is False
+    clock.advance(timedelta(milliseconds=1))
+    assert reopened.try_begin_ambient(6) is True
+
+
+def test_ambient_rate_one_uses_the_same_persistent_gate(tmp_path) -> None:
+    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
+    database = str(tmp_path / "rate-one.sqlite")
+    store = storage.Storage(database, now=clock)
+    assert store.try_begin_ambient(1) is True
+    assert store.try_begin_ambient(1) is False
+    store.close()
+
+    reopened = storage.Storage(database, now=clock)
+    assert reopened.try_begin_ambient(1) is False
+    assert reopened.try_begin_ambient(0) is False
+    assert reopened.try_begin_ambient(7) is False
+
+
+def test_rolling_budget_combines_all_request_types_and_ages_by_reservation_time(tmp_path) -> None:
+    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
+    store = storage.Storage(str(tmp_path / "rolling.sqlite"), now=clock)
+    budget = storage.usd_to_nano(5)
+
+    reservations = [
+        store.reserve(request_id, 100, 10, HAIKU_PRICES, budget) for request_id in (101, 102, 103, 104)
+    ]
+    assert all(reservation is not None for reservation in reservations)
+    first = reservations[0]
+    assert first is not None
+    store.mark_submitted(first)
+    store.settle(first, 80, 5, HAIKU_PRICES)
+
+    snapshot = store.rolling_budget_snapshot()
+    assert snapshot.spent_nano == HAIKU_PRICES.cost_nano(80, 5)
+    assert snapshot.reserved_nano == 3 * HAIKU_PRICES.cost_nano(100, 10)
+    assert snapshot.next_expiry_at == datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
+
+    clock.advance(timedelta(hours=24))
+    expired = store.rolling_budget_snapshot()
+    assert expired.spent_nano == 0
+    assert expired.reserved_nano == 0
+    assert expired.next_expiry_at is None
+    assert store.usage_count() == 1
+    assert store.outstanding_nano() == 3 * HAIKU_PRICES.cost_nano(100, 10)
+
+
+def test_concurrent_reservations_cannot_cross_rolling_budget(tmp_path) -> None:
+    database = str(tmp_path / "concurrent-budget.sqlite")
+    clock_value = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    storage.Storage(database, now=lambda: clock_value).close()
+    one_request_budget = HAIKU_PRICES.cost_nano(100, 10)
+    barrier = threading.Barrier(2)
+
+    def reserve(request_id: int) -> int | None:
+        store = storage.Storage(database, now=lambda: clock_value)
+        try:
+            barrier.wait()
+            return store.reserve(request_id, 100, 10, HAIKU_PRICES, one_request_budget)
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(reserve, (201, 202)))
+
+    assert sum(result is not None for result in results) == 1
+
+
+def test_concurrent_ambient_attempts_cannot_cross_rate_limit(tmp_path) -> None:
+    database = str(tmp_path / "concurrent-rate.sqlite")
+    clock_value = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    storage.Storage(database, now=lambda: clock_value).close()
+    barrier = threading.Barrier(2)
+
+    def begin() -> bool:
+        store = storage.Storage(database, now=lambda: clock_value)
+        try:
+            barrier.wait()
+            return store.try_begin_ambient(1)
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: begin(), range(2)))
+
+    assert results.count(True) == 1
 
 
 def test_response_rejects_invalid_messages() -> None:

@@ -5,19 +5,24 @@ cost examples reproduce exactly and no float rounding can leak into the ledger.
 Budget rules are conservative by construction: a reservation charges the maximum
 possible cost the moment it is created, actual usage replaces it only at settlement,
 and reservations that never settle (crash, provider failure) stay charged at maximum
-until independently reconciled.
+until their reservation leaves the rolling 24 hour window.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from playerbot_claude import protocol
 
 CONVERSATION_TURN_LIMIT = 20
 NANO_PER_USD = 1_000_000_000
+MAX_AMBIENT_MESSAGES_PER_HOUR = 6
+AMBIENT_WINDOW = timedelta(hours=1)
+BUDGET_WINDOW = timedelta(hours=24)
 
 
 def usd_to_nano(usd: float) -> int:
@@ -50,6 +55,13 @@ class PriceSnapshot:
 
     def cost_nano(self, input_tokens: int, output_tokens: int) -> int:
         return input_tokens * self.input_nano_per_token + output_tokens * self.output_nano_per_token
+
+
+@dataclass(frozen=True)
+class BudgetWindowSnapshot:
+    spent_nano: int
+    reserved_nano: int
+    next_expiry_at: datetime | None
 
 
 _SCHEMA = """
@@ -93,26 +105,48 @@ CREATE TABLE IF NOT EXISTS usage_log (
     cost_nano INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ambient_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ambient_attempts_created_at ON ambient_attempts (created_at);
 """
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+def _system_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class Storage:
     """Single-connection SQLite store. Callers serialize access (the sidecar's
     generation lock); WAL journaling makes each transaction crash-durable."""
 
-    def __init__(self, path: str) -> None:
-        self._connection = sqlite3.connect(path)
+    def __init__(self, path: str, now: Callable[[], datetime] = _system_now) -> None:
+        self._connection = sqlite3.connect(path, timeout=5)
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.executescript(_SCHEMA)
         self._connection.commit()
+        self._now = now
 
     def close(self) -> None:
         self._connection.close()
+
+    def _timestamp(self) -> str:
+        return self._now().isoformat()
+
+    @contextmanager
+    def _immediate_transaction(self) -> Iterator[None]:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
 
     # --- Observed trusted profiles ---
 
@@ -141,7 +175,7 @@ class Storage:
                     request.sociability,
                     request.voice,
                     request.bot_name,
-                    _now(),
+                    self._timestamp(),
                 ),
             )
 
@@ -173,7 +207,7 @@ class Storage:
         with self._connection:
             self._connection.execute(
                 "INSERT INTO conversation_turns (bot_guid, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (bot_guid, role, content, _now()),
+                (bot_guid, role, content, self._timestamp()),
             )
             self._connection.execute(
                 """
@@ -206,12 +240,14 @@ class Storage:
         """Charges the maximum possible cost up front, inside one transaction.
 
         Returns the reservation id, or None when the maximum cost cannot fit in
-        what remains of the budget (spent plus outstanding reservations).
+        what remains of the rolling budget (settled plus outstanding reservations).
         """
 
         max_cost = prices.cost_nano(input_tokens, max_output_tokens)
-        with self._connection:
-            committed = self.spent_nano() + self.outstanding_nano()
+        now = self._now()
+        cutoff = (now - BUDGET_WINDOW).isoformat()
+        with self._immediate_transaction():
+            committed = self._rolling_spent_nano(cutoff) + self._rolling_outstanding_nano(cutoff)
             if committed + max_cost > budget_nano:
                 return None
 
@@ -221,7 +257,7 @@ class Storage:
                                           max_cost_nano, state, created_at)
                 VALUES (?, ?, ?, ?, 'reserved', ?)
                 """,
-                (request_id, input_tokens, max_output_tokens, max_cost, _now()),
+                (request_id, input_tokens, max_output_tokens, max_cost, now.isoformat()),
             )
             return cursor.lastrowid
 
@@ -261,7 +297,7 @@ class Storage:
                     prices.input_nano_per_token,
                     prices.output_nano_per_token,
                     cost,
-                    _now(),
+                    self._timestamp(),
                 ),
             )
 
@@ -275,5 +311,70 @@ class Storage:
         row = self._connection.execute(
             "SELECT COALESCE(SUM(max_cost_nano), 0) FROM reservations"
             " WHERE state IN ('reserved', 'submitted')"
+        ).fetchone()
+        return int(row[0])
+
+    # --- Persistent ambient rate and rolling budget views ---
+
+    def try_begin_ambient(self, messages_per_hour: int) -> bool:
+        if not 1 <= messages_per_hour <= MAX_AMBIENT_MESSAGES_PER_HOUR:
+            return False
+
+        now = self._now()
+        cutoff = (now - AMBIENT_WINDOW).isoformat()
+        with self._immediate_transaction():
+            self._connection.execute(
+                "DELETE FROM ambient_attempts WHERE created_at <= ?",
+                (cutoff,),
+            )
+            row = self._connection.execute("SELECT COUNT(*) FROM ambient_attempts").fetchone()
+            if int(row[0]) >= messages_per_hour:
+                return False
+
+            self._connection.execute(
+                "INSERT INTO ambient_attempts (created_at) VALUES (?)",
+                (now.isoformat(),),
+            )
+            return True
+
+    def rolling_budget_snapshot(self) -> BudgetWindowSnapshot:
+        cutoff = (self._now() - BUDGET_WINDOW).isoformat()
+        spent = self._rolling_spent_nano(cutoff)
+        reserved = self._rolling_outstanding_nano(cutoff)
+        row = self._connection.execute(
+            "SELECT MIN(created_at) FROM reservations WHERE created_at > ?",
+            (cutoff,),
+        ).fetchone()
+        next_expiry = datetime.fromisoformat(row[0]) + BUDGET_WINDOW if row[0] is not None else None
+        return BudgetWindowSnapshot(
+            spent_nano=spent,
+            reserved_nano=reserved,
+            next_expiry_at=next_expiry,
+        )
+
+    def usage_count(self) -> int:
+        row = self._connection.execute("SELECT COUNT(*) FROM usage_log").fetchone()
+        return int(row[0])
+
+    def _rolling_spent_nano(self, cutoff: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COALESCE(SUM(u.cost_nano), 0)
+            FROM usage_log u
+            JOIN reservations r ON r.id = u.reservation_id
+            WHERE r.created_at > ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        return int(row[0])
+
+    def _rolling_outstanding_nano(self, cutoff: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COALESCE(SUM(max_cost_nano), 0)
+            FROM reservations
+            WHERE state IN ('reserved', 'submitted') AND created_at > ?
+            """,
+            (cutoff,),
         ).fetchone()
         return int(row[0])

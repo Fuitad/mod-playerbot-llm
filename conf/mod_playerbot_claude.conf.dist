@@ -48,13 +48,14 @@ PlayerbotClaude.AmbientMaxMessagesPerHour = 6
 PlayerbotClaude.BridgePort = 0
 
 #
-#    PlayerbotClaude.BudgetUsd
-#        Description: Hard spending ceiling in USD for the sidecar. When the reserved plus spent
-#                     amount would exceed this ceiling, no generation request is made. 0 disables
-#                     all generation.
-#        Default:     0
+#    PlayerbotClaude.DailyBudgetUsd
+#        Description: Emergency spending circuit breaker shared by every Claude generation.
+#                     Settled actual cost plus unsettled maximum reservations may not exceed this
+#                     value in any rolling 24 hour window. Values above 5 or below 0 disable all
+#                     generation. 0 also disables all generation.
+#        Default:     5
 
-PlayerbotClaude.BudgetUsd = 0
+PlayerbotClaude.DailyBudgetUsd = 5
 
 #
 #    PlayerbotClaude.InputUsdPerMTok
