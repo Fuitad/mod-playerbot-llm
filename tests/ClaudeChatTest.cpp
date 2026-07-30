@@ -240,15 +240,37 @@ TEST(ClaudeChatProtocolTest, PartyChannelSerializesAsParty)
     EXPECT_NE(SerializeRequest(request, TEST_TOKEN).find("\"channel\":\"party\""), std::string::npos);
 }
 
-TEST(ClaudeChatProtocolTest, WorldChannelSerializesAsWorld)
+TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
 {
     ChatRequest request = MakeFixtureRequest();
+    request.requestId = 8;
     request.channel = ChatChannel::World;
     request.speakerGuidCounter = 0;
     request.speakerName.clear();
     request.message = AMBIENT_EVENT_MARKER;
     request.eventKind = AMBIENT_EVENT_KIND;
-    EXPECT_NE(SerializeRequest(request, TEST_TOKEN).find("\"channel\":\"world\""), std::string::npos);
+    request.occurrence = 9;
+
+    std::string const expected =
+        "{\"schema_version\":2,"
+        "\"token\":\"0123456789abcdef0123456789abcdef\","
+        "\"request_id\":8,"
+        "\"channel\":\"world\","
+        "\"bot_guid\":42,"
+        "\"speaker_guid\":0,"
+        "\"bot_name\":\"Botname\","
+        "\"speaker_name\":\"\","
+        "\"profile_version\":1,"
+        "\"crafting_affinity\":65,"
+        "\"exploration_affinity\":91,"
+        "\"sociability\":82,"
+        "\"voice\":\"earnest\","
+        "\"event_kind\":4,"
+        "\"subject_id\":0,"
+        "\"occurrence\":9,"
+        "\"message\":\"ambient_world\"}";
+
+    EXPECT_EQ(SerializeRequest(request, TEST_TOKEN), expected);
 }
 
 // --- Protocol: response parsing ---

@@ -43,26 +43,34 @@ CPP_REQUEST_FIXTURE = (
     '"message":"What do you enjoy doing?"}'
 )
 
+# Byte-for-byte copy of the C++ AmbientRequestSerializesToExactContractJson fixture.
+CPP_AMBIENT_REQUEST_FIXTURE = (
+    '{"schema_version":2,'
+    '"token":"0123456789abcdef0123456789abcdef",'
+    '"request_id":8,'
+    '"channel":"world",'
+    '"bot_guid":42,'
+    '"speaker_guid":0,'
+    '"bot_name":"Botname",'
+    '"speaker_name":"",'
+    '"profile_version":1,'
+    '"crafting_affinity":65,'
+    '"exploration_affinity":91,'
+    '"sociability":82,'
+    '"voice":"earnest",'
+    '"event_kind":4,'
+    '"subject_id":0,'
+    '"occurrence":9,'
+    '"message":"ambient_world"}'
+)
+
 
 def valid_request_dict() -> dict[str, object]:
     return json.loads(CPP_REQUEST_FIXTURE)
 
 
 def ambient_request_dict() -> dict[str, object]:
-    request = valid_request_dict()
-    request.update(
-        {
-            "request_id": 8,
-            "channel": "world",
-            "speaker_guid": 0,
-            "speaker_name": "",
-            "event_kind": 4,
-            "subject_id": 0,
-            "occurrence": 9,
-            "message": "ambient_world",
-        }
-    )
-    return request
+    return json.loads(CPP_AMBIENT_REQUEST_FIXTURE)
 
 
 def parse(payload_dict: dict[str, object], token: str = TEST_TOKEN) -> protocol.ChatRequest:
@@ -139,6 +147,16 @@ def test_accepts_exact_cpp_fixture() -> None:
     assert request.message == "What do you enjoy doing?"
 
 
+def test_accepts_exact_cpp_ambient_fixture() -> None:
+    request = protocol.parse_request(CPP_AMBIENT_REQUEST_FIXTURE.encode(), TEST_TOKEN)
+    assert request.request_id == 8
+    assert request.channel == "world"
+    assert request.speaker_guid == 0
+    assert request.event_kind == protocol.AMBIENT_EVENT_KIND
+    assert request.occurrence == 9
+    assert request.message == protocol.AMBIENT_EVENT_MARKER
+
+
 def test_rejects_invalid_utf8_payload() -> None:
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_request(b'{"schema_version":2,"bad":"\xff"}', TEST_TOKEN)
@@ -168,6 +186,17 @@ def test_rejects_missing_and_extra_fields() -> None:
     extra["action"] = "cast fireball"
     with pytest.raises(protocol.ProtocolError):
         parse(extra)
+
+
+def test_rejects_duplicate_fields_and_type_coercion() -> None:
+    duplicate = CPP_REQUEST_FIXTURE.replace('"request_id":7,', '"request_id":7,"request_id":8,')
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_request(duplicate.encode(), TEST_TOKEN)
+
+    for invalid_request_id in ('"7"', "true", "7.0"):
+        coerced = CPP_REQUEST_FIXTURE.replace('"request_id":7,', f'"request_id":{invalid_request_id},')
+        with pytest.raises(protocol.ProtocolError):
+            protocol.parse_request(coerced.encode(), TEST_TOKEN)
 
 
 def test_rejects_invalid_guids() -> None:

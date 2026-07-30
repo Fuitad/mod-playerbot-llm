@@ -271,8 +271,9 @@ These scenarios use the WoW 3.3.5a client, worldserver logs, and sidecar logs. T
 
 ## Verification Record
 
-- The sidecar suite passed with 71 tests. Ruff formatting, Ruff lint, and BasedPyright also passed.
+- The sidecar suite passed with 73 tests. Ruff formatting, Ruff lint, and BasedPyright also passed.
 - The isolated C++ harness passed all 44 `ClaudeChat*` tests, and `ClaudeChatScripts.cpp` compiled from the isolated worktree.
 - The existing CMake test tree targets the other checkout, so the approved incremental target was reproduced with its compile commands against the isolated sources instead of rebuilding the other session's files.
 - The repository wide C++ style command still reports existing failures in unrelated AzerothCore core files. The module diff has no whitespace errors, decorative non ASCII additions, or unresolved `SHORTCUT` markers.
+- Changes review findings were fixed by rejecting duplicate or coerced JSON fields and adding one byte exact ambient fixture to both protocol suites.
 - Live TS-001 through TS-004 remain gated on separate authorization to build, install, configure, and exercise the change through a WoW client.

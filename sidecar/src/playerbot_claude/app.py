@@ -234,7 +234,7 @@ class SidecarService:
                 reply, usage = await asyncio.to_thread(self._adapter.generate_reply, request, history)
             except claude.ClaudeError as error:
                 # Fail closed on money: an unsettled reservation deliberately stays
-                # charged at its maximum cost until independently reconciled.
+                # charged at its maximum cost until it leaves the rolling 24 hour window.
                 _log(f"request {request.request_id}: {type(error).__name__}: {error}")
                 return None
 

@@ -57,7 +57,7 @@ def _byte_length(text: str) -> int:
 class ChatRequest(BaseModel):
     """One trusted request from worldserver. Extra fields are rejected."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[2]
     token: str
@@ -130,6 +130,15 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes:
         raise FrameError("stream ended before the complete frame payload") from error
 
 
+def _object_with_unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
 def parse_request(payload: bytes, expected_token: str) -> ChatRequest:
     try:
         text = payload.decode("utf-8")
@@ -137,8 +146,8 @@ def parse_request(payload: bytes, expected_token: str) -> ChatRequest:
         raise ProtocolError("request payload is not valid UTF-8") from error
 
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
         raise ProtocolError("request payload is not valid JSON") from error
 
     if not isinstance(data, dict):
