@@ -79,6 +79,18 @@ namespace
         return false;
     }
 
+    bool HasOnlineHumanOnTeam(TeamId teamId)
+    {
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* player = entry.second;
+            if (player && player->IsInWorld() && player->GetTeamId() == teamId && IsRealPlayerActor(player))
+                return true;
+        }
+
+        return false;
+    }
+
     bool HasWorldChannel(Player* player)
     {
         if (!player)
@@ -474,8 +486,9 @@ namespace
             std::vector<AmbientCandidateSnapshot> snapshots;
             std::vector<SpeakerCandidate> candidates;
             std::unordered_map<uint64, Player*> byCounter;
-            for (Player* bot : sRandomPlayerbotMgr.GetPlayers())
+            for (auto const& entry : sRandomPlayerbotMgr.GetAllBots())
             {
+                Player* bot = entry.second;
                 AmbientCandidateSnapshot snapshot;
                 snapshot.botOnline = bot && bot->IsInWorld();
                 snapshot.botAlive = bot && bot->IsAlive();
@@ -485,7 +498,8 @@ namespace
                 snapshots.push_back(snapshot);
 
                 if (!snapshot.botOnline || !snapshot.botAlive || !snapshot.botIsMachine ||
-                    snapshot.botInCombat || !snapshot.worldChannelAvailable)
+                    snapshot.botInCombat || !snapshot.worldChannelAvailable ||
+                    !HasOnlineHumanOnTeam(bot->GetTeamId()))
                     continue;
 
                 uint64 const counter = bot->GetGUID().GetCounter();
