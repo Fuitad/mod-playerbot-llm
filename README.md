@@ -1,6 +1,6 @@
 # mod-playerbot-claude
 
-A private AzerothCore module that gives [mod-playerbots](https://github.com/Fuitad/mod-playerbots) bots short, in-character Claude Haiku dialogue. The language model only ever produces chat text. It has no tools, no game state access, and no influence over any bot decision. Every failure path ends in silence, never in fabricated text.
+A private AzerothCore module that gives [mod-playerbots](https://github.com/Fuitad/mod-playerbots) bots short, in character Claude Haiku dialogue and one bounded profession career choice. The model has no tools and receives no live game state. Playerbot code supplies opaque legal candidates and validates the response. Chat failures end in silence. Career failures use the deterministic playerbot fallback.
 
 ## Compatibility
 
@@ -12,7 +12,7 @@ Verify before building:
 test "$(cat modules/mod-playerbot-claude/PLAYERBOTS_REVISION)" = "$(git -C modules/mod-playerbots rev-parse HEAD)"
 ```
 
-The module consumes the versioned personality contract (`PLAYERBOT_PERSONALITY_API_VERSION == 1`) from mod-playerbots. Configuration fails with a clear error when mod-playerbots is missing, and compilation fails when the personality API version changes.
+The module consumes the versioned personality contract (`PLAYERBOT_PERSONALITY_API_VERSION == 2`) from mod-playerbots. Configuration fails with a clear error when mod-playerbots is missing, and compilation fails when the personality API version changes.
 
 Requirements:
 
@@ -49,7 +49,7 @@ All keys live in `mod_playerbot_claude.conf` and are read by both worldserver an
 | `PlayerbotClaude.InputUsdPerMTok` | `1.00` | Price per million input tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.OutputUsdPerMTok` | `5.00` | Price per million output tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.SidecarDatabase` | `playerbot_claude.sqlite` | SQLite path used by the sidecar. |
-| `PlayerbotClaude.ResponseDeadlineMs` | `10000` | How long a pending conversation waits before expiring silently. |
+| `PlayerbotClaude.ResponseDeadlineMs` | `10000` | How long a pending conversation or career choice waits. |
 | `PlayerbotClaude.QueueSize` | `16` | Bounded queue between the world thread and the bridge worker. |
 | `PlayerbotClaude.GroupCooldownSeconds` | `120` | Minimum seconds between milestone reactions per group. |
 
@@ -92,9 +92,11 @@ uv run playerbot-claude profile --config /path/to/mod_playerbot_claude.conf --bo
 
 Replies are one short line (at most 240 bytes), in the bot's fixed voice. If anything fails (budget, timeout, provider error, invalid output), the bot simply stays silent.
 
-## Personality behavior
+## Personality and career behavior
 
-Bots reuse the deterministic personality profiles defined by mod-playerbots (see its `docs/personality.md`): crafting affinity, exploration affinity, sociability (each 0 to 100), and one of five voices, all derived from the bot GUID under a versioned contract. The same bot always has the same personality, and the dialogue personality always matches the bot's in-game profession and travel preferences, because both come from the same profile.
+Bots reuse the deterministic personality profiles defined by mod-playerbots (see its `docs/personality.md`). Version 2 provides independent crafting, gathering, exploration, and sociability scores from 0 to 100, plus one of five voices.
+
+When playerbot code needs a new career plan, this module may submit one request containing only opaque legal candidate tokens, short candidate categories, maximum spending styles, market eligibility, and engagement. The model chooses one token and a permitted style. It cannot invent a profession, recipe, spell, destination, price, or runtime action. Playerbot code validates the correlation, versions, token, and style before persistence. Disabled, unavailable, invalid, or late responses use the same deterministic fallback as a server without this module.
 
 ## What is sent to the cloud
 
@@ -107,6 +109,8 @@ For a direct conversation or milestone, the sidecar sends the following to the A
 - Up to 20 prior turns of that bot's stored conversation memory
 
 An ambient request sends only the selected bot's name, personality numbers, voice, and a fixed instruction to offer one brief World observation. It sends no human identity, human text, or conversation history. Ambient input and output are never appended to conversation memory.
+
+A career request sends the bot name, personality values, and opaque candidate descriptions. It sends no raw profession, skill, spell, item, or recipe identifiers and no conversation history. The returned career decision is diagnostic data only in the sidecar. The authoritative validated plan remains in mod-playerbots.
 
 Never sent: account names, GUIDs, IP addresses, positions, inventories, combat state, the bridge token, recognized bot commands, or any party/group chat without the `llm ` prefix. Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. If you want the stricter opt-in-per-message behavior back, whisper traffic is exactly the `llm `-prefixed subset.
 
@@ -129,6 +133,7 @@ The sidecar's SQLite database (`PlayerbotClaude.SidecarDatabase`) holds:
 - The most recent 20 conversation turns per bot (older turns are deleted automatically)
 - The budget ledger: reservations and an append-only usage log with price snapshots
 - Accepted ambient attempt timestamps used by the rolling hourly gate
+- Validated career response diagnostics, without raw game identifiers
 
 No secrets are ever stored. To delete all retained data, stop the sidecar and delete the SQLite file (including its `-wal` and `-shm` companions). Anthropic's own data handling is governed by their API terms.
 

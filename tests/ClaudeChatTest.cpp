@@ -33,8 +33,9 @@ namespace
         request.speakerGuidCounter = 9001;
         request.botName = "Botname";
         request.speakerName = "Speaker";
-        request.profile.version = 1;
+        request.profile.version = 2;
         request.profile.craftingAffinity = 65;
+        request.profile.gatheringAffinity = 37;
         request.profile.explorationAffinity = 91;
         request.profile.sociability = 82;
         request.profile.voice = PlayerbotVoice::Earnest;
@@ -211,8 +212,9 @@ TEST(ClaudeChatProtocolTest, RequestSerializesToExactContractJson)
         "\"speaker_guid\":9001,"
         "\"bot_name\":\"Botname\","
         "\"speaker_name\":\"Speaker\","
-        "\"profile_version\":1,"
+        "\"profile_version\":2,"
         "\"crafting_affinity\":65,"
+        "\"gathering_affinity\":37,"
         "\"exploration_affinity\":91,"
         "\"sociability\":82,"
         "\"voice\":\"earnest\","
@@ -260,8 +262,9 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
         "\"speaker_guid\":0,"
         "\"bot_name\":\"Botname\","
         "\"speaker_name\":\"\","
-        "\"profile_version\":1,"
+        "\"profile_version\":2,"
         "\"crafting_affinity\":65,"
+        "\"gathering_affinity\":37,"
         "\"exploration_affinity\":91,"
         "\"sociability\":82,"
         "\"voice\":\"earnest\","
@@ -271,6 +274,41 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
         "\"message\":\"ambient_world\"}";
 
     EXPECT_EQ(SerializeRequest(request, TEST_TOKEN), expected);
+}
+
+TEST(ClaudeChatProtocolTest, CareerRequestUsesOpaqueCandidates)
+{
+    PlayerbotCareerPlanRequest request;
+    request.personalityVersion = 2u;
+    request.careerVersion = 1u;
+    request.candidates =
+    {
+        { "career-none", "no professions", PlayerbotRecipeSpendingStyle::None, false, 0u },
+        { "career-deadbeef", "mixed primary professions",
+          PlayerbotRecipeSpendingStyle::Completionist, true, 90u }
+    };
+
+    EXPECT_EQ(
+        SerializeCareerRequestContent(request),
+        "{\"personality_version\":2,\"career_version\":1,\"candidates\":["
+        "{\"token\":\"career-none\",\"summary\":\"no professions\","
+        "\"maximum_spending_style\":\"none\",\"market_eligible\":0,\"engagement\":0},"
+        "{\"token\":\"career-deadbeef\",\"summary\":\"mixed primary professions\","
+        "\"maximum_spending_style\":\"completionist\",\"market_eligible\":1,\"engagement\":90}]}");
+}
+
+TEST(ClaudeChatProtocolTest, CareerDecisionParserIsStrict)
+{
+    std::optional<CareerDecision> const valid =
+        ParseCareerDecision("{\"candidate_token\":\"career-deadbeef\",\"spending_style\":\"progression\"}");
+    ASSERT_TRUE(valid);
+    EXPECT_EQ(valid->candidateToken, "career-deadbeef");
+    EXPECT_EQ(valid->spendingStyle, PlayerbotRecipeSpendingStyle::Progression);
+
+    EXPECT_FALSE(ParseCareerDecision(
+        "{\"candidate_token\":\"career-deadbeef\",\"spending_style\":\"invalid\"}"));
+    EXPECT_FALSE(ParseCareerDecision(
+        "{\"candidate_token\":\"career-deadbeef\",\"spending_style\":\"minimal\",\"raw_skill_id\":171}"));
 }
 
 // --- Protocol: response parsing ---

@@ -27,12 +27,15 @@ from pydantic import (
 SCHEMA_VERSION = 2
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
+MAX_CAREER_MESSAGE_BYTES = 60 * 1024
 MAX_RESPONSE_MESSAGE_BYTES = 240
 MIN_BRIDGE_TOKEN_BYTES = 32
 AMBIENT_EVENT_KIND = 4
+CAREER_EVENT_KIND = 5
 AMBIENT_EVENT_MARKER = "ambient_world"
 
 VOICES = ("reserved", "pragmatic", "earnest", "wry", "boisterous")
+SPENDING_STYLES = ("none", "minimal", "progression", "completionist")
 
 _UINT64_MAX = 2**64 - 1
 _FRAME_HEADER = struct.Struct("!I")
@@ -54,6 +57,31 @@ def _byte_length(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+class CareerCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    token: Annotated[str, StringConstraints(pattern=r"^career-[a-z0-9]+$", max_length=64)]
+    summary: Annotated[str, StringConstraints(min_length=1, max_length=160)]
+    maximum_spending_style: Literal["none", "minimal", "progression", "completionist"]
+    market_eligible: Literal[0, 1]
+    engagement: Annotated[int, Field(ge=0, le=100)]
+
+
+class CareerRequestContent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    personality_version: Literal[2]
+    career_version: Literal[1]
+    candidates: Annotated[list[CareerCandidate], Field(min_length=1, max_length=256)]
+
+    @model_validator(mode="after")
+    def _unique_tokens(self) -> Self:
+        tokens = [candidate.token for candidate in self.candidates]
+        if len(tokens) != len(set(tokens)):
+            raise ValueError("career candidate tokens must be unique")
+        return self
+
+
 class ChatRequest(BaseModel):
     """One trusted request from worldserver. Extra fields are rejected."""
 
@@ -62,17 +90,18 @@ class ChatRequest(BaseModel):
     schema_version: Literal[2]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
-    channel: Literal["whisper", "party", "world"]
+    channel: Literal["whisper", "party", "world", "career"]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     speaker_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     bot_name: Annotated[str, StringConstraints(min_length=1, max_length=48)]
     speaker_name: Annotated[str, StringConstraints(max_length=48)]
-    profile_version: Literal[1]
+    profile_version: Literal[2]
     crafting_affinity: Annotated[int, Field(ge=0, le=100)]
+    gathering_affinity: Annotated[int, Field(ge=0, le=100)]
     exploration_affinity: Annotated[int, Field(ge=0, le=100)]
     sociability: Annotated[int, Field(ge=0, le=100)]
     voice: Literal["reserved", "pragmatic", "earnest", "wry", "boisterous"]
-    event_kind: Literal[0, 1, 2, 3, 4]
+    event_kind: Literal[0, 1, 2, 3, 4, 5]
     subject_id: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     occurrence: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     message: str
@@ -80,14 +109,25 @@ class ChatRequest(BaseModel):
     @field_validator("message")
     @classmethod
     def _validate_message(cls, value: str) -> str:
-        if not value or _byte_length(value) > MAX_REQUEST_MESSAGE_BYTES:
-            raise ValueError("message must be 1 to 512 UTF-8 bytes")
+        if not value or _byte_length(value) > MAX_CAREER_MESSAGE_BYTES:
+            raise ValueError("message must be 1 to 61440 UTF-8 bytes")
 
         return value
 
     @model_validator(mode="after")
     def _validate_ambient_fields(self) -> Self:
-        if self.channel == "world" or self.event_kind == AMBIENT_EVENT_KIND:
+        if self.channel == "career" or self.event_kind == CAREER_EVENT_KIND:
+            if (
+                self.channel != "career"
+                or self.event_kind != CAREER_EVENT_KIND
+                or self.speaker_guid != 0
+                or self.speaker_name
+                or self.subject_id != 0
+                or self.occurrence != 0
+            ):
+                raise ValueError("career request fields do not match the trusted contract")
+            parse_career_content(self.message)
+        elif self.channel == "world" or self.event_kind == AMBIENT_EVENT_KIND:
             if (
                 self.channel != "world"
                 or self.event_kind != AMBIENT_EVENT_KIND
@@ -99,12 +139,32 @@ class ChatRequest(BaseModel):
                 raise ValueError("ambient World request fields do not match the trusted contract")
         elif self.speaker_guid == 0 or not self.speaker_name:
             raise ValueError("direct chat requires a human speaker identity")
+        elif _byte_length(self.message) > MAX_REQUEST_MESSAGE_BYTES:
+            raise ValueError("chat message must be at most 512 UTF-8 bytes")
 
         return self
 
     @property
     def is_ambient(self) -> bool:
         return self.channel == "world"
+
+    @property
+    def is_career(self) -> bool:
+        return self.channel == "career"
+
+    @property
+    def career_content(self) -> CareerRequestContent:
+        return parse_career_content(self.message)
+
+
+def parse_career_content(message: str) -> CareerRequestContent:
+    try:
+        data = json.loads(message, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError("career content is not valid JSON") from error
+    if not isinstance(data, dict):
+        raise ValueError("career content must be a JSON object")
+    return CareerRequestContent.model_validate(data)
 
 
 def encode_frame(payload: bytes) -> bytes:

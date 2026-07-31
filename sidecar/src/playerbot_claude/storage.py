@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     bot_guid INTEGER PRIMARY KEY,
     profile_version INTEGER NOT NULL,
     crafting_affinity INTEGER NOT NULL,
+    gathering_affinity INTEGER NOT NULL,
     exploration_affinity INTEGER NOT NULL,
     sociability INTEGER NOT NULL,
     voice TEXT NOT NULL,
@@ -111,6 +112,14 @@ CREATE TABLE IF NOT EXISTS ambient_attempts (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ambient_attempts_created_at ON ambient_attempts (created_at);
+
+CREATE TABLE IF NOT EXISTS career_decisions (
+    bot_guid INTEGER PRIMARY KEY,
+    career_version INTEGER NOT NULL,
+    candidate_token TEXT NOT NULL,
+    spending_style TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -128,6 +137,13 @@ class Storage:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.executescript(_SCHEMA)
+        profile_columns = {
+            row[1] for row in self._connection.execute("PRAGMA table_info(profiles)").fetchall()
+        }
+        if "gathering_affinity" not in profile_columns:
+            self._connection.execute(
+                "ALTER TABLE profiles ADD COLUMN gathering_affinity INTEGER NOT NULL DEFAULT 0"
+            )
         self._connection.commit()
         self._now = now
 
@@ -155,12 +171,13 @@ class Storage:
             self._connection.execute(
                 """
                 INSERT INTO profiles (bot_guid, profile_version, crafting_affinity,
-                                      exploration_affinity, sociability, voice, bot_name,
-                                      updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      gathering_affinity, exploration_affinity, sociability,
+                                      voice, bot_name, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (bot_guid) DO UPDATE SET
                     profile_version = excluded.profile_version,
                     crafting_affinity = excluded.crafting_affinity,
+                    gathering_affinity = excluded.gathering_affinity,
                     exploration_affinity = excluded.exploration_affinity,
                     sociability = excluded.sociability,
                     voice = excluded.voice,
@@ -171,6 +188,7 @@ class Storage:
                     request.bot_guid,
                     request.profile_version,
                     request.crafting_affinity,
+                    request.gathering_affinity,
                     request.exploration_affinity,
                     request.sociability,
                     request.voice,
@@ -182,8 +200,8 @@ class Storage:
     def get_profile(self, bot_guid: int) -> dict[str, object] | None:
         row = self._connection.execute(
             """
-            SELECT profile_version, crafting_affinity, exploration_affinity, sociability,
-                   voice, bot_name, updated_at
+            SELECT profile_version, crafting_affinity, gathering_affinity, exploration_affinity,
+                   sociability, voice, bot_name, updated_at
             FROM profiles WHERE bot_guid = ?
             """,
             (bot_guid,),
@@ -194,11 +212,59 @@ class Storage:
         return {
             "profile_version": row[0],
             "crafting_affinity": row[1],
-            "exploration_affinity": row[2],
-            "sociability": row[3],
-            "voice": row[4],
-            "bot_name": row[5],
-            "updated_at": row[6],
+            "gathering_affinity": row[2],
+            "exploration_affinity": row[3],
+            "sociability": row[4],
+            "voice": row[5],
+            "bot_name": row[6],
+            "updated_at": row[7],
+        }
+
+    def record_career_decision(
+        self,
+        bot_guid: int,
+        career_version: int,
+        candidate_token: str,
+        spending_style: str,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO career_decisions (
+                    bot_guid, career_version, candidate_token, spending_style, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (bot_guid) DO UPDATE SET
+                    career_version = excluded.career_version,
+                    candidate_token = excluded.candidate_token,
+                    spending_style = excluded.spending_style,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    bot_guid,
+                    career_version,
+                    candidate_token,
+                    spending_style,
+                    self._timestamp(),
+                ),
+            )
+
+    def get_career_decision(self, bot_guid: int) -> dict[str, object] | None:
+        row = self._connection.execute(
+            """
+            SELECT career_version, candidate_token, spending_style, updated_at
+            FROM career_decisions WHERE bot_guid = ?
+            """,
+            (bot_guid,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        return {
+            "career_version": row[0],
+            "candidate_token": row[1],
+            "spending_style": row[2],
+            "updated_at": row[3],
         }
 
     # --- Bounded conversation memory ---

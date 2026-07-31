@@ -1,6 +1,6 @@
 # Architecture
 
-Three processes, two trust boundaries, one direction of trust: the game never trusts the model, and the machine never trusts the network.
+Three processes, two trust boundaries, one direction of trust: the game validates every model result, and the machine never trusts the network.
 
 ```
 worldserver (C++)                     sidecar (Python)              Anthropic API
@@ -16,16 +16,17 @@ worldserver (C++)                     sidecar (Python)              Anthropic AP
 
 All game state lives on the world thread. The bridge worker thread never touches it.
 
-- `ClaudeChatScripts.cpp` runs only on the world thread. It observes whispers to bots (any whisper the playerbot command system does not recognize becomes conversation; the `llm ` prefix forces Claude even for command-shaped text), `llm` prefixed party chat, and quest, level, and rare loot milestones, then copies everything the sidecar needs into an immutable `ChatRequest` value snapshot (names, personality numbers, message text). It also owns the ambient cadence. A due slot first requires a connected human, then selects an online, alive, noncombat machine bot with a usable World channel through deterministic personality weighting. Command recognition uses `ExternalEventHelper::IsChatCommand`, a non-executing mirror of mod-playerbots' own command resolution. No pointers cross the thread boundary.
+- `ClaudeChatScripts.cpp` runs only on the world thread. It observes supported chat and milestone events, owns ambient cadence, and implements the optional playerbot career provider. Chat requests contain immutable names, personality values, and text. Career requests contain immutable personality values plus opaque legal candidates. No pointers cross the thread boundary.
 - `ClaudeChat.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
 - Delivery happens back on the world thread during world update. The bot GUID is re-resolved through `ObjectAccessor` immediately before speaking; if the bot is gone, offline, or the deadline (`ResponseDeadlineMs`) has passed, the response is dropped. World delivery also requires a human to remain connected, an alive bot outside combat, and a current World channel. `SayToWorld` failure is inspected and produces no fallback text.
 - Ambient mode requires `AiPlayerbot.EnableBroadcasts = 0`. When canned broadcasts remain enabled, only ambient scheduling is disabled. Whisper, party, and milestone Claude behavior remains available.
-- The model cannot act. Responses carry exactly one field, `message`, and the only thing the module ever does with it is have the bot say it.
+- The model cannot act. Chat responses contain one `message`. Career responses contain one candidate token and one spending style. Playerbot code validates the response against its pending request and legal candidate set before persisting it.
 
 ## Wire protocol (loopback TCP)
 
 - Frame: 4-byte network order length prefix, then a UTF-8 JSON payload. Payloads above 64 KiB are rejected.
-- Payloads are strict flat JSON objects: schema version 2, no nesting, no arrays, no booleans, no null, no floats, no duplicate keys, no trailing bytes. Both sides validate independently (`ClaudeChat.cpp` and `protocol.py`); the Python and C++ test suites share byte-for-byte fixtures so the implementations cannot drift.
+- Payloads use strict schema version 2 JSON. Chat payloads remain flat. Career payloads use a bounded nested candidate list because one request must carry the complete opaque legal set. Both sides reject unknown fields, duplicate keys, invalid types, raw game identifiers, oversized content, and trailing bytes.
+- Career uses channel `career` and event kind `5`. It never enters conversation history. A valid reply must preserve the request correlation and supported versions, select an offered opaque token, and choose a spending style no broader than that candidate permits.
 - Ambient uses channel `world` and event kind `4`. Its trusted combination requires speaker GUID `0`, an empty speaker name, subject ID `0`, and marker `ambient_world`. Direct requests reject the empty speaker identity.
 - Every payload carries the bridge token from `PLAYERBOT_CLAUDE_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
 - The socket binds to 127.0.0.1 only. The token exists to stop other local processes from injecting bot speech or draining budget.
@@ -35,7 +36,8 @@ All game state lives on the world thread. The bridge worker thread never touches
 - `app.py` serializes all budget bookkeeping behind one lock, so socket concurrency can never race the ledger: record profile, count tokens, reserve, generate, settle, append memory. Ambient acceptance is persisted before token counting, so provider or counting failure still consumes the conservative rolling hourly slot.
 - The entire pipeline (queueing included) runs under an end-to-end `ResponseDeadlineMs` deadline, and the SDK client's own timeout is capped at the same value. A request that cannot finish in time is dropped silently; its reservation stays charged at maximum, and the dead exchange never enters conversation memory.
 - One residual overlap exists by design: a deadline cancellation releases the lock while the abandoned synchronous SDK call finishes in its worker thread (Python cannot interrupt it; the capped client timeout bounds it). This is safe because httpx clients are thread-safe and an abandoned call can never settle or write memory, but it does mean a new provider call may start while the abandoned one is still physically in flight.
-- `claude.py` is the only file that talks to Anthropic. The trusted personality profile is rendered into the system prompt; the player's text is delivered as a separate, explicitly untrusted user message. The model gets no tools. Structured output (`output_format`) restricts the reply to a single `message` field, and the adapter additionally enforces non-empty, single-line, at most 240 UTF-8 bytes.
+- `claude.py` is the only file that talks to Anthropic. The model gets no tools. Chat uses structured output with one bounded `message`. Career selection uses a separate structured output schema with one offered token and one allowed spending style.
+- Career generation receives no conversation history or human text. The prompt describes only the personality and opaque candidate properties. `app.py` records a diagnostic decision after validation but never makes it authoritative.
 - Ambient generation receives only bot identity and personality plus a fixed observation instruction. The adapter discards any supplied history, and `app.py` neither reads nor appends conversation turns for ambient requests.
 - The API key is read from `MOD_PLAYERBOT_CLAUDE_APIKEY` only and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
 
@@ -68,6 +70,7 @@ The ambient rate gate uses the same transaction strategy. It stores each accepte
 | `reservations` | Budget reservations with state `reserved`, `submitted`, or `settled` | Append and update |
 | `usage_log` | Actual usage with price snapshots | Append only |
 | `ambient_attempts` | Accepted ambient attempt timestamps | Rolling one hour |
+| `career_decisions` | Validated opaque career response diagnostics | Latest row per bot |
 
 ## Failure modes
 
@@ -87,3 +90,4 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped |
 | Bot despawned or deadline passed | Response discarded at delivery |
 | Last human disconnects during generation | Accepted attempt remains charged; response is discarded |
+| Career provider disabled, busy, invalid, or late | Playerbot persists its deterministic fallback |

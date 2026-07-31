@@ -43,6 +43,12 @@ namespace
         int64 expiresAtSteadyMs = 0;
     };
 
+    struct PendingCareerDelivery
+    {
+        PlayerbotCareerPlanRequest request;
+        int64 expiresAtSteadyMs = 0;
+    };
+
     bool IsMachineBot(Player* candidate)
     {
         if (!candidate)
@@ -102,7 +108,7 @@ namespace
     // All state lives on the world thread; every method below must only be called from
     // world-thread hooks. The bridge worker is the only other thread and it touches only
     // the bounded queues inside ClaudeBridge.
-    class ClaudeChatState
+    class ClaudeChatState : public PlayerbotCareerPlanProvider
     {
     public:
         static ClaudeChatState& Instance()
@@ -151,16 +157,73 @@ namespace
 
             _bridge = std::make_unique<ClaudeBridge>(std::move(config));
             _bridge->Start();
+            if (!PlayerbotCareer::RegisterProvider(this))
+            {
+                _bridge->Stop();
+                _bridge.reset();
+                LOG_ERROR("playerbot.claude", "mod-playerbot-claude: career provider registration failed");
+                return;
+            }
             LOG_INFO("playerbot.claude", "mod-playerbot-claude: bridge worker started on 127.0.0.1:{}", port);
         }
 
         void Shutdown()
         {
+            PlayerbotCareer::UnregisterProvider(this);
             if (_bridge)
                 _bridge->Stop();
             _bridge.reset();
             _pending.clear();
+            _careerPending.clear();
+            _careerResponses.clear();
             _ambientCadence.reset();
+        }
+
+        bool TrySubmit(PlayerbotCareerPlanRequest const& careerRequest) override
+        {
+            if (!_bridge)
+                return false;
+
+            Player* bot = ObjectAccessor::FindPlayer(
+                ObjectGuid::Create<HighGuid::Player>(careerRequest.botGuid));
+            if (!bot || !bot->IsInWorld())
+                return false;
+
+            ChatRequest request;
+            request.requestId = _nextRequestId++;
+            request.channel = ChatChannel::Career;
+            request.botGuidCounter = careerRequest.botGuid;
+            request.botName = bot->GetName();
+            request.profile = careerRequest.profile;
+            request.message = SerializeCareerRequestContent(careerRequest);
+            request.eventKind = CAREER_EVENT_KIND;
+            request.expiresAtSteadyMs = SteadyNowMs() + _responseDeadlineMs;
+
+            uint64 const wireRequestId = request.requestId;
+            int64 const expiresAtSteadyMs = request.expiresAtSteadyMs;
+            if (!_bridge->TryEnqueue(std::move(request)))
+                return false;
+
+            _careerPending.emplace(
+                wireRequestId,
+                PendingCareerDelivery { careerRequest, expiresAtSteadyMs });
+            return true;
+        }
+
+        std::optional<PlayerbotCareerPlanResponse> Poll(uint64 requestId) override
+        {
+            auto response = _careerResponses.find(requestId);
+            if (response == _careerResponses.end())
+                return std::nullopt;
+
+            PlayerbotCareerPlanResponse result = std::move(response->second);
+            _careerResponses.erase(response);
+            return result;
+        }
+
+        uint64 ResponseDeadlineMs() const override
+        {
+            return static_cast<uint64>(_responseDeadlineMs);
         }
 
         void CaptureWhisper(Player* speaker, Player* receiver, std::string const& message)
@@ -287,6 +350,26 @@ namespace
 
             for (ChatResponse const& response : _bridge->DrainResponses())
             {
+                auto career = _careerPending.find(response.requestId);
+                if (career != _careerPending.end())
+                {
+                    std::optional<CareerDecision> decision = ParseCareerDecision(response.message);
+                    if (decision)
+                    {
+                        PlayerbotCareerPlanRequest const& request = career->second.request;
+                        _careerResponses[request.requestId] = {
+                            request.requestId,
+                            request.botGuid,
+                            request.personalityVersion,
+                            request.careerVersion,
+                            decision->candidateToken,
+                            decision->spendingStyle
+                        };
+                    }
+                    _careerPending.erase(career);
+                    continue;
+                }
+
                 auto it = _pending.find(response.requestId);
                 if (it == _pending.end())
                     continue;
@@ -342,6 +425,9 @@ namespace
 
             int64 const now = SteadyNowMs();
             std::erase_if(_pending, [now](auto const& entry) { return now > entry.second.expiresAtSteadyMs; });
+            std::erase_if(
+                _careerPending,
+                [now](auto const& entry) { return now > entry.second.expiresAtSteadyMs; });
 
             if (_ambientCadence && _ambientCadence->TryConsumeDueSlot(now))
                 TryEnqueueAmbient();
@@ -476,6 +562,8 @@ namespace
 
         std::unique_ptr<ClaudeBridge> _bridge;
         std::unordered_map<uint64, PendingDelivery> _pending;
+        std::unordered_map<uint64, PendingCareerDelivery> _careerPending;
+        std::unordered_map<uint64, PlayerbotCareerPlanResponse> _careerResponses;
         std::map<uint64, uint64> _occurrenceByActor;
         RecentEventIdSet _recentEvents{RECENT_EVENT_CAPACITY};
         GroupCooldownTracker _groupCooldowns;

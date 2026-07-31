@@ -104,9 +104,41 @@ namespace
                 return "party";
             case ClaudeChat::ChatChannel::World:
                 return "world";
+            case ClaudeChat::ChatChannel::Career:
+                return "career";
         }
 
         return "";
+    }
+
+    std::string SpendingStyleName(PlayerbotRecipeSpendingStyle style)
+    {
+        switch (style)
+        {
+            case PlayerbotRecipeSpendingStyle::None:
+                return "none";
+            case PlayerbotRecipeSpendingStyle::Minimal:
+                return "minimal";
+            case PlayerbotRecipeSpendingStyle::Progression:
+                return "progression";
+            case PlayerbotRecipeSpendingStyle::Completionist:
+                return "completionist";
+        }
+
+        return "";
+    }
+
+    std::optional<PlayerbotRecipeSpendingStyle> ParseSpendingStyle(std::string const& style)
+    {
+        if (style == "none")
+            return PlayerbotRecipeSpendingStyle::None;
+        if (style == "minimal")
+            return PlayerbotRecipeSpendingStyle::Minimal;
+        if (style == "progression")
+            return PlayerbotRecipeSpendingStyle::Progression;
+        if (style == "completionist")
+            return PlayerbotRecipeSpendingStyle::Completionist;
+        return std::nullopt;
     }
 
     // Strict flat JSON value: unsigned integer or string only.
@@ -440,6 +472,7 @@ std::string ClaudeChat::SerializeRequest(ChatRequest const& request, std::string
     AppendJsonField(out, "speaker_name", request.speakerName);
     AppendJsonField(out, "profile_version", request.profile.version);
     AppendJsonField(out, "crafting_affinity", request.profile.craftingAffinity);
+    AppendJsonField(out, "gathering_affinity", request.profile.gatheringAffinity);
     AppendJsonField(out, "exploration_affinity", request.profile.explorationAffinity);
     AppendJsonField(out, "sociability", request.profile.sociability);
     AppendJsonField(out, "voice", std::string(PlayerbotPersonality::VoiceName(request.profile.voice)));
@@ -489,6 +522,50 @@ std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::st
     response.requestId = requestIt->second.number;
     response.message = message;
     return response;
+}
+
+std::string ClaudeChat::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
+{
+    std::string out;
+    out += '{';
+    AppendJsonField(out, "personality_version", request.personalityVersion, true);
+    AppendJsonField(out, "career_version", request.careerVersion);
+    out += ",\"candidates\":[";
+    for (size_t index = 0; index < request.candidates.size(); ++index)
+    {
+        if (index)
+            out += ',';
+        PlayerbotCareerCandidateView const& candidate = request.candidates[index];
+        out += '{';
+        AppendJsonField(out, "token", candidate.token, true);
+        AppendJsonField(out, "summary", candidate.summary);
+        AppendJsonField(out, "maximum_spending_style", SpendingStyleName(candidate.maximumSpendingStyle));
+        AppendJsonField(out, "market_eligible", static_cast<uint64>(candidate.marketEligible));
+        AppendJsonField(out, "engagement", candidate.engagement);
+        out += '}';
+    }
+    out += "]}";
+    return out;
+}
+
+std::optional<ClaudeChat::CareerDecision> ClaudeChat::ParseCareerDecision(std::string const& content)
+{
+    std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(content).Parse();
+    if (!fields || fields->size() != 2u)
+        return std::nullopt;
+
+    auto token = fields->find("candidate_token");
+    auto style = fields->find("spending_style");
+    if (token == fields->end() || style == fields->end() ||
+        !token->second.isString || !style->second.isString ||
+        token->second.text.find("career-") != 0u)
+        return std::nullopt;
+
+    std::optional<PlayerbotRecipeSpendingStyle> parsedStyle = ParseSpendingStyle(style->second.text);
+    if (!parsedStyle)
+        return std::nullopt;
+
+    return CareerDecision { token->second.text, *parsedStyle };
 }
 
 // --- Milestone speaker selection ---

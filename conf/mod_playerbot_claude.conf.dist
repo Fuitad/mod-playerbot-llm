@@ -86,8 +86,9 @@ PlayerbotClaude.SidecarDatabase = "playerbot_claude.sqlite"
 
 #
 #    PlayerbotClaude.ResponseDeadlineMs
-#        Description: Milliseconds a pending conversation waits for the sidecar before the
-#                     request expires. Expired requests are dropped without any fallback text.
+#        Description: Milliseconds a pending conversation or career choice waits for the
+#                     sidecar before the request expires. Expired conversations are dropped.
+#                     Expired career choices use the deterministic playerbot fallback.
 #                     The sidecar enforces the same deadline end to end (queueing, token
 #                     counting, and generation), and worldserver re-checks it immediately
 #                     before delivery, so a late provider reply is never spoken.

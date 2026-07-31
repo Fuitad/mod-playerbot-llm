@@ -7,9 +7,10 @@ explicitly untrusted user message, and the structured output carries only `messa
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 import anthropic
 import httpx
@@ -34,6 +35,14 @@ EVENT_KIND_NAMES = {
     2: "level gain",
     3: "rare loot",
     4: "ambient World chatter",
+    5: "career selection",
+}
+
+_SPENDING_STYLE_ORDER = {
+    "none": 0,
+    "minimal": 1,
+    "progression": 2,
+    "completionist": 3,
 }
 
 
@@ -69,6 +78,15 @@ class ChatReply(BaseModel):
     message: str
 
 
+class CareerReply(BaseModel):
+    """Structured output schema for one bounded career candidate choice."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    candidate_token: str
+    spending_style: Literal["none", "minimal", "progression", "completionist"]
+
+
 @dataclass(frozen=True)
 class UsageTotals:
     input_tokens: int
@@ -80,6 +98,20 @@ class UsageTotals:
 def build_system_prompt(request: protocol.ChatRequest) -> str:
     """Stable, trusted-only system prompt. Player text never enters it."""
 
+    if request.is_career:
+        return (
+            f"You are selecting a long-term profession career for {request.bot_name}.\n"
+            f"Trusted personality (each trait 0 to 100): crafting affinity {request.crafting_affinity}, "
+            f"gathering affinity {request.gathering_affinity}, exploration affinity "
+            f"{request.exploration_affinity}, sociability {request.sociability}. "
+            f"The voice is {request.voice}.\n"
+            "Choose exactly one supplied opaque candidate token and a spending style no greater "
+            "than that candidate's maximum. No profession is a valid choice. Higher engagement "
+            "means profession work can compete more strongly with questing. Market eligibility "
+            "permits using normal vendors or the auction house, but money remains limited. "
+            "Do not invent candidates, skill IDs, recipes, actions, or game facts."
+        )
+
     audience = (
         "speaking in character to the World channel"
         if request.is_ambient
@@ -88,7 +120,8 @@ def build_system_prompt(request: protocol.ChatRequest) -> str:
     return (
         f"You are {request.bot_name}, an adventurer in the world of Azeroth, {audience}.\n"
         f"Your fixed personality (each trait 0 to 100): crafting affinity {request.crafting_affinity}, "
-        f"exploration affinity {request.exploration_affinity}, sociability {request.sociability}. "
+        f"gathering affinity {request.gathering_affinity}, exploration affinity "
+        f"{request.exploration_affinity}, sociability {request.sociability}. "
         f"Your voice is {request.voice}: let that tone color every reply.\n"
         "Rules:\n"
         "- Reply with exactly one short in-character line of plain text, at most 200 characters.\n"
@@ -101,6 +134,19 @@ def build_system_prompt(request: protocol.ChatRequest) -> str:
 
 
 def build_user_message(request: protocol.ChatRequest) -> str:
+    if request.is_career:
+        candidates = [
+            {
+                "candidate_token": candidate.token,
+                "summary": candidate.summary,
+                "maximum_spending_style": candidate.maximum_spending_style,
+                "market_eligible": candidate.market_eligible,
+                "engagement": candidate.engagement,
+            }
+            for candidate in request.career_content.candidates
+        ]
+        return json.dumps({"candidates": candidates}, separators=(",", ":"))
+
     if request.is_ambient:
         return (
             "Offer one brief in-character World observation. Do not claim current game facts, "
@@ -119,7 +165,7 @@ def build_user_message(request: protocol.ChatRequest) -> str:
 
 def _build_messages(request: protocol.ChatRequest, history: list[tuple[str, str]]) -> list[MessageParam]:
     # History roles are constrained to user/assistant by storage's CHECK clause.
-    if request.is_ambient:
+    if request.is_ambient or request.is_career:
         history = []
 
     messages: list[MessageParam] = [
@@ -146,6 +192,7 @@ class ClaudeAdapter:
         )
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
+        output_format = CareerReply if request.is_career else ChatReply
         try:
             # output_format must match generate_reply exactly: the structured output
             # schema is billed as input, and the budget reservation is priced from
@@ -154,7 +201,7 @@ class ClaudeAdapter:
                 model=MODEL_ID,
                 system=build_system_prompt(request),
                 messages=_build_messages(request, history),
-                output_format=ChatReply,
+                output_format=output_format,
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -166,13 +213,14 @@ class ClaudeAdapter:
     def generate_reply(
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
     ) -> tuple[str, UsageTotals]:
+        output_format = CareerReply if request.is_career else ChatReply
         try:
             response = self._client.messages.parse(
                 model=MODEL_ID,
                 max_tokens=MAX_OUTPUT_TOKENS,
                 system=build_system_prompt(request),
                 messages=_build_messages(request, history),
-                output_format=ChatReply,
+                output_format=output_format,
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -185,7 +233,14 @@ class ClaudeAdapter:
         if parsed is None:
             raise ClaudeInvalidOutputError("model output did not match the reply schema")
 
-        message = parsed.message.strip()
+        if request.is_career:
+            if not isinstance(parsed, CareerReply):
+                raise ClaudeInvalidOutputError("model output did not match the career reply schema")
+            message = _validate_career_reply(request, parsed)
+        else:
+            if not isinstance(parsed, ChatReply):
+                raise ClaudeInvalidOutputError("model output did not match the chat reply schema")
+            message = parsed.message.strip()
         if not message:
             raise ClaudeInvalidOutputError("model returned an empty message")
 
@@ -203,6 +258,23 @@ class ClaudeAdapter:
             cache_read_input_tokens=usage.cache_read_input_tokens or 0,
         )
         return message, totals
+
+
+def _validate_career_reply(request: protocol.ChatRequest, reply: CareerReply) -> str:
+    candidates = {candidate.token: candidate for candidate in request.career_content.candidates}
+    candidate = candidates.get(reply.candidate_token)
+    if candidate is None:
+        raise ClaudeInvalidOutputError("model selected an unknown career candidate")
+    if _SPENDING_STYLE_ORDER[reply.spending_style] > _SPENDING_STYLE_ORDER[candidate.maximum_spending_style]:
+        raise ClaudeInvalidOutputError("model selected spending above the candidate maximum")
+
+    return json.dumps(
+        {
+            "candidate_token": reply.candidate_token,
+            "spending_style": reply.spending_style,
+        },
+        separators=(",", ":"),
+    )
 
 
 def _map_api_error(error: anthropic.APIError) -> ClaudeError:

@@ -6,6 +6,7 @@
 #define MOD_PLAYERBOT_CLAUDE_CLAUDECHAT_H
 
 #include "PlayerbotPersonality.h"
+#include "PlayerbotCareerPlan.h"
 
 #include <array>
 #include <chrono>
@@ -33,13 +34,15 @@ namespace ClaudeChat
     inline constexpr size_t MIN_BRIDGE_TOKEN_BYTES = 32;
     inline constexpr uint32 MAX_AMBIENT_MESSAGES_PER_HOUR = 6;
     inline constexpr uint8 AMBIENT_EVENT_KIND = 4;
+    inline constexpr uint8 CAREER_EVENT_KIND = 5;
     inline constexpr char AMBIENT_EVENT_MARKER[] = "ambient_world";
 
     enum class ChatChannel : uint8
     {
         Whisper = 0,
         Party = 1,
-        World = 2
+        World = 2,
+        Career = 3
     };
 
     // Immutable snapshot captured on the world thread. expiresAtSteadyMs is a steady-clock
@@ -90,6 +93,15 @@ namespace ClaudeChat
     // matching schema version and token, one line of at most MAX_RESPONSE_MESSAGE_BYTES of
     // valid UTF-8, and rejects everything else.
     std::optional<ChatResponse> ParseResponsePayload(std::string const& payload, std::string const& expectedToken);
+
+    struct CareerDecision
+    {
+        std::string candidateToken;
+        PlayerbotRecipeSpendingStyle spendingStyle = PlayerbotRecipeSpendingStyle::None;
+    };
+
+    std::string SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request);
+    std::optional<CareerDecision> ParseCareerDecision(std::string const& content);
 
     // Bounded FIFO shared between the world thread and the bridge worker. A full or
     // stopped queue rejects immediately; nothing ever blocks the pushing side.

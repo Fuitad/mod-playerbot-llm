@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,8 +33,9 @@ CPP_REQUEST_FIXTURE = (
     '"speaker_guid":9001,'
     '"bot_name":"Botname",'
     '"speaker_name":"Speaker",'
-    '"profile_version":1,'
+    '"profile_version":2,'
     '"crafting_affinity":65,'
+    '"gathering_affinity":37,'
     '"exploration_affinity":91,'
     '"sociability":82,'
     '"voice":"earnest",'
@@ -53,8 +55,9 @@ CPP_AMBIENT_REQUEST_FIXTURE = (
     '"speaker_guid":0,'
     '"bot_name":"Botname",'
     '"speaker_name":"",'
-    '"profile_version":1,'
+    '"profile_version":2,'
     '"crafting_affinity":65,'
+    '"gathering_affinity":37,'
     '"exploration_affinity":91,'
     '"sociability":82,'
     '"voice":"earnest",'
@@ -71,6 +74,42 @@ def valid_request_dict() -> dict[str, object]:
 
 def ambient_request_dict() -> dict[str, object]:
     return json.loads(CPP_AMBIENT_REQUEST_FIXTURE)
+
+
+def career_request_dict() -> dict[str, object]:
+    payload = valid_request_dict()
+    payload.update(
+        channel="career",
+        speaker_guid=0,
+        speaker_name="",
+        event_kind=protocol.CAREER_EVENT_KIND,
+        subject_id=0,
+        occurrence=0,
+        message=json.dumps(
+            {
+                "personality_version": 2,
+                "career_version": 1,
+                "candidates": [
+                    {
+                        "token": "career-abc123",
+                        "summary": "No professions",
+                        "maximum_spending_style": "none",
+                        "market_eligible": 0,
+                        "engagement": 0,
+                    },
+                    {
+                        "token": "career-def456",
+                        "summary": "Gathering career",
+                        "maximum_spending_style": "progression",
+                        "market_eligible": 1,
+                        "engagement": 78,
+                    },
+                ],
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return payload
 
 
 def parse(payload_dict: dict[str, object], token: str = TEST_TOKEN) -> protocol.ChatRequest:
@@ -140,6 +179,7 @@ def test_accepts_exact_cpp_fixture() -> None:
     assert request.speaker_guid == 9001
     assert request.bot_name == "Botname"
     assert request.crafting_affinity == 65
+    assert request.gathering_affinity == 37
     assert request.exploration_affinity == 91
     assert request.sociability == 82
     assert request.voice == "earnest"
@@ -212,7 +252,7 @@ def test_rejects_invalid_guids() -> None:
 
 
 def test_rejects_out_of_bounds_profile() -> None:
-    for field in ("crafting_affinity", "exploration_affinity", "sociability"):
+    for field in ("crafting_affinity", "gathering_affinity", "exploration_affinity", "sociability"):
         payload = valid_request_dict()
         payload[field] = 101
         with pytest.raises(protocol.ProtocolError):
@@ -223,7 +263,7 @@ def test_rejects_out_of_bounds_profile() -> None:
             parse(payload)
 
     payload = valid_request_dict()
-    payload["profile_version"] = 2
+    payload["profile_version"] = 1
     with pytest.raises(protocol.ProtocolError):
         parse(payload)
 
@@ -235,7 +275,7 @@ def test_rejects_out_of_bounds_profile() -> None:
 
 def test_rejects_unknown_event_kinds_and_channels() -> None:
     payload = valid_request_dict()
-    payload["event_kind"] = 5
+    payload["event_kind"] = 6
     with pytest.raises(protocol.ProtocolError):
         parse(payload)
 
@@ -270,6 +310,45 @@ def test_rejects_ambient_identity_fields_on_direct_chat() -> None:
     for field, invalid in (("speaker_guid", 0), ("speaker_name", "")):
         payload = valid_request_dict()
         payload[field] = invalid
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+
+def test_accepts_only_opaque_bounded_career_candidates() -> None:
+    request = parse(career_request_dict())
+    assert request.is_career
+    assert request.career_content.personality_version == 2
+    assert request.career_content.career_version == 1
+    assert [candidate.token for candidate in request.career_content.candidates] == [
+        "career-abc123",
+        "career-def456",
+    ]
+
+    for field, invalid in (
+        ("channel", "party"),
+        ("speaker_guid", 9001),
+        ("speaker_name", "Speaker"),
+        ("event_kind", 0),
+        ("subject_id", 42),
+        ("occurrence", 1),
+    ):
+        payload = career_request_dict()
+        payload[field] = invalid
+        with pytest.raises(protocol.ProtocolError):
+            parse(payload)
+
+
+def test_rejects_career_raw_ids_duplicates_and_invalid_styles() -> None:
+    for mutation in ("raw_id", "duplicate", "style"):
+        payload = career_request_dict()
+        content = json.loads(str(payload["message"]))
+        if mutation == "raw_id":
+            content["candidates"][0]["skill_id"] = 164
+        elif mutation == "duplicate":
+            content["candidates"][1]["token"] = content["candidates"][0]["token"]
+        else:
+            content["candidates"][1]["maximum_spending_style"] = "unlimited"
+        payload["message"] = json.dumps(content, separators=(",", ":"))
         with pytest.raises(protocol.ProtocolError):
             parse(payload)
 
@@ -344,6 +423,35 @@ def messages_response(message_text: str, usage: dict[str, int] | None = None) ->
         or {
             "input_tokens": 2500,
             "output_tokens": 80,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+    return httpx.Response(200, json=body)
+
+
+def career_messages_response(candidate_token: str, spending_style: str) -> httpx.Response:
+    body = {
+        "id": "msg_career_01",
+        "type": "message",
+        "role": "assistant",
+        "model": claude.MODEL_ID,
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "candidate_token": candidate_token,
+                        "spending_style": spending_style,
+                    }
+                ),
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 400,
+            "output_tokens": 24,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
         },
@@ -435,6 +543,53 @@ def test_ambient_provider_payload_uses_only_bot_personality() -> None:
     assert len(body["messages"]) == 1
     assert "observation" in body["messages"][0]["content"]
     assert "current game facts" in body["messages"][0]["content"]
+
+
+def test_career_provider_selects_only_bounded_opaque_candidate_without_history() -> None:
+    captured: dict[str, Any] = {}
+    private_marker = "PRIVATE-WHISPER-MARKER-7E31"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return career_messages_response("career-def456", "progression")
+
+    career = parse(career_request_dict())
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    reply, usage = adapter.generate_reply(
+        career,
+        history=[("user", private_marker), ("assistant", "Private reply")],
+    )
+
+    assert json.loads(reply) == {
+        "candidate_token": "career-def456",
+        "spending_style": "progression",
+    }
+    assert usage.input_tokens == 400
+    serialized = json.dumps(captured["body"])
+    assert private_marker not in serialized
+    assert "career-abc123" in serialized
+    assert "career-def456" in serialized
+    assert '"skill_id"' not in serialized
+    assert len(captured["body"]["messages"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("candidate_token", "spending_style"),
+    [
+        ("career-unknown", "minimal"),
+        ("career-abc123", "completionist"),
+    ],
+)
+def test_career_provider_rejects_unknown_candidate_or_excess_spending(
+    candidate_token: str,
+    spending_style: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return career_messages_response(candidate_token, spending_style)
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        adapter.generate_reply(parse(career_request_dict()), history=[])
 
 
 def test_count_input_tokens_uses_count_tokens_endpoint() -> None:
@@ -712,6 +867,30 @@ async def test_service_makes_no_generation_call_without_budget(tmp_path) -> None
     assert adapter.requests == []
 
 
+async def test_service_keeps_career_decisions_out_of_chat_history(tmp_path) -> None:
+    adapter = FakeAdapter(reply='{"candidate_token":"career-def456","spending_style":"progression"}')
+    store = make_storage(tmp_path)
+    service = app.SidecarService(
+        config=app.SidecarConfig.load(write_conf(tmp_path)),
+        token=TEST_TOKEN,
+        adapter=adapter,
+        store=store,
+    )
+
+    payload = await service.process_payload(json.dumps(career_request_dict()).encode())
+    assert payload is not None
+    assert adapter.histories == [[]]
+    assert store.recent_turns(42) == []
+    decision = store.get_career_decision(42)
+    assert decision is not None
+    assert decision == {
+        "career_version": 1,
+        "candidate_token": "career-def456",
+        "spending_style": "progression",
+        "updated_at": decision["updated_at"],
+    }
+
+
 # --- Storage: profiles, bounded memory, crash-safe budget ---
 
 
@@ -755,12 +934,41 @@ def test_profile_persists_across_reopen(tmp_path) -> None:
     reopened = make_storage(tmp_path)
     profile = reopened.get_profile(42)
     assert profile is not None
-    assert profile["profile_version"] == 1
+    assert profile["profile_version"] == 2
     assert profile["crafting_affinity"] == 65
+    assert profile["gathering_affinity"] == 37
     assert profile["exploration_affinity"] == 91
     assert profile["sociability"] == 82
     assert profile["voice"] == "earnest"
     assert reopened.get_profile(9999) is None
+
+
+def test_profile_schema_migrates_existing_database_without_erasing_history(tmp_path) -> None:
+    path = tmp_path / "sidecar.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE profiles (
+            bot_guid INTEGER PRIMARY KEY,
+            profile_version INTEGER NOT NULL,
+            crafting_affinity INTEGER NOT NULL,
+            exploration_affinity INTEGER NOT NULL,
+            sociability INTEGER NOT NULL,
+            voice TEXT NOT NULL,
+            bot_name TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute("INSERT INTO profiles VALUES (42, 1, 65, 91, 82, 'earnest', 'Botname', 'old')")
+    connection.commit()
+    connection.close()
+
+    store = storage.Storage(str(path))
+    profile = store.get_profile(42)
+    assert profile is not None
+    assert profile["profile_version"] == 1
+    assert profile["gathering_affinity"] == 0
 
 
 def test_conversation_memory_is_bounded_to_20_turns(tmp_path) -> None:

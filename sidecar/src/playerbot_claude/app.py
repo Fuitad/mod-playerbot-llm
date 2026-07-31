@@ -243,7 +243,15 @@ class SidecarService:
                     self._store.settle(
                         reservation, usage.input_tokens, usage.output_tokens, self._config.prices
                     )
-                if not request.is_ambient:
+                if request.is_career:
+                    decision = claude.CareerReply.model_validate_json(reply)
+                    self._store.record_career_decision(
+                        request.bot_guid,
+                        request.career_content.career_version,
+                        decision.candidate_token,
+                        decision.spending_style,
+                    )
+                elif not request.is_ambient:
                     self._store.append_turn(request.bot_guid, "user", claude.build_user_message(request))
                     self._store.append_turn(request.bot_guid, "assistant", reply)
 
@@ -251,7 +259,7 @@ class SidecarService:
         return protocol.encode_response(request.request_id, reply, self._token)
 
     def _history_for(self, request: protocol.ChatRequest) -> list[tuple[str, str]]:
-        if self._store is None or request.is_ambient:
+        if self._store is None or request.is_ambient or request.is_career:
             return []
 
         return self._store.recent_turns(request.bot_guid)
