@@ -32,7 +32,7 @@ namespace ClaudeChat
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
     inline constexpr size_t MIN_BRIDGE_TOKEN_BYTES = 32;
-    inline constexpr uint32 MAX_AMBIENT_MESSAGES_PER_HOUR = 6;
+    inline constexpr uint32 MAX_AMBIENT_MESSAGES_PER_HOUR = 60;
     inline constexpr uint8 AMBIENT_EVENT_KIND = 4;
     inline constexpr uint8 CAREER_EVENT_KIND = 5;
     inline constexpr char AMBIENT_EVENT_MARKER[] = "ambient_world";

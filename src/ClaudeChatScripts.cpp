@@ -97,7 +97,8 @@ namespace
             return false;
 
         ChannelMgr* channelManager = ChannelMgr::forTeam(player->GetTeamId());
-        return channelManager && channelManager->GetChannel("World", player);
+        Channel* worldChannel = channelManager ? channelManager->GetChannel("World", player) : nullptr;
+        return worldChannel && worldChannel->IsOn(player->GetGUID());
     }
 
     bool EqualNamesCaseInsensitive(std::string const& a, std::string const& b)

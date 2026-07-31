@@ -43,7 +43,7 @@ All keys live in `mod_playerbot_claude.conf` and are read by both worldserver an
 | --- | --- | --- |
 | `PlayerbotClaude.Enable` | `0` | Master switch for the worldserver hooks. |
 | `PlayerbotClaude.AmbientWorldEnable` | `0` | Enables personality shaped ambient World chatter. |
-| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | Persistent rolling hourly limit. Values above `6` disable ambient chatter. |
+| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | Persistent rolling hourly limit. Values above `60` disable ambient chatter. |
 | `PlayerbotClaude.BridgePort` | `0` | Loopback TCP port shared by worldserver and sidecar. `0` disables both. |
 | `PlayerbotClaude.DailyBudgetUsd` | `5` | Rolling 24 hour circuit breaker shared by all Claude generation. |
 | `PlayerbotClaude.InputUsdPerMTok` | `1.00` | Price per million input tokens (Claude Haiku 4.5). |
@@ -88,7 +88,7 @@ uv run playerbot-claude profile --config /path/to/mod_playerbot_claude.conf --bo
 - **Whisper** a bot naturally: any whisper that mod-playerbots does not recognize as a bot command becomes Claude conversation. Known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. Prefixing with `llm ` forces Claude even for command-shaped text (`llm follow` asks the bot about following instead of ordering it to).
 - **Party chat**: `llm <bot-name> <message>` addresses one bot in your group. Party chat keeps the explicit prefix so ordinary group conversation never reaches the API.
 - **Milestones**: after a quest completion, a level gain, or a rare or epic loot drop, one deterministically selected group bot may react, at most once per `GroupCooldownSeconds` per group.
-- **Ambient World chatter**: set `PlayerbotClaude.AmbientWorldEnable = 1` and set `AiPlayerbot.EnableBroadcasts = 0` in `playerbots.conf`. The module refuses ambient mode while canned broadcasts remain enabled, but direct Claude conversations continue working. Ambient attempts occur only while a human player is connected, use an eligible online bot that is alive, outside combat, and able to speak in World, and are limited to six accepted attempts in any rolling hour. Delivery checks the human and bot again before speech.
+- **Ambient World chatter**: set `PlayerbotClaude.AmbientWorldEnable = 1` and set `AiPlayerbot.EnableBroadcasts = 0` in `playerbots.conf`. The module refuses ambient mode while canned broadcasts remain enabled, but direct Claude conversations continue working. Ambient attempts occur only while a human player is connected, use an eligible online bot that is alive, outside combat, and able to speak in the human player's faction World channel, and are limited to the configured rolling hourly limit. Delivery checks the human, bot, and channel membership again before speech.
 
 Replies are one short line (at most 240 bytes), in the bot's fixed voice. If anything fails (budget, timeout, provider error, invalid output), the bot simply stays silent.
 

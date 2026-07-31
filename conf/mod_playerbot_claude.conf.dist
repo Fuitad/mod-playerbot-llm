@@ -33,7 +33,7 @@ PlayerbotClaude.AmbientWorldEnable = 0
 #
 #    PlayerbotClaude.AmbientMaxMessagesPerHour
 #        Description: Maximum accepted ambient attempts in any rolling hour. Values from 1 through
-#                     6 are valid. Values outside that range disable ambient World chat.
+#                     60 are valid. Values outside that range disable ambient World chat.
 #        Default:     6
 
 PlayerbotClaude.AmbientMaxMessagesPerHour = 6
