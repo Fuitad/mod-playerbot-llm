@@ -17,6 +17,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 
+#include "Bot/Social/PlayerbotSocialRoute.h"
 #include "ExternalEventHelper.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
@@ -442,7 +443,10 @@ namespace
                 _careerPending,
                 [now](auto const& entry) { return now > entry.second.expiresAtSteadyMs; });
 
-            if (_ambientCadence && _ambientCadence->TryConsumeDueSlot(now))
+            // Re-read every tick rather than trusted from startup, so a social gate that becomes
+            // live-controllable silences this limiter immediately instead of at the next restart.
+            if (LegacyAmbientWorldAllowed(_ambientCadence.has_value(), PlayerbotSocialConfiguredGate().enabled) &&
+                _ambientCadence->TryConsumeDueSlot(now))
                 TryEnqueueAmbient();
         }
 
@@ -451,6 +455,19 @@ namespace
         {
             if (!sConfigMgr->GetOption<bool>("PlayerbotClaude.AmbientWorldEnable", false))
                 return;
+
+            /*
+             * The interactive social feature owns unprompted chatter when it is on, so the hourly
+             * limiter is never configured alongside it. Reported rather than silently skipped: this
+             * setting being ignored is worth knowing about when reading a running server's log.
+             */
+            if (!LegacyAmbientWorldAllowed(true, PlayerbotSocialConfiguredGate().enabled))
+            {
+                LOG_INFO("playerbot.claude",
+                         "mod-playerbot-claude: ambient World chat disabled "
+                         "(AiPlayerbot.SocialChat.Enable owns unprompted chat while it is on)");
+                return;
+            }
 
             int32 const messagesPerHour =
                 sConfigMgr->GetOption<int32>("PlayerbotClaude.AmbientMaxMessagesPerHour", 6);

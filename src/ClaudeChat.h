@@ -227,6 +227,11 @@ namespace ClaudeChat
     // preflight gate required for a World request.
     bool ShouldEnqueueAmbient(bool humanOnline, std::vector<AmbientCandidateSnapshot> const& candidates);
 
+    // True only when the legacy hourly ambient World limiter may still run: it is configured on AND
+    // the interactive social feature is off. The two are competing answers to when a bot speaks
+    // unprompted, so the older one yields while the newer one owns the decision.
+    bool LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled);
+
     // Bounded set of recently enqueued event identifiers with FIFO eviction. Insert
     // returns false for an exact duplicate still tracked.
     class RecentEventIdSet

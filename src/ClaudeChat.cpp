@@ -675,6 +675,11 @@ bool ClaudeChat::ShouldEnqueueAmbient(bool humanOnline,
     });
 }
 
+bool ClaudeChat::LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled)
+{
+    return ambientConfigured && !socialGateEnabled;
+}
+
 bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
 {
     for (MilestoneEventId const& seen : _order)

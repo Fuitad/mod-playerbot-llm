@@ -653,6 +653,22 @@ TEST(ClaudeChatPolicyTest, AmbientEligibilityRequiresHumanAndAvailableQuietBot)
     EXPECT_FALSE(ShouldEnqueueAmbient(true, {fighting}));
 }
 
+TEST(ClaudeChatPolicyTest, TheLegacyAmbientLimiterYieldsToTheInteractiveSocialFeature)
+{
+    /*
+     * The hourly limiter and the interactive social feature are two answers to the same question, so
+     * only one of them may be speaking. While the social gate is on, social density, probability
+     * decay, cooldowns, and budget admission decide when a bot opens its mouth, and this limiter
+     * steps aside entirely rather than adding an unrelated World line on top.
+     */
+    EXPECT_TRUE(LegacyAmbientWorldAllowed(true, false));
+    EXPECT_FALSE(LegacyAmbientWorldAllowed(true, true));
+
+    // And the gate being on is not a way to turn the limiter on: an unconfigured limiter stays off.
+    EXPECT_FALSE(LegacyAmbientWorldAllowed(false, false));
+    EXPECT_FALSE(LegacyAmbientWorldAllowed(false, true));
+}
+
 TEST(ClaudeChatBridgeTest, DeclinedAmbientSnapshotProducesNoOutboundFrame)
 {
     FakeSidecarServer server([](std::string const&) -> std::optional<std::string>
