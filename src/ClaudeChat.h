@@ -8,9 +8,12 @@
 #include "PlayerbotPersonality.h"
 #include "PlayerbotCareerPlan.h"
 
+#include "Bot/Social/PlayerbotSocialProvider.h"
+
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <map>
 #include <memory>
@@ -187,6 +190,21 @@ namespace ClaudeChat
         bool regenerate = false;
     };
 
+    /*
+     * A social answer as it came off the wire, still unparsed, tagged with the request it claims to
+     * answer.
+     *
+     * The bridge worker deliberately does NOT parse it. Classifying a social payload spends the
+     * request's regeneration budget, and that budget is per request state owned by the transport on
+     * the world thread. A worker that parsed would either have to carry the budget across a thread
+     * boundary or answer without it, and the second is how one malformed sidecar retries forever.
+     */
+    struct SocialRawResponse
+    {
+        uint64 socialRequestToken = 0;
+        std::string payload;
+    };
+
 /*
      * Tracks one social request across the bridge, and decides what to do with what comes back.
      *
@@ -240,6 +258,16 @@ namespace ClaudeChat
      * nullopt rather than an oversize frame the far side would reject anyway, so the failure happens
      * here where the caller can see which request caused it.
      */
+    /*
+     * Whether a social request could be serialized at all: both actors, the thread identity, the
+     * context, and the bridge token, each inside its byte budget.
+     *
+     * Named separately so the transport can refuse a request without building the frame twice, and
+     * so there is exactly ONE definition of a usable request. Two would drift, and the one that
+     * drifted would be the one that only the far side enforced.
+     */
+    [[nodiscard]] bool SocialRequestIsUsable(SocialRequest const& request, std::string const& token);
+
     std::optional<std::string> SerializeSocialRequest(SocialRequest const& request, std::string const& token);
 
     /*
@@ -526,12 +554,100 @@ namespace ClaudeChat
         // request is already expired.
         bool TryEnqueue(ChatRequest request);
 
+        /*
+         * World thread: the social lane, sharing this one socket and worker.
+         *
+         * A second bridge would mean a second connection, a second reconnect loop, and two
+         * independent queue bounds for one sidecar. The two shapes share everything except how they
+         * are serialized and what comes back, so they share the queue and differ there.
+         */
+        bool TryEnqueueSocial(SocialRequest request, int64 expiresAtSteadyMs);
+
         // World thread: returns every completed response since the previous drain.
         std::vector<ChatResponse> DrainResponses();
+        std::vector<SocialRawResponse> DrainSocialResponses();
 
     private:
         struct Impl;
         std::unique_ptr<Impl> _impl;
+    };
+
+    /*
+     * The social transport: everything the provider does that does not need a game object.
+     *
+     * Split from the provider itself for the reason every other layer here is split: the worldserver
+     * coordinator cannot be linked into this module's unit tests, so a rule that lives inside the
+     * provider is a rule nothing executes. This half owns the outstanding exchanges and decides what
+     * each answer is; the provider half resolves characters into actors and talks to the coordinator.
+     *
+     * Nothing here holds a game pointer, and nothing here delivers. It produces a value the
+     * worldserver then judges, which is Definition of Done 5.
+     */
+    inline constexpr std::size_t MAX_OUTSTANDING_SOCIAL_REQUESTS =
+        PLAYERBOT_SOCIAL_MAX_PENDING_BOTS * PLAYERBOT_SOCIAL_MAX_PENDING_PER_BOT;
+
+    class ClaudeSocialTransport
+    {
+    public:
+        ClaudeSocialTransport(ClaudeBridge& bridge, std::string bridgeToken, int64 requestDeadlineMs)
+            : _bridge(bridge), _bridgeToken(std::move(bridgeToken)), _requestDeadlineMs(requestDeadlineMs)
+        {
+        }
+
+        ClaudeSocialTransport(ClaudeSocialTransport const&) = delete;
+        ClaudeSocialTransport& operator=(ClaudeSocialTransport const&) = delete;
+
+        /*
+         * Opens an exchange and hands the request to the bridge.
+         *
+         * False on every refusal, which the coordinator reads as ProviderFailed and turns into
+         * silence: an unusable actor, a duplicate token, a full transport, an unusable bridge token,
+         * and a full or stopped queue are all "this will not be answered", and saying so immediately
+         * is better than holding a slot until the coordinator's own timeout expires it.
+         */
+        bool Submit(SocialRequest const& request);
+
+        /*
+         * One drained answer, already classified.
+         *
+         * `result` is only meaningful for Deliver. Regenerate means the transport has already asked
+         * again and there is nothing yet to do; Abandon means this request will never produce a line,
+         * and the coordinator expires it by token.
+         */
+        struct Completed
+        {
+            uint64 socialRequestToken = 0;
+            SocialExchangeOutcome outcome = SocialExchangeOutcome::Abandon;
+            PlayerbotSocialProviderResult result;
+        };
+
+        // World thread: classifies everything that came back since the previous drain.
+        std::vector<Completed> Drain();
+
+        [[nodiscard]] std::size_t OutstandingCount() const { return _exchanges.size(); }
+
+        // Drops every outstanding exchange. Shutdown, and provider deregistration, both need this:
+        // an exchange outlives nothing, and a stale one would match a token the coordinator reissued.
+        void Clear() { _exchanges.clear(); }
+
+    private:
+        /*
+         * The exchange and the request that opened it, together.
+         *
+         * The request is retained because a regeneration has to re-send the SAME request. Rebuilding
+         * it from the world would resolve a second time, and by then the subject may be gone, so the
+         * retry would silently become a different question.
+         */
+        struct Outstanding
+        {
+            SocialExchange exchange;
+            SocialRequest request;
+        };
+
+        ClaudeBridge& _bridge;
+        std::string _bridgeToken;
+        int64 _requestDeadlineMs = 0;
+        std::map<uint64, Outstanding> _exchanges;
     };
 }
 

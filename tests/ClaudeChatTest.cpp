@@ -1329,3 +1329,275 @@ TEST(ClaudeChatSocialProtocolTest, ResponseParsersBoundTheTokenExplicitly)
     std::string const tooShort(ClaudeChat::MIN_BRIDGE_TOKEN_BYTES - 1, 'k');
     EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), tooShort, 77, 500).has_value());
 }
+
+// Typed social transport ---------------------------------------------------------------------------
+
+namespace
+{
+    ClaudeChat::SocialRequest MakeSocialRequest(uint64 requestToken = 77, uint64 botGuid = 500)
+    {
+        ClaudeChat::SocialRequest request;
+        request.socialRequestToken = requestToken;
+        request.bot = SocialActor(botGuid, "Grimbold", false);
+        request.subject = SocialActor(900, "Deszy", true);
+        request.speakOnChannel = static_cast<uint8>(PlayerbotSocialChannel::Party);
+        request.threadPublicId = "thr_00000000000000000000000000000001";
+        request.context = "party pull";
+        return request;
+    }
+
+    BridgeConfig MakeSocialBridgeConfig(uint16_t port, uint32 queueCapacity = 8)
+    {
+        BridgeConfig config = MakeBridgeConfig(port, queueCapacity);
+        config.token = SOCIAL_TOKEN;
+        return config;
+    }
+
+    // Collects one drain's worth of transport outcomes, polling until something arrives.
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> DrainWithin(
+        ClaudeChat::ClaudeSocialTransport& transport, int64 timeoutMs)
+    {
+        std::vector<ClaudeChat::ClaudeSocialTransport::Completed> drained;
+        WaitFor([&]() {
+            std::vector<ClaudeChat::ClaudeSocialTransport::Completed> batch = transport.Drain();
+            drained.insert(drained.end(), batch.begin(), batch.end());
+            return !drained.empty();
+        }, timeoutMs);
+        return drained;
+    }
+}
+
+TEST(ClaudeChatSocialTransportTest, ASubmittedRequestReachesTheSidecarAsASocialFrame)
+{
+    std::atomic<bool> sawSocialFrame{false};
+    FakeSidecarServer server([&](std::string const& payload) -> std::optional<std::string> {
+        sawSocialFrame = payload.find("\"kind\":\"social\"") != std::string::npos &&
+                         payload.find("\"social_request_token\":77") != std::string::npos &&
+                         payload.find("\"thread_id\":\"thr_00000000000000000000000000000001\"") !=
+                             std::string::npos;
+        return SocialPayload();
+    });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    EXPECT_EQ(transport.OutstandingCount(), 1u);
+
+    EXPECT_TRUE(WaitFor([&]() { return sawSocialFrame.load(); }, 5000));
+    bridge.Stop();
+}
+
+TEST(ClaudeChatSocialTransportTest, AUsableLineIsDrainedAsAMessageForTheCoordinator)
+{
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return SocialPayload(); });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = DrainWithin(transport, 5000);
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].outcome, ClaudeChat::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(drained[0].socialRequestToken, 77u);
+    EXPECT_EQ(drained[0].result.requestToken, 77u);
+    EXPECT_EQ(drained[0].result.kind, PlayerbotSocialOutputKind::Message);
+    EXPECT_EQ(drained[0].result.text, "Aye, that pack hits hard.");
+    EXPECT_EQ(drained[0].result.channel, PlayerbotSocialChannel::Party);
+
+    // A delivered exchange is consumed. A result is delivered once or not at all.
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, ScheduleThreeCannotExpressSilenceSoAnEmptyLineIsAbandoned)
+{
+    /*
+     * The coordinator names Silence a legitimate answer, but schema 3's social response has no way
+     * to SAY it: a payload that is not a regeneration must carry one clean line, so an empty message
+     * is an invalid response rather than a quiet bot.
+     *
+     * Abandoned rather than delivered as Silence. Reading an empty message as a deliberate choice
+     * would give the same meaning to "this bot decided not to speak" and "the sidecar returned
+     * nothing", and those are not the same event. Task 10 owns the response models and is where a
+     * silence variant belongs; until then this provider produces a line or nothing at all, and the
+     * coordinator's Silence and Emote kinds stay unreachable from it.
+     */
+    FakeSidecarServer server(
+        [](std::string const&) -> std::optional<std::string> { return SocialPayload("social", 77, 500, ""); });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = DrainWithin(transport, 5000);
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].outcome, ClaudeChat::SocialExchangeOutcome::Abandon);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, TheSidecarsOwnChannelIsCarriedSoTheCoordinatorCanRefuseASwitch)
+{
+    /*
+     * The channel travels as the sidecar reported it rather than being replaced with the one that was
+     * asked for. Substituting the requested channel here would make PlayerbotSocialValidateOutput's
+     * ChannelSwitch refusal unreachable, which is how a party remark reaches a zone channel.
+     */
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> {
+        std::string payload = SocialPayload();
+        std::string const asked = "\"speak_on_channel\":2";
+        payload.replace(payload.find(asked), asked.size(), "\"speak_on_channel\":0");
+        return payload;
+    });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = DrainWithin(transport, 5000);
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].result.channel, PlayerbotSocialChannel::General);
+    EXPECT_EQ(PlayerbotSocialValidateOutput(drained[0].result, PlayerbotSocialChannel::Party),
+              PlayerbotSocialDeliveryRejection::ChannelSwitch);
+}
+
+TEST(ClaudeChatSocialTransportTest, AnUnreadableChannelIsAbandonedRatherThanCastIntoOne)
+{
+    // A value outside the enum cannot be handed to the coordinator: this build has neither -Wswitch
+    // nor -Werror, so a cast one would reach a consumer unchallenged.
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> {
+        std::string payload = SocialPayload();
+        std::string const asked = "\"speak_on_channel\":2";
+        payload.replace(payload.find(asked), asked.size(), "\"speak_on_channel\":9");
+        return payload;
+    });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = DrainWithin(transport, 5000);
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].outcome, ClaudeChat::SocialExchangeOutcome::Abandon);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, ARegenerationIsResubmittedOnceAndThenAbandoned)
+{
+    std::atomic<uint32_t> asks{0};
+    FakeSidecarServer server([&](std::string const&) -> std::optional<std::string> {
+        ++asks;
+        return SocialPayload("social", 77, 500, "", 1);
+    });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> outcomes;
+    WaitFor([&]() {
+        std::vector<ClaudeChat::ClaudeSocialTransport::Completed> batch = transport.Drain();
+        outcomes.insert(outcomes.end(), batch.begin(), batch.end());
+        return outcomes.size() >= 2;
+    }, 8000);
+    bridge.Stop();
+
+    ASSERT_EQ(outcomes.size(), 2u);
+    EXPECT_EQ(outcomes[0].outcome, ClaudeChat::SocialExchangeOutcome::Regenerate);
+    EXPECT_EQ(outcomes[1].outcome, ClaudeChat::SocialExchangeOutcome::Abandon);
+
+    // Exactly one retry: the original ask plus one regeneration, never a third.
+    EXPECT_EQ(asks.load(), 2u);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, AnAnswerForARequestNobodyIsWaitingOnIsDropped)
+{
+    // The bridge tags each answer with the request it was sent for, so this is the case where an
+    // exchange was cleared while its answer was in flight. It must not resurrect one.
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return SocialPayload(); });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    transport.Clear();
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> drained;
+    WaitFor([&]() {
+        std::vector<ClaudeChat::ClaudeSocialTransport::Completed> batch = transport.Drain();
+        drained.insert(drained.end(), batch.begin(), batch.end());
+        return !drained.empty();
+    }, 1500);
+    bridge.Stop();
+
+    EXPECT_TRUE(drained.empty());
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, SubmitFailsClosedOnEveryRefusal)
+{
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return SocialPayload(); });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 5000);
+
+    // An unusable actor never reaches the wire.
+    ClaudeChat::SocialRequest unusable = MakeSocialRequest(78);
+    unusable.bot.name.clear();
+    EXPECT_FALSE(transport.Submit(unusable));
+
+    // Neither does a request with no token to tie an answer back to.
+    EXPECT_FALSE(transport.Submit(MakeSocialRequest(0)));
+
+    // A token already outstanding is refused rather than replacing the exchange that owns it.
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest(77)));
+    EXPECT_FALSE(transport.Submit(MakeSocialRequest(77)));
+    EXPECT_EQ(transport.OutstandingCount(), 1u);
+
+    bridge.Stop();
+
+    // And a stopped bridge accepts nothing, which the coordinator reads as ProviderFailed.
+    EXPECT_FALSE(transport.Submit(MakeSocialRequest(79)));
+}
+
+TEST(ClaudeChatSocialTransportTest, TheTransportRefusesBeyondItsOutstandingBound)
+{
+    /*
+     * The coordinator bounds pending deliveries per bot and in total, and this holds the same
+     * ceiling. Without it a provider that is never drained accumulates one retained request per
+     * token for the rest of the uptime.
+     */
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port(), 4096));
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 60000);
+    for (std::size_t i = 0; i < ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS; ++i)
+        ASSERT_TRUE(transport.Submit(MakeSocialRequest(i + 1)));
+
+    EXPECT_EQ(transport.OutstandingCount(), ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS);
+    EXPECT_FALSE(transport.Submit(MakeSocialRequest(ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS + 1)));
+}

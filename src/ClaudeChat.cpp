@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <map>
 #include <thread>
+#include <variant>
 
 using boost::asio::ip::tcp;
 
@@ -679,8 +680,122 @@ ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::stri
     return SocialExchangeOutcome::Deliver;
 }
 
-std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest const& request,
-                                                               std::string const& token)
+bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
+{
+    /*
+     * Every refusal here is immediate and final, which is the point. The coordinator reads a false
+     * as ProviderFailed and produces silence now, rather than holding the bot's slot until its own
+     * thirty second timeout expires a request that was never going to be answered.
+     */
+    if (!SocialRequestIsUsable(request, _bridgeToken))
+        return false;
+
+    // Never replace the exchange that already owns this token. The coordinator does not reuse one,
+    // so a second submission under the same token is a caller bug, and silently dropping the first
+    // exchange would leave its answer unmatchable.
+    if (_exchanges.contains(request.socialRequestToken))
+        return false;
+
+    /*
+     * The same ceiling the coordinator bounds its pending deliveries with. Without it a provider
+     * whose drain is never called accumulates one retained request per token for the rest of the
+     * uptime, and the retained copy is the whole request including its context.
+     */
+    if (_exchanges.size() >= MAX_OUTSTANDING_SOCIAL_REQUESTS)
+        return false;
+
+    if (!_bridge.TryEnqueueSocial(request, SteadyNowMs() + _requestDeadlineMs))
+        return false;
+
+    _exchanges.emplace(request.socialRequestToken,
+                       Outstanding{SocialExchange(request.socialRequestToken, request.bot.guidCounter), request});
+    return true;
+}
+
+std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Drain()
+{
+    std::vector<Completed> completed;
+
+    for (SocialRawResponse const& raw : _bridge.DrainSocialResponses())
+    {
+        auto const outstanding = _exchanges.find(raw.socialRequestToken);
+        if (outstanding == _exchanges.end())
+            continue;  // Cleared while its answer was in flight. Never resurrect an exchange.
+
+        SocialResponse response;
+        SocialExchangeOutcome const outcome = outstanding->second.exchange.Classify(raw.payload, _bridgeToken,
+                                                                                   response);
+
+        if (outcome == SocialExchangeOutcome::Regenerate)
+        {
+            /*
+             * Re-send the request that is already retained rather than rebuilding it. Rebuilding
+             * would resolve the world a second time, and by then the subject may be gone, so the
+             * retry would quietly become a different question.
+             *
+             * A regeneration the bridge will not take is the end of this exchange: the budget has
+             * already been spent, so there is no second retry to fall back on.
+             */
+            if (_bridge.TryEnqueueSocial(outstanding->second.request, SteadyNowMs() + _requestDeadlineMs))
+            {
+                completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Regenerate, {}});
+                continue;
+            }
+
+            _exchanges.erase(outstanding);
+            completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Abandon, {}});
+            continue;
+        }
+
+        if (outcome != SocialExchangeOutcome::Deliver)
+        {
+            _exchanges.erase(outstanding);
+            completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Abandon, {}});
+            continue;
+        }
+
+        /*
+         * The channel travels as the SIDECAR reported it, not as the coordinator asked for it.
+         * Substituting the requested channel would make the coordinator's ChannelSwitch refusal
+         * unreachable, and that refusal is what keeps a party remark out of a zone channel.
+         *
+         * A value outside the enum is abandoned rather than cast: this build has neither -Wswitch
+         * nor -Werror, so a cast one reaches a consumer unchallenged.
+         */
+        auto const channel = static_cast<PlayerbotSocialChannel>(response.speakOnChannel);
+        if (!PlayerbotSocialChannelIsValid(channel))
+        {
+            _exchanges.erase(outstanding);
+            completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Abandon, {}});
+            continue;
+        }
+
+        PlayerbotSocialProviderResult result;
+        result.requestToken = raw.socialRequestToken;
+        /*
+         * Always a Message, and that is a statement about schema 3 rather than a simplification.
+         *
+         * A social answer that is not a regeneration must carry one clean line, so the parser has
+         * already refused an empty one: there is no payload this transport can receive that means
+         * "the bot chose not to speak". Schema 3 carries no emote either. Two of the coordinator's
+         * three output kinds are therefore unreachable from this provider, which is recorded rather
+         * than hidden behind a branch that cannot be taken. Task 10 owns the response models and is
+         * where a silence and an emote variant belong.
+         */
+        result.kind = PlayerbotSocialOutputKind::Message;
+        result.text = response.message;
+        result.channel = channel;
+
+        // Consumed either way: a result is delivered once or not at all, never retried into a
+        // conversation that has already moved on.
+        _exchanges.erase(outstanding);
+        completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Deliver, std::move(result)});
+    }
+
+    return completed;
+}
+
+bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
 {
     /*
      * Refused before anything is written. The sidecar enforces these too, but a bound checked only
@@ -688,10 +803,10 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
      * nothing about which request was at fault.
      */
     if (!BridgeTokenIsUsable(token))
-        return std::nullopt;
+        return false;
 
     if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot))
-        return std::nullopt;
+        return false;
 
     /*
      * The subject is either fully absent or fully usable, never half described. Accepting a zero
@@ -699,12 +814,21 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
      * prompt builder reading that name would describe somebody who is not there.
      */
     if (!ActorIsAbsent(request.subject) && !ActorIsUsable(request.subject))
-        return std::nullopt;
+        return false;
 
     if (request.threadPublicId.empty() || request.threadPublicId.size() > MAX_THREAD_ID_BYTES)
-        return std::nullopt;
+        return false;
 
     if (request.context.size() > MAX_SOCIAL_CONTEXT_BYTES)
+        return false;
+
+    return true;
+}
+
+std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest const& request,
+                                                               std::string const& token)
+{
+    if (!SocialRequestIsUsable(request, token))
         return std::nullopt;
 
     /*
@@ -1101,13 +1225,28 @@ bool ClaudeChat::GroupCooldownTracker::TryBegin(uint64 groupId, int64 nowMs, int
 struct ClaudeChat::ClaudeBridge::Impl
 {
     explicit Impl(BridgeConfig bridgeConfig)
-        : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity)
+        : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity),
+          socialResponses(config.queueCapacity)
     {
     }
 
+    /*
+     * One queued request, in exactly one of the two shapes this bridge carries.
+     *
+     * A variant rather than a chat request with social fields hanging off it. The two share nothing
+     * but a deadline, and a struct where half the fields are meaningless depending on a channel
+     * enum is precisely the half described shape this protocol refuses everywhere else.
+     */
+    struct QueuedRequest
+    {
+        std::variant<ChatRequest, SocialRequest> payload;
+        int64 expiresAtSteadyMs = 0;
+    };
+
     BridgeConfig config;
-    BoundedQueue<ChatRequest> requests;
+    BoundedQueue<QueuedRequest> requests;
     BoundedQueue<ChatResponse> responses;
+    BoundedQueue<SocialRawResponse> socialResponses;
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
 
@@ -1243,16 +1382,20 @@ struct ClaudeChat::ClaudeBridge::Impl
     {
         while (!stopToken.stop_requested())
         {
-            ChatRequest request;
+            QueuedRequest request;
             if (!requests.WaitPop(request, std::chrono::milliseconds(200)))
                 continue;
 
             if (SteadyNowMs() > request.expiresAtSteadyMs)
                 continue;  // expired in queue: discard, fail closed
 
+            SocialRequest const* const social = std::get_if<SocialRequest>(&request.payload);
+
             // A request that cannot be serialized within its budgets is discarded here rather than
             // sent for the far side to reject. Same fail closed posture as an expired one above.
-            std::optional<std::string> const payload = SerializeRequest(request, config.token);
+            std::optional<std::string> const payload =
+                social ? SerializeSocialRequest(*social, config.token)
+                       : SerializeRequest(std::get<ChatRequest>(request.payload), config.token);
             if (!payload)
                 continue;
 
@@ -1277,8 +1420,8 @@ struct ClaudeChat::ClaudeBridge::Impl
                 int64 const remainingMs = request.expiresAtSteadyMs - SteadyNowMs();
                 SetReadTimeout(std::max<int64>(remainingMs, 100));
 
-                std::optional<std::string> const payload = ReadFrame();
-                if (!payload)
+                std::optional<std::string> const answer = ReadFrame();
+                if (!answer)
                 {
                     // Timeout, closed connection, or oversized frame: the request is
                     // lost. Never fabricate a response.
@@ -1286,8 +1429,16 @@ struct ClaudeChat::ClaudeBridge::Impl
                     break;
                 }
 
-                if (std::optional<ChatResponse> response = ParseResponsePayload(*payload, config.token))
+                if (social)
+                {
+                    // Handed back unparsed. Classifying it spends the regeneration budget, which
+                    // lives with the transport on the world thread and not here.
+                    socialResponses.TryPush(SocialRawResponse{social->socialRequestToken, std::move(*answer)});
+                }
+                else if (std::optional<ChatResponse> response = ParseResponsePayload(*answer, config.token))
+                {
                     responses.TryPush(std::move(*response));
+                }
 
                 break;
             }
@@ -1324,6 +1475,7 @@ void ClaudeChat::ClaudeBridge::Stop()
 
     _impl->requests.Stop();
     _impl->responses.Stop();
+    _impl->socialResponses.Stop();
     _impl->AbortSocket();
 
     if (_impl->worker.joinable())
@@ -1338,7 +1490,19 @@ bool ClaudeChat::ClaudeBridge::TryEnqueue(ChatRequest request)
     if (SteadyNowMs() > request.expiresAtSteadyMs)
         return false;
 
-    return _impl->requests.TryPush(std::move(request));
+    int64 const expiresAtSteadyMs = request.expiresAtSteadyMs;
+    return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
+}
+
+bool ClaudeChat::ClaudeBridge::TryEnqueueSocial(SocialRequest request, int64 expiresAtSteadyMs)
+{
+    if (_impl->stopped.load())
+        return false;
+
+    if (SteadyNowMs() > expiresAtSteadyMs)
+        return false;
+
+    return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
 std::vector<ClaudeChat::ChatResponse> ClaudeChat::ClaudeBridge::DrainResponses()
@@ -1346,6 +1510,16 @@ std::vector<ClaudeChat::ChatResponse> ClaudeChat::ClaudeBridge::DrainResponses()
     std::vector<ChatResponse> drained;
     ChatResponse response;
     while (_impl->responses.TryPop(response))
+        drained.push_back(std::move(response));
+
+    return drained;
+}
+
+std::vector<ClaudeChat::SocialRawResponse> ClaudeChat::ClaudeBridge::DrainSocialResponses()
+{
+    std::vector<SocialRawResponse> drained;
+    SocialRawResponse response;
+    while (_impl->socialResponses.TryPop(response))
         drained.push_back(std::move(response));
 
     return drained;

@@ -19,6 +19,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 
+#include "Bot/Social/PlayerbotSocialMgr.h"
 #include "Bot/Social/PlayerbotSocialRoute.h"
 #include "ExternalEventHelper.h"
 #include "PlayerbotAI.h"
@@ -124,7 +125,14 @@ namespace
     // All state lives on the world thread; every method below must only be called from
     // world-thread hooks. The bridge worker is the only other thread and it touches only
     // the bounded queues inside ClaudeBridge.
-    class ClaudeChatState : public PlayerbotCareerPlanProvider
+    /*
+     * Both provider seams on one object, because they share the one bridge and the one lifetime.
+     *
+     * The career provider and the social provider are unrelated contracts, but a second object would
+     * need its own reference to the bridge and its own answer to "has startup run yet", and those two
+     * answers drifting apart is how a provider stays registered against a stopped bridge.
+     */
+    class ClaudeChatState : public PlayerbotCareerPlanProvider, public PlayerbotSocialProvider
     {
     public:
         static ClaudeChatState& Instance()
@@ -171,6 +179,8 @@ namespace
                 static_cast<uint32>(std::max(1, sConfigMgr->GetOption<int32>("PlayerbotClaude.QueueSize", 16)));
             config.socketTimeoutMs = _responseDeadlineMs;
 
+            std::string const bridgeToken = config.token;
+
             _bridge = std::make_unique<ClaudeBridge>(std::move(config));
             _bridge->Start();
             if (!PlayerbotCareer::RegisterProvider(this))
@@ -181,18 +191,117 @@ namespace
                 return;
             }
             LOG_INFO("playerbot.claude", "mod-playerbot-claude: bridge worker started on 127.0.0.1:{}", port);
+
+            /*
+             * The social provider registers only while the worldserver's social feature is on.
+             *
+             * Registering regardless would be harmless in itself, since nothing would call it, but it
+             * would make "is this module the social provider" a different question from "is social
+             * running", and the two answers are read by different people at different times.
+             *
+             * The gate is read once here rather than per request: SetSocialProvider is the
+             * worldserver's own registration seam, and a provider that appeared and vanished as an
+             * operator toggled a config would leave outstanding requests pointing at nothing. Turning
+             * the feature on or off takes effect at the next startup, which is what the coordinator's
+             * own "absence is a supported state" contract already assumes.
+             */
+            if (PlayerbotSocialConfiguredGate().enabled)
+            {
+                _socialTransport.emplace(*_bridge, bridgeToken, _responseDeadlineMs);
+                sPlayerbotSocialMgr.SetSocialProvider(this);
+                LOG_INFO("playerbot.claude", "mod-playerbot-claude: registered as the social provider");
+            }
         }
 
         void Shutdown()
         {
             PlayerbotCareer::UnregisterProvider(this);
+
+            /*
+             * Deregistered BEFORE the bridge stops. The coordinator abandons by token rather than
+             * expecting a cancellation to be honoured, so the only ordering that matters is that it
+             * cannot submit into a bridge that is on its way down.
+             */
+            if (_socialTransport)
+                sPlayerbotSocialMgr.SetSocialProvider(nullptr);
+
+            /*
+             * The transport goes before the bridge, not after. It holds a reference to the bridge, so
+             * destroying the bridge first would leave that reference dangling even for the moment it
+             * takes to drop the exchanges. Every outstanding exchange names a request the coordinator
+             * is dropping too, so nothing is lost by forgetting them here.
+             */
+            _socialTransport.reset();
+
             if (_bridge)
                 _bridge->Stop();
             _bridge.reset();
+
             _pending.clear();
             _careerPending.clear();
             _careerResponses.clear();
             _ambientCadence.reset();
+        }
+
+        /*
+         * The social provider seam. Called on the world thread by the coordinator.
+         *
+         * Everything here that needs the game happens here, and nothing that decides anything does:
+         * this resolves two characters into value actors and hands them to the transport, which owns
+         * the exchange and every rule about what an answer means. False is ProviderFailed, which the
+         * coordinator turns into silence.
+         */
+        bool Submit(uint64 requestToken, uint64 botGuidCounter, PlayerbotSocialChannel channel,
+                    std::string const& threadPublicId) override
+        {
+            if (!_socialTransport || !_bridge)
+                return false;
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(botGuidCounter));
+            if (!bot || !bot->IsInWorld())
+                return false;
+
+            /*
+             * The coordinator's own record is the only authority on who this line is for. Re-deriving
+             * the target from the thread would be a second answer to a question that already has one,
+             * and the two would disagree the moment a thread moved on.
+             */
+            PlayerbotSocialPendingDelivery pending;
+            if (!sPlayerbotSocialMgr.PendingDeliveryFor(requestToken, pending))
+                return false;
+
+            SocialRequest request;
+            request.socialRequestToken = requestToken;
+            request.bot.guidCounter = botGuidCounter;
+            request.bot.name = bot->GetName();
+            request.bot.human = false;
+            request.speakOnChannel = static_cast<uint8>(channel);
+            request.threadPublicId = threadPublicId;
+
+            /*
+             * The subject is left fully absent when it cannot be resolved, never half described. A
+             * guid with no name, or a name for somebody who logged out, would travel as a participant
+             * the prompt builder would then describe as present.
+             */
+            if (pending.targetGuidCounter)
+            {
+                Player* target =
+                    ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(pending.targetGuidCounter));
+                if (target && target->IsInWorld())
+                {
+                    request.subject.guidCounter = pending.targetGuidCounter;
+                    request.subject.name = target->GetName();
+                    request.subject.human = !GET_PLAYERBOT_AI(target);
+                }
+            }
+
+            /*
+             * SHORTCUT: the context is empty, so the sidecar generates from the persona and the
+             * thread identity alone. Task 10 owns the typed prompt and is what fills it with the
+             * effective persona, the relationship, the bounded thread, and privacy filtered memory.
+             * Upgrade trigger: Task 10's prompt assembly landing.
+             */
+            return _socialTransport->Submit(request);
         }
 
         bool TrySubmit(PlayerbotCareerPlanRequest const& careerRequest) override
@@ -367,6 +476,8 @@ namespace
         {
             if (!_bridge)
                 return;
+
+            DrainSocial();
 
             for (ChatResponse const& response : _bridge->DrainResponses())
             {
@@ -617,6 +728,49 @@ namespace
             Enqueue(std::move(request), bot, speaker, channel);
         }
 
+        /*
+         * Hands each generated line to the coordinator, which decides whether it may be spoken.
+         *
+         * Nothing is delivered here. The coordinator validates the shape, schedules the natural
+         * delay, revalidates the world immediately before the send, and can still refuse: this
+         * module never speaks, which is Definition of Done 5.
+         */
+        void DrainSocial()
+        {
+            if (!_socialTransport)
+                return;
+
+            /*
+             * Unix milliseconds, which is what the coordinator's delivery clock is denominated in.
+             * GetGameTimeMS is milliseconds since server START, and mixing the two would schedule a
+             * delivery decades in the past on a freshly restarted realm.
+             */
+            uint64 const nowMs = static_cast<uint64>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(GameTime::GetSystemTime().time_since_epoch())
+                    .count());
+
+            for (ClaudeSocialTransport::Completed const& completed : _socialTransport->Drain())
+            {
+                if (completed.outcome != SocialExchangeOutcome::Deliver)
+                {
+                    /*
+                     * A regeneration is already back on the wire and an abandonment is final. Neither
+                     * is reported to the coordinator, which has no entry point for "this one will not
+                     * be answered" and expires the request by its own timeout instead. Task 11 records
+                     * the named suppression reason.
+                     */
+                    continue;
+                }
+
+                PlayerbotSocialDeliveryRejection const rejection = sPlayerbotSocialMgr.AcceptSocialResult(
+                    completed.result, nowMs, urand(0, 100000));
+
+                if (rejection != PlayerbotSocialDeliveryRejection::None)
+                    LOG_DEBUG("playerbot.claude", "mod-playerbot-claude: social result for request {} refused ({})",
+                              completed.socialRequestToken, PlayerbotSocialDeliveryRejectionName(rejection));
+            }
+        }
+
         void Enqueue(ChatRequest request, Player* bot, Player* speaker, ChatChannel channel)
         {
             PendingDelivery delivery;
@@ -632,6 +786,11 @@ namespace
         }
 
         std::unique_ptr<ClaudeBridge> _bridge;
+
+        // Present only while this module is the registered social provider. Holds a reference to the
+        // bridge, so it is destroyed before the bridge is and never outlives it.
+        std::optional<ClaudeSocialTransport> _socialTransport;
+
         std::unordered_map<uint64, PendingDelivery> _pending;
         std::unordered_map<uint64, PendingCareerDelivery> _careerPending;
         std::unordered_map<uint64, PlayerbotCareerPlanResponse> _careerResponses;
