@@ -631,16 +631,13 @@ async def test_two_ambient_attempts_for_the_last_slot_yield_exactly_one(clean_le
 
 
 async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> None:
-    """The primitive, proven deterministically rather than by hoping two tasks overlap.
+    """MySQL itself reports the block, rather than the test inferring it from a timeout.
 
-    Every barrier in this file synchronizes BEFORE a transaction begins, which does not
-    guarantee the two transactions are ever inside the lock at the same time: a
-    sequential schedule satisfies the barrier and passes. That mistake has now been made
-    twice, so this test does not rely on scheduling at all.
-
-    One connection takes the lock and holds it open. A second tries to take the same key
-    and must NOT complete while the first holds it. Releasing the first lets the second
-    through, which is what mutual exclusion means.
+    An earlier version asserted the contender had not finished within a second, which a
+    slow or unscheduled task satisfies just as well as a blocked one. Setting a short
+    innodb_lock_wait_timeout on the contender turns "it was blocked" into a positive
+    error the database raises: with a working lock the contender times out waiting, and
+    with a broken one it simply succeeds and the test fails.
     """
     _, holder = clean_ledger
     contender = await _connect()
@@ -650,22 +647,24 @@ async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> Non
         async with holder.cursor() as cursor:
             await ledger.acquire_named_lock(cursor, "test-key")
 
-        async def take_it():
-            await contender.begin()
+        async with contender.cursor() as cursor:
+            await cursor.execute("SET SESSION innodb_lock_wait_timeout = 1")
+
+        await contender.begin()
+        with pytest.raises(aiomysql.OperationalError) as caught:
             async with contender.cursor() as cursor:
                 await ledger.acquire_named_lock(cursor, "test-key")
-            await contender.commit()
 
-        blocked = asyncio.create_task(take_it())
+        # 1205 is ER_LOCK_WAIT_TIMEOUT. The database is asserting the contention.
+        assert caught.value.args[0] == 1205
+        await contender.rollback()
 
-        # It must still be waiting while the first transaction holds the key.
-        done, _ = await asyncio.wait({blocked}, timeout=1.0)
-        assert not done, "second holder acquired the lock while the first still held it"
-
+        # And once the holder releases, the same acquisition goes through.
         await holder.commit()
-
-        # And it must go through once the holder releases.
-        await asyncio.wait_for(blocked, timeout=10.0)
+        await contender.begin()
+        async with contender.cursor() as cursor:
+            await ledger.acquire_named_lock(cursor, "test-key")
+        await contender.commit()
     finally:
         contender.close()
 

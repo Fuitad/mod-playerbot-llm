@@ -198,6 +198,27 @@ class BudgetLedger:
         async with connection.cursor() as cursor:
             for statement in SCHEMA_STATEMENTS:
                 await cursor.execute(statement)
+
+            # One time cleanup of the key shapes this module used before the set was
+            # bounded: `budget_day:<date>` and `conversation:<bot_guid>`. Deleting a lock
+            # row is normally forbidden, because removing one while a transaction may
+            # still take that key reintroduces the missing row race. These are safe
+            # precisely because no code path produces them any more: they are retired,
+            # not merely unused right now. Without this an upgraded database keeps an
+            # already unbounded table forever.
+            # No parameters here, so the % in the LIKE pattern is a literal rather than
+            # a placeholder pymysql would try to interpolate.
+            await cursor.execute("DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'budget_day:%'")
+            # A conversation key with a bucket at or above the bound cannot have come
+            # from the current code, so it is retired. One BELOW the bound is
+            # indistinguishable from a live bucket key and is left alone: it is a valid
+            # key now regardless of what produced it. The %% is escaped because this
+            # statement does take a parameter.
+            await cursor.execute(
+                "DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'conversation:%%' "
+                "AND CAST(SUBSTRING(lock_key, 14) AS UNSIGNED) >= %s",
+                (CONVERSATION_LOCK_BUCKETS,),
+            )
         await connection.commit()
 
     async def _lock_day(self, cursor, day: date) -> tuple[int, bool]:
