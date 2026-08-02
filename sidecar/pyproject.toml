@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Loopback Claude sidecar for the mod-playerbot-claude AzerothCore module"
 requires-python = ">=3.12"
 dependencies = [
-    "aiomysql>=0.3.2",
+    "aiomysql[rsa]>=0.3.2",
     "anthropic==0.120.2",
     "pydantic>=2.7,<3",
 ]
@@ -30,6 +30,12 @@ packages = ["src/playerbot_claude"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "mysql: needs a disposable MySQL instance; run scripts/run_ledger_mysql_tests.sh",
+]
+# The mysql tests skip themselves without a DSN, but excluding them by default keeps a
+# bare `pytest` honest about what it actually verified.
+addopts = "-m 'not mysql'"
 
 [tool.ruff]
 line-length = 110
