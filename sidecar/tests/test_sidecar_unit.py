@@ -1448,3 +1448,25 @@ def test_a_deliverable_social_line_is_still_held_to_the_response_rules() -> None
         protocol.encode_social_response(
             77, 500, 2, "a" * (protocol.MAX_RESPONSE_MESSAGE_BYTES + 1), TEST_TOKEN
         )
+
+
+def test_social_request_bounds_names_and_thread_id_in_bytes() -> None:
+    """StringConstraints counts characters; every bound here is a byte budget.
+
+    A multibyte name or thread id passes the character check and still overflows the frame,
+    which is the same trap the context bound was already written to avoid.
+    """
+    long_name = "é" * (protocol.MAX_ACTOR_NAME_BYTES // 2 + 1)
+    assert len(long_name) <= protocol.MAX_ACTOR_NAME_BYTES
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(bot_name=long_name), TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(subject_name=long_name), TEST_TOKEN)
+
+    long_thread = "é" * (protocol.MAX_THREAD_ID_BYTES // 2 + 1)
+    assert len(long_thread) <= protocol.MAX_THREAD_ID_BYTES
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(thread_id=long_thread), TEST_TOKEN)

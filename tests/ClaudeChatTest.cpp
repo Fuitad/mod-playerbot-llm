@@ -1156,3 +1156,16 @@ TEST(ClaudeChatSocialProtocolTest, TheExchangeOutcomeEnumFailsClosed)
     EXPECT_TRUE(ClaudeChat::SocialExchangeOutcomeIsValid(ClaudeChat::SocialExchangeOutcome::Abandon));
     EXPECT_FALSE(ClaudeChat::SocialExchangeOutcomeIsValid(static_cast<ClaudeChat::SocialExchangeOutcome>(88)));
 }
+
+TEST(ClaudeChatSocialProtocolTest, ALegacyResponseInFlightIsDroppedIfTheGateTakesOverMeanwhile)
+{
+    /*
+     * The gate is rechecked at DELIVERY, not only at capture. A request enqueued while the social
+     * feature was off can come back after it turned on, and delivering it then sends chat the
+     * coordinator now owns, chosen by a rule that no longer applies.
+     *
+     * The predicate is what the delivery path consults, so this pins the rule the path depends on.
+     */
+    EXPECT_FALSE(ClaudeChat::LegacyConversationalHookAllowed(true));
+    EXPECT_TRUE(ClaudeChat::LegacyConversationalHookAllowed(false));
+}

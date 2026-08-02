@@ -418,6 +418,21 @@ namespace
                     continue;
                 }
 
+                /*
+                 * Rechecked here, not only at capture. A request enqueued while the gate was off can
+                 * come back after it turned on, and delivering it then would send chat the
+                 * coordinator now owns, chosen by the rule that no longer applies. The gate is read
+                 * per delivery for the same reason the ambient limiter reads it per tick.
+                 */
+                if (!LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
+                {
+                    LOG_INFO("playerbot.claude",
+                             "mod-playerbot-claude: dropped legacy response for request {} "
+                             "(AiPlayerbot.SocialChat.Enable took ownership while it was in flight)",
+                             response.requestId);
+                    continue;
+                }
+
                 if (delivery.channel == ChatChannel::World)
                 {
                     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);

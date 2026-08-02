@@ -227,11 +227,28 @@ class SocialRequest(BaseModel):
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
     context: str
 
+    @field_validator("bot_name", "subject_name")
+    @classmethod
+    def _validate_actor_name(cls, value: str) -> str:
+        # StringConstraints(max_length=...) counts CHARACTERS. Every bound here is a byte budget,
+        # so a multibyte name passes the character check and still overflows the frame. The
+        # declared max_length stays as a cheap first cut; this is the one that actually holds.
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"actor name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("thread_id")
+    @classmethod
+    def _validate_thread_id(cls, value: str) -> str:
+        if _byte_length(value) > MAX_THREAD_ID_BYTES:
+            raise ValueError(f"thread_id must be at most {MAX_THREAD_ID_BYTES} UTF-8 bytes")
+
+        return value
+
     @field_validator("context")
     @classmethod
     def _validate_context(cls, value: str) -> str:
-        # Bounded in BYTES rather than characters, because the frame budget is bytes and a
-        # multibyte context would otherwise pass a character check and overflow the frame.
         if _byte_length(value) > MAX_SOCIAL_CONTEXT_BYTES:
             raise ValueError(f"context must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
 

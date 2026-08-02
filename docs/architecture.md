@@ -25,7 +25,7 @@ All game state lives on the world thread. The bridge worker thread never touches
 ## Wire protocol (loopback TCP)
 
 - Frame: 4-byte network order length prefix, then a UTF-8 JSON payload. Payloads above 64 KiB are rejected.
-- Payloads use strict schema version 2 JSON. Chat payloads remain flat. Career payloads use a bounded nested candidate list because one request must carry the complete opaque legal set. Both sides reject unknown fields, duplicate keys, invalid types, raw game identifiers, oversized content, and trailing bytes.
+- Payloads use strict schema version 3 JSON. Chat payloads remain flat. Career payloads use a bounded nested candidate list because one request must carry the complete opaque legal set. Both sides reject unknown fields, duplicate keys, invalid types, raw game identifiers, oversized content, and trailing bytes.
 - Career uses channel `career` and event kind `5`. It never enters conversation history. A valid reply must preserve the request correlation and supported versions, select an offered opaque token, and choose a spending style no broader than that candidate permits.
 - Ambient uses channel `world` and event kind `4`. Its trusted combination requires speaker GUID `0`, an empty speaker name, subject ID `0`, and marker `ambient_world`. Direct requests reject the empty speaker identity.
 - Every payload carries the bridge token from `PLAYERBOT_CLAUDE_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
