@@ -682,6 +682,11 @@ ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::stri
 
 bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
 {
+    return SubmitAt(request, SteadyNowMs());
+}
+
+bool ClaudeChat::ClaudeSocialTransport::SubmitAt(SocialRequest const& request, int64 nowMs)
+{
     /*
      * Every refusal here is immediate and final, which is the point. The coordinator reads a false
      * as ProviderFailed and produces silence now, rather than holding the bot's slot until its own
@@ -704,7 +709,7 @@ bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
     if (_exchanges.size() >= MAX_OUTSTANDING_SOCIAL_REQUESTS)
         return false;
 
-    int64 const expiresAtSteadyMs = SteadyNowMs() + _requestDeadlineMs;
+    int64 const expiresAtSteadyMs = nowMs + _requestDeadlineMs;
     if (!_bridge.TryEnqueueSocial(request, expiresAtSteadyMs))
         return false;
 

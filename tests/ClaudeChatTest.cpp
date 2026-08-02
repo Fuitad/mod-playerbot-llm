@@ -1353,6 +1353,20 @@ namespace
         return config;
     }
 
+    /*
+     * The deadline the deterministic timing tests run at, which is the largest one the transport
+     * will accept.
+     *
+     * Those tests hand every instant in, so the deadline costs no wall clock at all and only sets
+     * the scale of their synthetic margins. It is the maximum on purpose. One real clock read
+     * remains on the path they exercise: `TryEnqueueSocial` refuses a request that has ALREADY
+     * expired, a fail fast that reads the steady clock itself and so cannot be handed a synthetic
+     * one without pushing this seam down into the bridge. At this scale that check has tens of
+     * seconds of slack, so triggering it would take a scheduler pause far longer than the timeouts
+     * every other test in this file already depends on.
+     */
+    int64 constexpr DETERMINISTIC_DEADLINE_MS = static_cast<int64>(PLAYERBOT_SOCIAL_PROVIDER_TIMEOUT_SECONDS) * 1000;
+
     // Collects one drain's worth of transport outcomes, polling until something arrives.
     std::vector<ClaudeChat::ClaudeSocialTransport::Completed> DrainWithin(
         ClaudeChat::ClaudeSocialTransport& transport, int64 timeoutMs)
@@ -1686,15 +1700,15 @@ TEST(ClaudeChatSocialTransportTest, AnAnswerThatBeatItsDeadlineIsKeptEvenWhenThe
     ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
 
     int64 const submittedAtMs = ClaudeChat::SteadyNowMs();
-    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 1000);
-    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, DETERMINISTIC_DEADLINE_MS);
+    ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
 
-    // Arrived 900 ms inside the deadline; resolved 4 seconds after it had passed.
+    // Arrived 20 seconds inside the deadline; resolved a minute after it had passed.
     std::vector<ClaudeChat::SocialRawResponse> const answered{
-        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 100}};
+        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 10000}};
 
     std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const resolved =
-        transport.Resolve(answered, submittedAtMs + 5000);
+        transport.Resolve(answered, submittedAtMs + 90000);
 
     ASSERT_EQ(resolved.size(), 1u);
     EXPECT_EQ(resolved[0].socialRequestToken, 77u);
@@ -1714,15 +1728,15 @@ TEST(ClaudeChatSocialTransportTest, AnAnswerThatMissedItsDeadlineIsAbandonedEven
     ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
 
     int64 const submittedAtMs = ClaudeChat::SteadyNowMs();
-    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 1000);
-    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, DETERMINISTIC_DEADLINE_MS);
+    ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
 
-    // Arrived 500 ms past the deadline, and resolved immediately afterwards.
+    // Arrived 30 seconds past the deadline, and resolved immediately afterwards.
     std::vector<ClaudeChat::SocialRawResponse> const answered{
-        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 1500}};
+        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 60000}};
 
     std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const resolved =
-        transport.Resolve(answered, submittedAtMs + 1501);
+        transport.Resolve(answered, submittedAtMs + 60001);
 
     ASSERT_EQ(resolved.size(), 1u);
     EXPECT_EQ(resolved[0].socialRequestToken, 77u);
@@ -1740,40 +1754,36 @@ TEST(ClaudeChatSocialTransportTest, ARetryIsGivenAFullDeadlineRatherThanTheOrigi
      * The second answer lands in the only window where the two behaviours differ: after the original
      * deadline, and inside the extended one.
      *
-     *   deadline 1000 ms, so the original expires at +1000
-     *   the regeneration is resolved at +200, so the extension runs to +1200
-     *   the retry's answer arrives at +1100: past the original, inside the extension
+     *   deadline 30000 ms, so the original expires at +30000
+     *   the regeneration is resolved at +20000, so the extension runs to +50000
+     *   the retry's answer arrives at +40000: past the original, inside the extension
      */
-    std::atomic<uint32_t> asks{0};
-    FakeSidecarServer server([&](std::string const&) -> std::optional<std::string> {
-        ++asks;
-        return std::nullopt;
-    });
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
 
     ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
     bridge.Start();
 
     int64 const submittedAtMs = ClaudeChat::SteadyNowMs();
-    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 1000);
-    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, DETERMINISTIC_DEADLINE_MS);
+    ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
 
     std::vector<ClaudeChat::SocialRawResponse> const regenerated{
-        ClaudeChat::SocialRawResponse{77, SocialPayload("social", 77, 500, "", 1), submittedAtMs + 100}};
+        ClaudeChat::SocialRawResponse{77, SocialPayload("social", 77, 500, "", 1), submittedAtMs + 10000}};
 
     std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const first =
-        transport.Resolve(regenerated, submittedAtMs + 200);
+        transport.Resolve(regenerated, submittedAtMs + 20000);
 
     ASSERT_EQ(first.size(), 1u);
     ASSERT_EQ(first[0].outcome, ClaudeChat::SocialExchangeOutcome::Regenerate);
     ASSERT_EQ(transport.OutstandingCount(), 1u);
 
     std::vector<ClaudeChat::SocialRawResponse> const answered{
-        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 1100}};
+        ClaudeChat::SocialRawResponse{77, SocialPayload(), submittedAtMs + 40000}};
 
     // Without the extension this is an Abandon: the arrival is past the original deadline, and the
     // sweep would have dropped the exchange at that deadline in any case.
     std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const second =
-        transport.Resolve(answered, submittedAtMs + 1150);
+        transport.Resolve(answered, submittedAtMs + 45000);
     bridge.Stop();
 
     ASSERT_EQ(second.size(), 1u);

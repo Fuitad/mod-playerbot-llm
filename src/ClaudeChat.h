@@ -632,6 +632,14 @@ namespace ClaudeChat
         bool Submit(SocialRequest const& request);
 
         /*
+         * `Submit` with the instant handed in, the same split as `Drain` and `Resolve`. The
+         * exchange's deadline is then exactly `nowMs + deadline` rather than that plus however long
+         * the caller took to reach this line, which is what lets a test state a margin instead of
+         * assuming one.
+         */
+        bool SubmitAt(SocialRequest const& request, int64 nowMs);
+
+        /*
          * One drained answer, already classified.
          *
          * `result` is only meaningful for Deliver. Regenerate means the transport has already asked
