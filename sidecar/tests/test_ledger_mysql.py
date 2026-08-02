@@ -34,6 +34,9 @@ CEILING = budget.usd_to_nano("10.00")
 QUARTER = Decimal("0.25")
 NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 
+# More distinct bots than there are lock buckets, so the bound is actually exercised.
+CONVERSATION_LOCK_SAMPLE = 400
+
 
 def _dsn_parts() -> dict[str, object]:
     settings = _settings()
@@ -526,7 +529,7 @@ async def test_an_out_of_range_ambient_rate_consumes_nothing(store) -> None:
 # Contention on the paths the earlier tests did not reach ---------------------------
 
 
-async def test_the_very_first_reservation_of_a_day_is_not_a_race(clean_ledger) -> None:
+async def test_the_very_first_reservation_of_a_day_succeeds_with_no_row_present(clean_ledger) -> None:
     """The path the other concurrency test skips by pre-creating the day row.
 
     Two transactions both taking a locking READ on a MISSING row acquire compatible gap
@@ -564,7 +567,7 @@ async def test_the_very_first_reservation_of_a_day_is_not_a_race(clean_ledger) -
         second_connection.close()
 
 
-async def test_concurrent_appends_for_one_bot_do_not_deadlock(clean_ledger) -> None:
+async def test_repeated_appends_for_one_bot_from_two_connections_settle_correctly(clean_ledger) -> None:
     """Each append inserts and then scans and deletes the same id range.
 
     Without per bot serialization two writers interleave those scans and deadlock. The
@@ -596,7 +599,7 @@ async def test_concurrent_appends_for_one_bot_do_not_deadlock(clean_ledger) -> N
         second_connection.close()
 
 
-async def test_concurrent_ambient_attempts_cannot_both_take_the_last_slot(clean_ledger) -> None:
+async def test_two_ambient_attempts_for_the_last_slot_yield_exactly_one(clean_ledger) -> None:
     """A bare COUNT(*) FOR UPDATE either deadlocks or lets both callers read the same count.
 
     With one slot left, exactly one of two simultaneous callers may have it.
@@ -625,3 +628,103 @@ async def test_concurrent_ambient_attempts_cannot_both_take_the_last_slot(clean_
         assert sorted(results) == [False, True]
     finally:
         second_connection.close()
+
+
+async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> None:
+    """The primitive, proven deterministically rather than by hoping two tasks overlap.
+
+    Every barrier in this file synchronizes BEFORE a transaction begins, which does not
+    guarantee the two transactions are ever inside the lock at the same time: a
+    sequential schedule satisfies the barrier and passes. That mistake has now been made
+    twice, so this test does not rely on scheduling at all.
+
+    One connection takes the lock and holds it open. A second tries to take the same key
+    and must NOT complete while the first holds it. Releasing the first lets the second
+    through, which is what mutual exclusion means.
+    """
+    _, holder = clean_ledger
+    contender = await _connect()
+
+    try:
+        await holder.begin()
+        async with holder.cursor() as cursor:
+            await ledger.acquire_named_lock(cursor, "test-key")
+
+        async def take_it():
+            await contender.begin()
+            async with contender.cursor() as cursor:
+                await ledger.acquire_named_lock(cursor, "test-key")
+            await contender.commit()
+
+        blocked = asyncio.create_task(take_it())
+
+        # It must still be waiting while the first transaction holds the key.
+        done, _ = await asyncio.wait({blocked}, timeout=1.0)
+        assert not done, "second holder acquired the lock while the first still held it"
+
+        await holder.commit()
+
+        # And it must go through once the holder releases.
+        await asyncio.wait_for(blocked, timeout=10.0)
+    finally:
+        contender.close()
+
+
+async def test_a_different_key_is_not_blocked_by_a_held_one(clean_ledger) -> None:
+    """Otherwise the bucketing below would be a global lock wearing a per bot name."""
+    _, holder = clean_ledger
+    other = await _connect()
+
+    try:
+        await holder.begin()
+        async with holder.cursor() as cursor:
+            await ledger.acquire_named_lock(cursor, "key-a")
+
+        async def take_other():
+            await other.begin()
+            async with other.cursor() as cursor:
+                await ledger.acquire_named_lock(cursor, "key-b")
+            await other.commit()
+
+        await asyncio.wait_for(take_other(), timeout=10.0)
+        await holder.commit()
+    finally:
+        other.close()
+
+
+async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
+    """A per day or per bot key adds a permanent row forever.
+
+    Deleting them instead is worse: removing a lock row while another transaction may
+    still take that key reintroduces the missing-row race the helper exists to avoid.
+    """
+    book, connection = clean_ledger
+    store = ledger.SidecarStore()
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("DELETE FROM playerbot_claude_lock")
+        await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+    await connection.commit()
+
+    # Many bots and several days must not produce many keys.
+    for bot_guid in range(0, CONVERSATION_LOCK_SAMPLE):
+        await store.append_turn(connection, bot_guid=bot_guid, role="user", content="x", now=NOW)
+
+    for offset in range(5):
+        await book.reserve(
+            connection,
+            request_id=1000 + offset,
+            attempt=1,
+            max_cost_nano=1,
+            priority=RequestPriority.IMMEDIATE_HUMAN,
+            now=NOW + timedelta(days=offset),
+        )
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_lock")
+        row = await cursor.fetchone()
+
+    # One budget key plus at most one per conversation bucket, regardless of bot count
+    # or how many days were touched.
+    assert int(row[0]) <= 1 + ledger.CONVERSATION_LOCK_BUCKETS
+    assert int(row[0]) < CONVERSATION_LOCK_SAMPLE

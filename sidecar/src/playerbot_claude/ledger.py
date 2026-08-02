@@ -35,6 +35,10 @@ RESERVATION_EXPIRY = timedelta(minutes=10)
 # exists to prevent.
 CONVERSATION_TURN_LIMIT = 12
 
+# How many named locks the per bot conversation trim spreads across. Bounded so the lock
+# table cannot grow with the bot roster; wide enough that unrelated bots rarely collide.
+CONVERSATION_LOCK_BUCKETS = 256
+
 AMBIENT_WINDOW = timedelta(hours=1)
 MAX_AMBIENT_MESSAGES_PER_HOUR = 6
 
@@ -44,7 +48,7 @@ SCHEMA_STATEMENTS = (
         `lock_key` VARCHAR(64) NOT NULL,
         PRIMARY KEY (`lock_key`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-      COMMENT='Named serialization points. A row here is taken before any work it guards.'
+      COMMENT='Named serialization points, from a bounded key set. Never deleted.'
     """,
     """
     CREATE TABLE IF NOT EXISTS playerbot_claude_profile (
@@ -146,6 +150,16 @@ async def acquire_named_lock(cursor, key: str) -> None:
 
     ``lock_key = lock_key`` is a deliberate no-op update: it makes the statement a write
     on an existing row without changing anything, which is what takes the lock.
+
+    Keys come from a BOUNDED set, and rows here are never deleted. A per-day or per-bot
+    key would add a permanent row for every day and every bot the server ever sees, which
+    is a table that only grows. Deleting them instead is worse: removing a lock row while
+    another transaction may still take that key reintroduces the missing-row race the
+    helper exists to avoid. Bounded keys make the question moot.
+
+    Nothing currently takes two named locks in one transaction. If something ever does,
+    it needs a canonical acquisition order first, or two callers taking the same pair in
+    opposite orders will deadlock.
     """
 
     await cursor.execute(
@@ -205,7 +219,10 @@ class BudgetLedger:
         serialization point in this module rather than each one improvising.
         """
 
-        await acquire_named_lock(cursor, f"budget_day:{day.isoformat()}")
+        # One key for the budget, not one per day. Only one day is ever being written
+        # at a time in practice, so a per-day key bought no concurrency and grew the
+        # lock table by a row a day forever.
+        await acquire_named_lock(cursor, "budget_day")
 
         await cursor.execute(
             "INSERT INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0) "
@@ -501,7 +518,11 @@ class SidecarStore:
                 # Serialized per bot. Two concurrent appends for the same bot would each
                 # insert and then scan and delete the same id range, which deadlocks. The
                 # lock is per bot rather than global so unrelated bots never wait.
-                await acquire_named_lock(cursor, f"conversation:{bot_guid}")
+                # Bucketed rather than one key per bot, so the lock table is bounded by
+                # CONVERSATION_LOCK_BUCKETS rather than by how many bots the server has
+                # ever seen. Two bots sharing a bucket wait for each other, which costs a
+                # little contention and buys a table that cannot grow.
+                await acquire_named_lock(cursor, f"conversation:{bot_guid % CONVERSATION_LOCK_BUCKETS}")
                 await cursor.execute(
                     "INSERT INTO playerbot_claude_conversation_turn (bot_guid, role, content, created_at) "
                     "VALUES (%s, %s, %s, %s)",
