@@ -458,6 +458,13 @@ async def test_an_unsupported_role_is_refused_rather_than_stored(store) -> None:
     with pytest.raises(ledger.LedgerError):
         await book.append_turn(connection, bot_guid=7, role="system", content="x", now=NOW)
 
+    # The name says "rather than stored", so the test has to check that rather than
+    # settling for the exception having been raised.
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_conversation_turn WHERE bot_guid = 7")
+        row = await cursor.fetchone()
+    assert int(row[0]) == 0
+
 
 async def test_a_career_decision_round_trips_and_is_one_per_bot(store) -> None:
     book, connection = store
@@ -514,3 +521,107 @@ async def test_an_out_of_range_ambient_rate_consumes_nothing(store) -> None:
         await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_ambient_attempt")
         row = await cursor.fetchone()
     assert int(row[0]) == 0
+
+
+# Contention on the paths the earlier tests did not reach ---------------------------
+
+
+async def test_the_very_first_reservation_of_a_day_is_not_a_race(clean_ledger) -> None:
+    """The path the other concurrency test skips by pre-creating the day row.
+
+    Two transactions both taking a locking READ on a MISSING row acquire compatible gap
+    locks and then both insert into the gap they are each holding, which deadlocks. That
+    is the mirror of the insert-then-lock deadlock, and it only appears when nothing
+    exists yet.
+    """
+    book, first_connection = clean_ledger
+    second_connection = await _connect()
+
+    try:
+        barrier = asyncio.Barrier(2)
+        one = budget.usd_to_nano("1.00")
+
+        async def reserve(connection, request_id):
+            await barrier.wait()
+            return await book.reserve(
+                connection,
+                request_id=request_id,
+                attempt=1,
+                max_cost_nano=one,
+                priority=RequestPriority.IMMEDIATE_HUMAN,
+                now=NOW,
+            )
+
+        # Nothing is pre-created: the day row does not exist when both start.
+        first, second = await asyncio.gather(reserve(first_connection, 1), reserve(second_connection, 2))
+
+        assert first[0] is AdmissionDecision.ADMITTED
+        assert second[0] is AdmissionDecision.ADMITTED
+
+        state = await book.snapshot(first_connection, now=NOW)
+        assert state.outstanding_nano == one * 2
+    finally:
+        second_connection.close()
+
+
+async def test_concurrent_appends_for_one_bot_do_not_deadlock(clean_ledger) -> None:
+    """Each append inserts and then scans and deletes the same id range.
+
+    Without per bot serialization two writers interleave those scans and deadlock. The
+    lock is per bot, so this also checks the trim still landed on the right rows.
+    """
+    _, first_connection = clean_ledger
+    second_connection = await _connect()
+    book = ledger.SidecarStore()
+
+    try:
+        async with first_connection.cursor() as cursor:
+            await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+        await first_connection.commit()
+
+        barrier = asyncio.Barrier(2)
+
+        async def append_many(connection, label):
+            await barrier.wait()
+            for index in range(ledger.CONVERSATION_TURN_LIMIT):
+                await book.append_turn(
+                    connection, bot_guid=7, role="user", content=f"{label}{index}", now=NOW
+                )
+
+        await asyncio.gather(append_many(first_connection, "a"), append_many(second_connection, "b"))
+
+        turns = await book.recent_turns(first_connection, bot_guid=7)
+        assert len(turns) == ledger.CONVERSATION_TURN_LIMIT
+    finally:
+        second_connection.close()
+
+
+async def test_concurrent_ambient_attempts_cannot_both_take_the_last_slot(clean_ledger) -> None:
+    """A bare COUNT(*) FOR UPDATE either deadlocks or lets both callers read the same count.
+
+    With one slot left, exactly one of two simultaneous callers may have it.
+    """
+    _, first_connection = clean_ledger
+    second_connection = await _connect()
+    book = ledger.SidecarStore()
+
+    try:
+        async with first_connection.cursor() as cursor:
+            await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
+        await first_connection.commit()
+
+        # Two of the three slots are already gone.
+        for _ in range(2):
+            assert await book.try_begin_ambient(first_connection, messages_per_hour=3, now=NOW) is True
+
+        barrier = asyncio.Barrier(2)
+
+        async def attempt(connection):
+            await barrier.wait()
+            return await book.try_begin_ambient(connection, messages_per_hour=3, now=NOW)
+
+        results = await asyncio.gather(attempt(first_connection), attempt(second_connection))
+
+        assert sorted(results) == [False, True]
+    finally:
+        second_connection.close()

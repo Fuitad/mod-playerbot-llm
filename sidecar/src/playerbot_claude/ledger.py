@@ -40,6 +40,13 @@ MAX_AMBIENT_MESSAGES_PER_HOUR = 6
 
 SCHEMA_STATEMENTS = (
     """
+    CREATE TABLE IF NOT EXISTS playerbot_claude_lock (
+        `lock_key` VARCHAR(64) NOT NULL,
+        PRIMARY KEY (`lock_key`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='Named serialization points. A row here is taken before any work it guards.'
+    """,
+    """
     CREATE TABLE IF NOT EXISTS playerbot_claude_profile (
         `bot_guid` BIGINT UNSIGNED NOT NULL,
         `profile_version` INT UNSIGNED NOT NULL,
@@ -128,6 +135,26 @@ class LedgerError(RuntimeError):
     """The ledger could not complete an operation it was asked to perform."""
 
 
+async def acquire_named_lock(cursor, key: str) -> None:
+    """Serializes every caller holding the same key, for the rest of the transaction.
+
+    One statement, and it always WRITES, which is the point. A read that locks
+    (``SELECT ... FOR UPDATE``) takes a gap lock when the row is missing, and two
+    transactions holding compatible gap locks that then both insert into that gap
+    deadlock. An upsert takes an exclusive row lock immediately instead, with no gap to
+    share and no shared lock to upgrade.
+
+    ``lock_key = lock_key`` is a deliberate no-op update: it makes the statement a write
+    on an existing row without changing anything, which is what takes the lock.
+    """
+
+    await cursor.execute(
+        "INSERT INTO playerbot_claude_lock (lock_key) VALUES (%s) "
+        "ON DUPLICATE KEY UPDATE lock_key = lock_key",
+        (key,),
+    )
+
+
 def utc_day(now: datetime) -> date:
     """The UTC calendar day a moment belongs to.
 
@@ -160,41 +187,39 @@ class BudgetLedger:
         await connection.commit()
 
     async def _lock_day(self, cursor, day: date) -> tuple[int, bool]:
-        """Takes the day row's write lock and returns its settled total and circuit state.
+        """Serializes on the day, then reads its settled total and circuit state.
 
-        The SELECT comes FIRST and the insert only runs when there is nothing to lock.
-        The obvious ordering, insert-then-lock, deadlocks under real contention:
-        ``INSERT IGNORE`` on an existing row takes a shared lock on the duplicate key,
-        and two transactions both holding that shared lock while both wait to upgrade it
-        to exclusive is the textbook deadlock. It passes every test that does not
-        actually contend, which is how it survived until the concurrency test grew a
-        barrier.
+        The lock is taken through :func:`acquire_named_lock` rather than on the budget
+        row itself. Two earlier attempts both had races that only appear when the row is
+        MISSING, which is the first request of any day:
 
-        On the first request of a day the select finds nothing, both callers insert, one
-        wins, and the re-select takes a clean exclusive lock on the row that exists.
+        - insert-then-``SELECT FOR UPDATE`` deadlocks on an EXISTING row, because
+          ``INSERT IGNORE`` takes a shared lock on the duplicate key that both
+          transactions then try to upgrade;
+        - ``SELECT FOR UPDATE``-then-insert deadlocks on a MISSING row, because both
+          transactions take compatible gap locks and then both try to insert into the
+          gap they are each holding.
+
+        An upsert that always writes takes an exclusive row lock in one statement, with
+        no gap and no upgrade, which is why the named lock below is used for every
+        serialization point in this module rather than each one improvising.
         """
 
+        await acquire_named_lock(cursor, f"budget_day:{day.isoformat()}")
+
         await cursor.execute(
-            "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day "
-            "WHERE usage_date = %s FOR UPDATE",
+            "INSERT INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0) "
+            "ON DUPLICATE KEY UPDATE usage_date = usage_date",
+            (day,),
+        )
+        await cursor.execute(
+            "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day WHERE usage_date = %s",
             (day,),
         )
         row = await cursor.fetchone()
 
-        if row is None:
-            await cursor.execute(
-                "INSERT IGNORE INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0)",
-                (day,),
-            )
-            await cursor.execute(
-                "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day "
-                "WHERE usage_date = %s FOR UPDATE",
-                (day,),
-            )
-            row = await cursor.fetchone()
-
-        if row is None:  # pragma: no cover - the insert above guarantees a row
-            raise LedgerError("budget day row vanished between insert and lock")
+        if row is None:  # pragma: no cover - the upsert above guarantees a row
+            raise LedgerError("budget day row vanished between upsert and read")
 
         return int(row[0]), bool(row[1])
 
@@ -470,19 +495,28 @@ class SidecarStore:
         if role not in ("user", "assistant"):
             raise LedgerError(f"unsupported conversation role: {role!r}")
 
-        async with connection.cursor() as cursor:
-            await cursor.execute(
-                "INSERT INTO playerbot_claude_conversation_turn (bot_guid, role, content, created_at) "
-                "VALUES (%s, %s, %s, %s)",
-                (bot_guid, role, content, now),
-            )
-            await cursor.execute(
-                "DELETE FROM playerbot_claude_conversation_turn WHERE bot_guid = %s AND id NOT IN "
-                "(SELECT id FROM (SELECT id FROM playerbot_claude_conversation_turn WHERE bot_guid = %s "
-                "ORDER BY id DESC LIMIT %s) AS keep)",
-                (bot_guid, bot_guid, CONVERSATION_TURN_LIMIT),
-            )
-        await connection.commit()
+        try:
+            await connection.begin()
+            async with connection.cursor() as cursor:
+                # Serialized per bot. Two concurrent appends for the same bot would each
+                # insert and then scan and delete the same id range, which deadlocks. The
+                # lock is per bot rather than global so unrelated bots never wait.
+                await acquire_named_lock(cursor, f"conversation:{bot_guid}")
+                await cursor.execute(
+                    "INSERT INTO playerbot_claude_conversation_turn (bot_guid, role, content, created_at) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (bot_guid, role, content, now),
+                )
+                await cursor.execute(
+                    "DELETE FROM playerbot_claude_conversation_turn WHERE bot_guid = %s AND id NOT IN "
+                    "(SELECT id FROM (SELECT id FROM playerbot_claude_conversation_turn "
+                    "WHERE bot_guid = %s ORDER BY id DESC LIMIT %s) AS keep)",
+                    (bot_guid, bot_guid, CONVERSATION_TURN_LIMIT),
+                )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
 
     async def recent_turns(self, connection, *, bot_guid: int) -> list[tuple[str, str]]:
         async with connection.cursor() as cursor:
@@ -550,12 +584,21 @@ class SidecarStore:
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
+                # One guard row rather than locking the whole attempts table. A bare
+                # COUNT(*) FOR UPDATE locks every row it scans, which blocks unrelated
+                # inserts and gets more expensive as the table grows, and under gap
+                # locking two callers can deadlock on it.
+                await acquire_named_lock(cursor, "ambient")
+
                 await cursor.execute(
                     "DELETE FROM playerbot_claude_ambient_attempt WHERE created_at <= %s",
                     (cutoff,),
                 )
+                # Predicated on the indexed column, so this reads an index range rather
+                # than the table.
                 await cursor.execute(
-                    "SELECT COUNT(*) FROM playerbot_claude_ambient_attempt FOR UPDATE",
+                    "SELECT COUNT(*) FROM playerbot_claude_ambient_attempt WHERE created_at > %s",
+                    (cutoff,),
                 )
                 row = await cursor.fetchone()
                 if row is not None and int(row[0]) >= messages_per_hour:
