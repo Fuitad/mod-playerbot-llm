@@ -465,9 +465,11 @@ class BudgetLedger:
                 added = min(storable, headroom)
                 saturated = added < storable
                 if saturated:
-                    # Reaching the column's ceiling is only possible through a report that
-                    # was already impossible, and a total that is no longer the sum of what
-                    # was charged is worth stopping on either way.
+                    # A total that is no longer the sum of what was charged is an
+                    # integrity failure whether or not the provider overran its
+                    # reservation, so it stops spending on its own account. The
+                    # configured ceiling is refused above MAX_STORABLE_NANO precisely so
+                    # honest traffic can never arrive here.
                     breach = True
 
                 await cursor.execute(
@@ -487,13 +489,22 @@ class BudgetLedger:
                     # that way. The column is VARCHAR(255); an over-long reason would
                     # fail the update, roll the transaction back, and leave the breaker
                     # shut for the exact case it exists to catch.
-                    reason = (
-                        f"reported cost {actual_cost_nano} exceeded reservation {reservation.max_cost_nano}"
-                    )
+                    # Named for what actually happened. Saturation and an overrun are
+                    # different incidents with different causes, and a reason that
+                    # reports an overrun when the cost was within its reservation sends
+                    # whoever reads it after the wrong thing.
+                    causes = []
+                    if budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano):
+                        causes.append(
+                            f"reported cost {actual_cost_nano} exceeded reservation "
+                            f"{reservation.max_cost_nano}"
+                        )
                     if saturated:
-                        # The stored total is no longer the sum of what was charged, so say
-                        # so where whoever reads the incident will see it.
-                        reason = f"{reason}; day total saturated at {budget.MAX_STORABLE_NANO}"
+                        causes.append(
+                            f"day total saturated at {budget.MAX_STORABLE_NANO} nano, "
+                            f"discarding {storable - added}"
+                        )
+                    reason = "; ".join(causes)
                     await cursor.execute(
                         "UPDATE playerbot_claude_budget_day SET circuit_open = 1, circuit_reason = %s "
                         "WHERE usage_date = %s",

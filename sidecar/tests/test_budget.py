@@ -58,6 +58,27 @@ def test_a_ceiling_of_zero_or_less_is_refused() -> None:
             budget.validate_daily_ceiling(bad)
 
 
+def test_a_ceiling_the_ledger_cannot_record_is_refused_rather_than_clamped() -> None:
+    """The one hard limit, and it is physical rather than policy.
+
+    The ledger stores money in BIGINT UNSIGNED. Under a ceiling above that, honest
+    traffic eventually saturates the day's settled total, and the settle path would have
+    to either overflow or claim a breach that never happened. Refusing is what keeps
+    "saturation implies a breach" true.
+
+    Refused rather than quietly clamped: silently substituting a different number is
+    exactly what removing the old hard-coded cap was meant to stop.
+    """
+    at_the_limit = budget.nano_to_usd_string(budget.MAX_STORABLE_NANO)
+    assert budget.validate_daily_ceiling(at_the_limit) == budget.MAX_STORABLE_NANO
+
+    with pytest.raises(BudgetConfigurationError, match="ledger can record"):
+        budget.validate_daily_ceiling(Decimal(budget.MAX_STORABLE_NANO + 1) / budget.NANO)
+
+    # And it constrains nothing anybody would configure: the limit is ~18.4 billion USD.
+    assert budget.validate_daily_ceiling("1000000") > 0
+
+
 def test_a_float_amount_goes_through_its_decimal_string_not_its_bits() -> None:
     """Decimal(1.1) is 1.10000000000000008881784197001252323389053344726562500.
 

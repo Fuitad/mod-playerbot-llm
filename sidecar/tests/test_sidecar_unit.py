@@ -740,6 +740,21 @@ def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
     assert config.budget_nano == budget.usd_to_nano("2.50")
 
 
+def test_an_unrecordable_ceiling_disables_generation_rather_than_being_clamped(tmp_path) -> None:
+    """An unenforceable budget fails closed and says nothing was configured.
+
+    budget_nano returns 0 for any ceiling it cannot validate, and every caller already
+    treats 0 as "no budget", so a ceiling the ledger cannot record silences the bots
+    instead of quietly becoming a different number.
+    """
+    huge = budget.nano_to_usd_string(budget.MAX_STORABLE_NANO + budget.NANO)
+    config = app.SidecarConfig.load(
+        write_conf(tmp_path, f"[worldserver]\nPlayerbotClaude.DailyBudgetUsd = {huge}\n")
+    )
+    assert config.budget_nano == 0
+    assert config.generation_allowed is False
+
+
 def test_config_defaults_fail_closed(tmp_path) -> None:
     config = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\n"))
     assert config.enable is False

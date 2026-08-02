@@ -78,7 +78,7 @@ The reserve-then-settle cycle, one MySQL transaction per step:
 
 Admission is refused, in this order, for an open circuit, unknown pricing, the total ceiling, and then the human reserve. The reserve denies background work only: `HumanBudgetReserveRatio` protects a share of the ceiling for whispers, party lines, and social replies, while ambient World chatter and career selection are background. Human work is protected from background work; it is not exempt from the ceiling.
 
-The ceiling is per UTC calendar day, so it rolls over at one instant regardless of server timezone or daylight saving. The configured `DailyBudgetUsd` is the only ceiling; there is no maximum above it.
+The ceiling is per UTC calendar day, so it rolls over at one instant regardless of server timezone or daylight saving. The configured `DailyBudgetUsd` is the only ceiling; no policy maximum sits above it. It is refused above what `BIGINT UNSIGNED` can record, roughly 18.4 billion USD, because a ceiling the ledger cannot enforce would let honest traffic saturate the day's settled total. That refusal is what makes saturation a reliable integrity signal rather than an ordinary outcome.
 
 Failure handling depends on what can be proven:
 
@@ -128,6 +128,8 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Model output invalid (empty, multiline, above 240 bytes) | Dropped; reservation settled at the cost the provider reported |
 | Model output unparseable | Dropped; no usage came back, so left outstanding for expiry |
 | Completion cannot be priced | Dropped; reservation stays outstanding rather than settling as free |
+| Provider reports more than it reserved | Circuit breaker opens, the reported figure recorded verbatim |
+| Day total would exceed what the column holds | Total saturates, circuit breaker opens naming the discarded amount |
 | Circuit breaker open | Every request denied until it is cleared |
 | Playerbots database unreachable | Sidecar refuses to start; `doctor` reports it and exits nonzero |
 | Bot despawned or deadline passed | Response discarded at delivery |

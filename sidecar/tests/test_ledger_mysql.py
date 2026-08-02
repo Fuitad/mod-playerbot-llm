@@ -1141,9 +1141,12 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     await connection.commit()
 
     assert row is not None
-    # The reported figure survives verbatim, and the saturation is named.
-    assert str(budget.MAX_STORABLE_NANO) in row[0]
+    # Both causes are named, because both happened: the report overran its reservation
+    # AND the day total saturated. A reason that mentioned only one would send whoever
+    # reads the incident after the wrong thing.
+    assert f"exceeded reservation {reservation.max_cost_nano}" in row[0]
     assert "saturated" in row[0]
+    assert len(row[0]) <= 255
 
     # And admission is closed afterwards.
     denied, _ = await book.reserve(
@@ -1154,3 +1157,52 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
         now=NOW,
     )
     assert denied is AdmissionDecision.DENIED_CIRCUIT_OPEN
+
+
+async def test_saturation_alone_is_reported_as_saturation_not_as_an_overrun(clean_ledger) -> None:
+    """A reason must name the cause that actually occurred.
+
+    A ceiling above MAX_STORABLE_NANO is refused at configuration time, so honest traffic
+    cannot reach saturation without an overrun. This drives the ledger directly, past that
+    guard, to prove the diagnostic is built from what happened rather than assuming the
+    two always coincide. Reporting "cost exceeded reservation" for a cost that did not is
+    how an incident investigation starts in the wrong place.
+    """
+    book, connection = clean_ledger
+
+    reserve_amount = budget.usd_to_nano("1.00")
+    decision, reservation = await book.reserve(
+        connection,
+        request_id=7101,
+        max_cost_nano=reserve_amount,
+        priority=RequestPriority.IMMEDIATE_HUMAN,
+        now=NOW,
+    )
+    assert decision is AdmissionDecision.ADMITTED
+    assert reservation is not None
+
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            "UPDATE playerbot_claude_budget_day SET settled_nano = %s WHERE usage_date = %s",
+            (budget.MAX_STORABLE_NANO - 1, ledger.utc_day(NOW)),
+        )
+    await connection.commit()
+
+    # WITHIN its reservation, so circuit_should_open is false. Only saturation applies.
+    assert (
+        await book.settle(connection, reservation=reservation, actual_cost_nano=reserve_amount, now=NOW)
+        is True
+    )
+
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            "SELECT circuit_open, circuit_reason FROM playerbot_claude_budget_day WHERE usage_date = %s",
+            (ledger.utc_day(NOW),),
+        )
+        row = await cursor.fetchone()
+    await connection.commit()
+
+    assert row is not None
+    assert bool(row[0]) is True, "an unrecordable total must still stop spending"
+    assert "saturated" in row[1]
+    assert "exceeded reservation" not in row[1], "the cost did NOT exceed its reservation"

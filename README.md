@@ -132,7 +132,7 @@ Cost per reply is `(input_tokens * InputUsdPerMTok + output_tokens * OutputUsdPe
 
 `PlayerbotClaude.DailyBudgetUsd = 5` is an emergency ceiling for all Claude features together. A measured day with about 7,700 input tokens and 610 output tokens costs approximately `0.01075 USD` at the configured rates, so the default is roughly 465 times observed usage and is not a spending target.
 
-The configured value is the only ceiling. There is no maximum above it: a large configured budget is honoured as configured. Missing, negative, or zero values disable generation, as does a price of zero. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
+The configured value is the only ceiling. No policy maximum sits above it: a large configured budget is honoured as configured. The one hard limit is physical, not policy. The ledger records money in `BIGINT UNSIGNED` columns, so a ceiling above roughly 18.4 billion USD per day is one the ledger could not enforce, and it is refused rather than quietly clamped. Missing, negative, zero, or unrecordable values disable generation, as does a price of zero. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
 
 The ceiling is per UTC calendar day, rolling over at one instant regardless of server timezone or daylight saving. Money is tracked as integer nano-USD (1 USD = 1,000,000,000), so no float rounding can accumulate into the ledger.
 

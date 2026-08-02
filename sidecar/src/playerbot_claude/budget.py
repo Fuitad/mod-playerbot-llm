@@ -106,14 +106,30 @@ def nano_to_usd_string(nano: int) -> str:
 def validate_daily_ceiling(usd: Decimal | str | int) -> int:
     """The configured ceiling is the sole limit. Returns it in nano-USD.
 
-    There is no hard-coded maximum above it. An operator who configures a large budget
-    has configured a large budget, and a second ceiling in the code would silently
+    No policy maximum sits above it. An operator who configures a large budget has
+    configured a large budget, and a second, lower ceiling in the code would silently
     ignore what they asked for.
+
+    There is one hard limit, and it is physical rather than a policy: the ledger records
+    money in ``BIGINT UNSIGNED`` columns, so a ceiling above what those can hold is a
+    ceiling the ledger cannot enforce. Honest traffic under such a ceiling would eventually
+    saturate the day's settled total, and the settle path would have to either overflow or
+    report a breach that never happened. Refused LOUDLY rather than quietly clamped: an
+    unenforceable budget is a configuration mistake, and silently substituting a different
+    number is exactly what removing the old hard-coded cap was meant to stop.
+
+    The limit is roughly 18.4 billion USD in one day, so it constrains nothing real.
     """
 
     ceiling = usd_to_nano(usd)
     if ceiling <= 0:
         raise BudgetConfigurationError("daily budget must be greater than zero")
+
+    if ceiling > MAX_STORABLE_NANO:
+        raise BudgetConfigurationError(
+            "daily budget exceeds what the ledger can record "
+            f"(limit {nano_to_usd_string(MAX_STORABLE_NANO)} USD)"
+        )
 
     return ceiling
 
