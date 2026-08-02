@@ -1083,3 +1083,74 @@ async def test_a_complete_service_request_runs_against_real_mysql(mysql_state) -
 
     # The pool is intact: nothing was discarded for holding a transaction open.
     assert pool.freesize == pool.size
+
+
+async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(clean_ledger) -> None:
+    """The breaker must survive the exact report it exists to catch.
+
+    settled_nano is BIGINT UNSIGNED. Clamping only the incoming value still overflows the
+    SUM once anything has been spent: MySQL rejects the statement in strict mode, the
+    transaction rolls back, and the breaker stays shut while the reservation stays
+    outstanding forever. That is the same failure mode as round 1's unstorable value, one
+    level up, so this drives the addition rather than the addend.
+    """
+    book, connection = clean_ledger
+
+    # Reserve first, while the day is empty and admission is possible.
+    decision, reservation = await book.reserve(
+        connection,
+        request_id=7001,
+        max_cost_nano=budget.usd_to_nano("1.00"),
+        priority=RequestPriority.IMMEDIATE_HUMAN,
+        now=NOW,
+    )
+    assert decision is AdmissionDecision.ADMITTED
+    assert reservation is not None
+
+    # THEN put the day's total within a whisker of the column's ceiling. This is the
+    # state a previous impossible report would have left behind, and it has to be set
+    # after admission because a ledger holding that much would refuse every request.
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            "UPDATE playerbot_claude_budget_day SET settled_nano = %s WHERE usage_date = %s",
+            (budget.MAX_STORABLE_NANO - 10, ledger.utc_day(NOW)),
+        )
+    await connection.commit()
+
+    # A report far above both the reservation and the remaining headroom.
+    assert (
+        await book.settle(
+            connection,
+            reservation=reservation,
+            actual_cost_nano=budget.MAX_STORABLE_NANO,
+            now=NOW,
+        )
+        is True
+    )
+
+    state = await book.snapshot(connection, now=NOW)
+    assert state.circuit_open is True, "the breaker must fire rather than the update failing"
+    assert state.settled_nano == budget.MAX_STORABLE_NANO
+
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            "SELECT circuit_reason FROM playerbot_claude_budget_day WHERE usage_date = %s",
+            (ledger.utc_day(NOW),),
+        )
+        row = await cursor.fetchone()
+    await connection.commit()
+
+    assert row is not None
+    # The reported figure survives verbatim, and the saturation is named.
+    assert str(budget.MAX_STORABLE_NANO) in row[0]
+    assert "saturated" in row[0]
+
+    # And admission is closed afterwards.
+    denied, _ = await book.reserve(
+        connection,
+        request_id=7002,
+        max_cost_nano=1,
+        priority=RequestPriority.IMMEDIATE_HUMAN,
+        now=NOW,
+    )
+    assert denied is AdmissionDecision.DENIED_CIRCUIT_OPEN

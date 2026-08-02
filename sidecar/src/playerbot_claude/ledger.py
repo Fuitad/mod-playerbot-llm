@@ -443,7 +443,7 @@ class BudgetLedger:
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
-                await self._lock_day(cursor, reservation.usage_date)
+                settled_before, _ = await self._lock_day(cursor, reservation.usage_date)
 
                 await cursor.execute(
                     "UPDATE playerbot_claude_budget_reservation "
@@ -455,10 +455,25 @@ class BudgetLedger:
                     await connection.commit()
                     return False
 
+                # The SUM is clamped, not just the value. Clamping only the addend still
+                # overflows BIGINT UNSIGNED once anything has been spent, and MySQL then
+                # rejects the statement, rolls the transaction back, and leaves the
+                # breaker shut for the exact report it exists to catch. The headroom comes
+                # from the total this transaction already read under the lock, so the
+                # arithmetic happens in Python where it cannot wrap.
+                headroom = budget.MAX_STORABLE_NANO - settled_before
+                added = min(storable, headroom)
+                saturated = added < storable
+                if saturated:
+                    # Reaching the column's ceiling is only possible through a report that
+                    # was already impossible, and a total that is no longer the sum of what
+                    # was charged is worth stopping on either way.
+                    breach = True
+
                 await cursor.execute(
                     "UPDATE playerbot_claude_budget_day SET settled_nano = settled_nano + %s "
                     "WHERE usage_date = %s",
-                    (storable, reservation.usage_date),
+                    (added, reservation.usage_date),
                 )
 
                 if breach:
@@ -475,6 +490,10 @@ class BudgetLedger:
                     reason = (
                         f"reported cost {actual_cost_nano} exceeded reservation {reservation.max_cost_nano}"
                     )
+                    if saturated:
+                        # The stored total is no longer the sum of what was charged, so say
+                        # so where whoever reads the incident will see it.
+                        reason = f"{reason}; day total saturated at {budget.MAX_STORABLE_NANO}"
                     await cursor.execute(
                         "UPDATE playerbot_claude_budget_day SET circuit_open = 1, circuit_reason = %s "
                         "WHERE usage_date = %s",
