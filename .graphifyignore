@@ -1,0 +1,22 @@
+# Markdown and prose are excluded from the graph corpus on purpose.
+#
+# Graphify sends every document file to an LLM for semantic extraction, and that is the only part
+# of a build that costs money. For this module the code graph is what the checkpoint protocol
+# actually reads: callers, callees, and blast radius, all of which come from AST extraction and
+# need no API key at all. The prose adds recurring cost for something no reviewer here queries.
+#
+# Graphify refuses to write an AST only graph when semantic extraction was requested and every
+# chunk failed, so with the key disabled these files block the whole incremental update rather
+# than merely being skipped. Excluding them is what lets the code graph refresh at all.
+#
+# This mirrors the identical exclusion in mod-playerbots, added during Task 6 for the same reason.
+#
+# To put them back: delete this file and re-run `graphify . --update` with a working key.
+*.md
+*.mdx
+*.rst
+*.txt
+# CI workflow YAML is a document to graphify's extractor as well.
+*.yml
+*.yaml
+*.html
