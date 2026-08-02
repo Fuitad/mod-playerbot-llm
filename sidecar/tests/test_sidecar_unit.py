@@ -8,21 +8,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+import re
+from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import anthropic
 import httpx
 import pytest
+from fakes import FakeState
 
-from playerbot_claude import app, budget, claude, protocol, storage
+from playerbot_claude import app, budget, claude, protocol
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
+
+# Pinned so a settlement records a known instant rather than whatever the suite ran at.
+FIXED_NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 
 # Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
 CPP_REQUEST_FIXTURE = (
@@ -729,13 +731,12 @@ def test_config_parses_worldserver_conf(tmp_path) -> None:
 
 def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
     # AzerothCore .conf convention quotes string values (the shipped .dist does);
-    # worldserver's ConfigMgr strips them, so the sidecar must too.
-    quoted = str(tmp_path / "quoted path.sqlite")
-    conf = write_conf(
-        tmp_path,
-        CONF_TEXT + f'PlayerbotClaude.SidecarDatabase = "{quoted}"\n',
-    )
-    assert app.SidecarConfig.load(conf).database_path == quoted
+    # worldserver's ConfigMgr strips them, so the sidecar must too. A quoted ceiling
+    # that keeps its quotes parses as no budget at all, which silences every bot.
+    conf = write_conf(tmp_path, '[worldserver]\nPlayerbotClaude.DailyBudgetUsd = "2.50"\n')
+    config = app.SidecarConfig.load(conf)
+    assert config.daily_budget_usd == "2.50"
+    assert config.budget_nano == budget.usd_to_nano("2.50")
 
 
 def test_config_defaults_fail_closed(tmp_path) -> None:
@@ -842,6 +843,39 @@ def test_doctor_flags_missing_token(tmp_path, monkeypatch) -> None:
     assert report["ok"] is False
 
 
+def test_no_module_in_the_package_can_open_sqlite() -> None:
+    """Definition of Done 6, asserted where it cannot quietly come back.
+
+    A test that only checks "no file appeared under tmp_path" passes for a sidecar that
+    writes its SQLite file somewhere else, and passes for one that opens a database and
+    deletes it. What Definition of Done 6 actually claims is that the dependency is gone,
+    so the assertion is over the shipped source rather than over one run's side effects.
+    """
+    package = Path(app.__file__).parent
+    # Importing it or calling into it, not merely naming it: a docstring explaining that
+    # the store used to be SQLite is documentation, and banning the word would push a
+    # future reader toward deleting the explanation rather than the dependency.
+    uses_sqlite = re.compile(r"^\s*(import|from)\s+sqlite3\b|\bsqlite3\s*\.", re.MULTILINE)
+    users = sorted(
+        path.name for path in package.glob("*.py") if uses_sqlite.search(path.read_text(encoding="utf-8"))
+    )
+    assert users == []
+    assert not (package / "storage.py").exists()
+
+
+def test_the_configuration_no_longer_carries_a_sqlite_path(tmp_path) -> None:
+    """A leftover SidecarDatabase in a deployed config is inert, not a second store.
+
+    Operators upgrade in place, so the setting will still be sitting in the file the
+    sidecar reads. It has to be ignored rather than honoured: honouring it is how a
+    server ends up with budget in MySQL and budget in a file nobody is looking at.
+    """
+    config = app.SidecarConfig.load(
+        write_conf(tmp_path, CONF_TEXT + 'PlayerbotClaude.SidecarDatabase = "leftover.sqlite"\n')
+    )
+    assert not hasattr(config, "database_path")
+
+
 class FakeAdapter(claude.ClaudeAdapter):
     def __init__(self, reply: str = "A fine day for fishing.") -> None:
         # Deliberately no super().__init__(): the fake never builds a real client.
@@ -849,6 +883,11 @@ class FakeAdapter(claude.ClaudeAdapter):
         self.requests: list[protocol.ChatRequest] = []
         self.histories: list[list[tuple[str, str]]] = []
         self.input_tokens = 100
+        # Set by the state double when generation happens, so a test can assert the
+        # money was reserved BEFORE the provider was reached and not merely that both
+        # eventually occurred.
+        self.generated_at_call_index: int | None = None
+        self.state: FakeState | None = None
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         return self.input_tokens
@@ -858,23 +897,13 @@ class FakeAdapter(claude.ClaudeAdapter):
     ) -> tuple[str, claude.UsageTotals]:
         self.requests.append(request)
         self.histories.append(list(history))
+        if self.state is not None:
+            self.generated_at_call_index = len(self.state.calls)
         return self.reply, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
 
 
-def make_service(tmp_path, adapter=None, budget: float = 1.0) -> app.SidecarService:
-    conf = write_conf(
-        tmp_path,
-        CONF_TEXT.replace("5.0", str(budget)),
-    )
-    return app.SidecarService(
-        config=app.SidecarConfig.load(conf),
-        token=TEST_TOKEN,
-        adapter=adapter or FakeAdapter(),
-    )
-
-
-async def test_service_processes_valid_request(tmp_path) -> None:
-    service = make_service(tmp_path)
+async def test_the_service_answers_a_valid_request(tmp_path) -> None:
+    service, _, _ = make_stored_service(tmp_path)
     payload = await service.process_payload(CPP_REQUEST_FIXTURE.encode())
     assert payload is not None
 
@@ -885,499 +914,263 @@ async def test_service_processes_valid_request(tmp_path) -> None:
     assert response["token"] == TEST_TOKEN
 
 
-async def test_service_stays_silent_on_bad_token(tmp_path) -> None:
-    adapter = FakeAdapter()
-    service = make_service(tmp_path, adapter=adapter)
+async def test_the_service_refuses_a_bad_token_before_touching_anything(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
     bad = valid_request_dict()
     bad["token"] = "z" * 32
+
     with pytest.raises(protocol.TokenMismatchError):
         await service.process_payload(json.dumps(bad).encode())
+
     assert adapter.requests == []
+    assert store.calls == []
 
 
-async def test_service_stays_silent_when_generation_fails(tmp_path) -> None:
-    class FailingAdapter(FakeAdapter):
-        def generate_reply(self, request, history):
-            raise claude.ClaudeTimeoutError("provider timed out")
-
-    service = make_service(tmp_path, adapter=FailingAdapter())
-    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-
-
-async def test_service_makes_no_generation_call_without_budget(tmp_path) -> None:
-    adapter = FakeAdapter()
-    service = make_service(tmp_path, adapter=adapter, budget=0.0)
+async def test_the_service_makes_no_generation_call_without_a_budget(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path, daily_budget="0")
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
     assert adapter.requests == []
-
-
-async def test_service_keeps_career_decisions_out_of_chat_history(tmp_path) -> None:
-    adapter = FakeAdapter(reply='{"candidate_token":"career-def456","spending_style":"progression"}')
-    store = make_storage(tmp_path)
-    service = app.SidecarService(
-        config=app.SidecarConfig.load(write_conf(tmp_path)),
-        token=TEST_TOKEN,
-        adapter=adapter,
-        store=store,
-    )
-
-    payload = await service.process_payload(json.dumps(career_request_dict()).encode())
-    assert payload is not None
-    assert adapter.histories == [[]]
-    assert store.recent_turns(42) == []
-    decision = store.get_career_decision(42)
-    assert decision is not None
-    assert decision == {
-        "career_version": 1,
-        "candidate_token": "career-def456",
-        "spending_style": "progression",
-        "updated_at": decision["updated_at"],
-    }
-
-
-# --- Storage: profiles, bounded memory, crash-safe budget ---
-
-
-HAIKU_PRICES = storage.PriceSnapshot.from_usd_per_mtok(1.00, 5.00)
-
-
-def make_storage(tmp_path) -> storage.Storage:
-    return storage.Storage(str(tmp_path / "sidecar.sqlite"))
-
-
-class MutableClock:
-    def __init__(self, value: datetime) -> None:
-        self.value = value
-
-    def __call__(self) -> datetime:
-        return self.value
-
-    def advance(self, delta: timedelta) -> None:
-        self.value += delta
-
-
-def test_prices_convert_exactly() -> None:
-    assert HAIKU_PRICES.input_nano_per_token == 1000
-    assert HAIKU_PRICES.output_nano_per_token == 5000
-
-
-def test_documented_cost_examples_are_exact() -> None:
-    # Literal examples from the approved plan: 2,500 + 80 tokens cost 0.0029 USD and
-    # 4,095 + 96 tokens cost 0.004575 USD.
-    assert HAIKU_PRICES.cost_nano(2500, 80) == 2_900_000
-    assert storage.nano_to_usd_string(HAIKU_PRICES.cost_nano(2500, 80)) == "0.0029"
-    assert HAIKU_PRICES.cost_nano(4095, 96) == 4_575_000
-    assert storage.nano_to_usd_string(HAIKU_PRICES.cost_nano(4095, 96)) == "0.004575"
-
-
-def test_profile_persists_across_reopen(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    store.record_profile(make_request_model())
-    store.close()
-
-    reopened = make_storage(tmp_path)
-    profile = reopened.get_profile(42)
-    assert profile is not None
-    assert profile["profile_version"] == 2
-    assert profile["crafting_affinity"] == 65
-    assert profile["gathering_affinity"] == 37
-    assert profile["exploration_affinity"] == 91
-    assert profile["sociability"] == 82
-    assert profile["voice"] == "earnest"
-    assert reopened.get_profile(9999) is None
-
-
-def test_profile_schema_migrates_existing_database_without_erasing_history(tmp_path) -> None:
-    path = tmp_path / "sidecar.sqlite"
-    connection = sqlite3.connect(path)
-    connection.execute(
-        """
-        CREATE TABLE profiles (
-            bot_guid INTEGER PRIMARY KEY,
-            profile_version INTEGER NOT NULL,
-            crafting_affinity INTEGER NOT NULL,
-            exploration_affinity INTEGER NOT NULL,
-            sociability INTEGER NOT NULL,
-            voice TEXT NOT NULL,
-            bot_name TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute("INSERT INTO profiles VALUES (42, 1, 65, 91, 82, 'earnest', 'Botname', 'old')")
-    connection.commit()
-    connection.close()
-
-    store = storage.Storage(str(path))
-    profile = store.get_profile(42)
-    assert profile is not None
-    assert profile["profile_version"] == 1
-    assert profile["gathering_affinity"] == 0
-
-
-def test_conversation_memory_is_bounded_to_20_turns(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    for index in range(25):
-        role = "user" if index % 2 == 0 else "assistant"
-        store.append_turn(42, role, f"turn {index}")
-
-    turns = store.recent_turns(42)
-    assert len(turns) == 20
-    assert turns[0] == ("user" if 5 % 2 == 0 else "assistant", "turn 5")
-    assert turns[-1] == ("user", "turn 24")
-
-    # Other bots are unaffected and isolated.
-    assert store.recent_turns(7) == []
-
-
-def test_reservation_settlement_produces_exact_spend(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    budget_nano = storage.usd_to_nano(5)
-
-    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, budget_nano)
-    assert reservation is not None
-    assert store.outstanding_nano() == 4_575_000
-    assert store.spent_nano() == 0
-
-    store.mark_submitted(reservation)
-    store.settle(reservation, 2500, 80, HAIKU_PRICES)
-    assert store.outstanding_nano() == 0
-    assert store.spent_nano() == 2_900_000
-
-
-def test_reservation_rejected_when_budget_cannot_fit(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    budget_nano = storage.usd_to_nano(0.0046)  # 4,600,000 nano
-
-    first = store.reserve(1, 4095, 96, HAIKU_PRICES, budget_nano)  # max 4,575,000
-    assert first is not None
-
-    # Outstanding reservation blocks a second one.
-    assert store.reserve(2, 10, 96, HAIKU_PRICES, budget_nano) is None
-
-    store.mark_submitted(first)
-    store.settle(first, 2500, 80, HAIKU_PRICES)  # actual spend 2,900,000
-
-    # A small follow-up fits (2,900,000 + 1,000*10 + 5,000*96 = 3,390,000).
-    assert store.reserve(3, 10, 96, HAIKU_PRICES, budget_nano) is not None
-    # A full-size one does not (2,900,000 + 4,575,000 > 4,600,000). The small
-    # reservation above is still outstanding, which blocks it further.
-    assert store.reserve(4, 4095, 96, HAIKU_PRICES, budget_nano) is None
-
-
-def test_crash_before_reservation_charges_nothing(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    store.close()
-    reopened = make_storage(tmp_path)
-    assert reopened.spent_nano() == 0
-    assert reopened.outstanding_nano() == 0
-
-
-def test_crash_after_reservation_remains_charged_at_maximum(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(5))
-    assert reservation is not None
-    store.close()  # crash before mark_submitted
-
-    reopened = make_storage(tmp_path)
-    assert reopened.outstanding_nano() == 4_575_000
-
-
-def test_crash_after_submission_remains_charged_at_maximum(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    reservation = store.reserve(7, 4095, 96, HAIKU_PRICES, storage.usd_to_nano(5))
-    assert reservation is not None
-    store.mark_submitted(reservation)
-    store.close()  # crash before settlement
-
-    reopened = make_storage(tmp_path)
-    assert reopened.outstanding_nano() == 4_575_000
-    assert reopened.spent_nano() == 0
-
-
-def test_settlement_survives_restart(tmp_path) -> None:
-    store = make_storage(tmp_path)
-    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(5))
-    assert reservation is not None
-    store.mark_submitted(reservation)
-    store.settle(reservation, 2500, 80, HAIKU_PRICES)
-    store.close()
-
-    reopened = make_storage(tmp_path)
-    assert reopened.spent_nano() == 2_900_000
-    assert reopened.outstanding_nano() == 0
-
-
-# --- Service integration with storage ---
+    assert store.calls == []
 
 
 def make_stored_service(
-    tmp_path, adapter=None, budget: float = 1.0, input_tokens: int = 100
-) -> tuple[app.SidecarService, storage.Storage, FakeAdapter]:
-    fake = adapter or FakeAdapter()
-    fake.input_tokens = input_tokens
-    store = make_storage(tmp_path)
-    conf = write_conf(tmp_path, CONF_TEXT.replace("5.0", str(budget)))
+    tmp_path,
+    adapter=None,
+    daily_budget: str = "5.0",
+    state_double: FakeState | None = None,
+) -> tuple[app.SidecarService, FakeState, FakeAdapter]:
+    config = app.SidecarConfig.load(write_conf(tmp_path, CONF_TEXT.replace("5.0", daily_budget)))
+    fake_adapter = adapter or FakeAdapter()
+    store = state_double or FakeState(config.budget_nano, config.reserve_ratio)
+    fake_adapter.state = store
     service = app.SidecarService(
-        config=app.SidecarConfig.load(conf),
+        config=config,
         token=TEST_TOKEN,
-        adapter=fake,
+        adapter=fake_adapter,
         store=store,
+        now=lambda: FIXED_NOW,
     )
-    return service, store, fake
+    return service, store, fake_adapter
 
 
-async def test_service_records_profile_memory_and_settlement(tmp_path) -> None:
-    service, store, fake = make_stored_service(tmp_path)
+async def test_the_service_records_profile_memory_and_settlement(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
 
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is not None
 
-    profile = store.get_profile(42)
-    assert profile is not None and profile["voice"] == "earnest"
+    assert store.profiles[42]["bot_name"] == "Botname"
+    assert store.profiles[42]["crafting_affinity"] == 65
+    assert store.profiles[42]["gathering_affinity"] == 37
+    assert store.turns[42] == [
+        ("user", claude.build_user_message(adapter.requests[0])),
+        ("assistant", "A fine day for fishing."),
+    ]
 
-    turns = store.recent_turns(42)
-    assert len(turns) == 2
-    assert turns[0][0] == "user"
-    assert turns[1] == ("assistant", "A fine day for fishing.")
-
-    assert store.spent_nano() == HAIKU_PRICES.cost_nano(100, 10)
-    assert store.outstanding_nano() == 0
-
-    # The next request carries the stored history to the adapter.
-    second = valid_request_dict()
-    second["request_id"] = 8
-    assert await service.process_payload(json.dumps(second).encode()) is not None
-    assert len(fake.histories[-1]) == 2
+    # 100 input at $1/Mtok plus 10 output at $5/Mtok.
+    expected = budget.usd_to_nano("0.0001") + budget.usd_to_nano("0.00005")
+    assert store.settled_nano == expected
+    assert store.outstanding == {}
 
 
-async def test_ambient_service_never_reads_or_appends_conversation_history(tmp_path) -> None:
-    service, store, fake = make_stored_service(tmp_path)
-    private_marker = "PRIVATE-WHISPER-MARKER-7E31"
-    store.append_turn(42, "user", private_marker)
-    before = store.recent_turns(42)
+async def test_the_money_is_reserved_before_the_provider_is_ever_called(tmp_path) -> None:
+    """The ordering is the whole guarantee, so it is asserted as an ordering.
 
-    payload = json.dumps(ambient_request_dict()).encode()
-    assert await service.process_payload(payload) is not None
+    A test that only checked "a reservation exists afterwards" passes for a service that
+    generates first and reserves second, which is a service whose ceiling can be crossed
+    by every request in flight.
+    """
+    service, store, adapter = make_stored_service(tmp_path)
 
-    assert fake.histories[-1] == []
-    assert store.recent_turns(42) == before
+    await service.process_payload(CPP_REQUEST_FIXTURE.encode())
 
-
-async def test_service_rejects_oversized_prompt_without_generation(tmp_path) -> None:
-    service, store, fake = make_stored_service(tmp_path, input_tokens=claude.MAX_INPUT_TOKENS + 1)
-    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-    assert fake.requests == []
-    assert store.outstanding_nano() == 0
+    assert store.calls.index("reserve") < store.calls.index("settle")
+    assert adapter.generated_at_call_index == store.calls.index("reserve") + 1
 
 
-async def test_service_makes_no_call_when_reservation_cannot_fit(tmp_path) -> None:
-    service, _store, fake = make_stored_service(tmp_path, budget=0.000001)
-    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-    assert fake.requests == []
+async def test_a_provider_failure_gives_the_reservation_back(tmp_path) -> None:
+    """Definition of Done 3's other half: a failed attempt must not hold the budget.
 
+    The call raised before any completion existed, so nothing was billed. Leaving the
+    maximum charged for the full expiry window would deny later requests money the
+    budget demonstrably still has.
+    """
 
-async def test_generation_failure_leaves_reservation_charged(tmp_path) -> None:
     class FailingAdapter(FakeAdapter):
         def generate_reply(self, request, history):
             raise claude.ClaudeTimeoutError("provider timed out")
 
-    service, store, _fake = make_stored_service(tmp_path, adapter=FailingAdapter())
+    service, store, _ = make_stored_service(tmp_path, adapter=FailingAdapter())
+
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-    # Fail closed: the reservation stays charged at maximum until reconciled.
-    assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
+
+    assert len(store.released) == 1
+    assert store.outstanding == {}
+    assert store.settled_nano == 0
+    assert store.settlements == []
 
 
-async def test_failed_ambient_attempt_consumes_rate_before_token_counting(tmp_path) -> None:
-    class FailingCountAdapter(FakeAdapter):
-        def __init__(self) -> None:
-            super().__init__()
-            self.count_calls = 0
+async def test_a_denied_request_never_reaches_the_provider(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
+    store.settled_nano = store.ceiling_nano
 
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert adapter.requests == []
+    assert store.reservations == []
+
+
+async def test_an_open_circuit_stops_the_service_dead(tmp_path) -> None:
+    """Definition of Done 7 as the service sees it: no admission, no call, no reply."""
+    service, store, adapter = make_stored_service(tmp_path)
+    store.circuit_open = True
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert adapter.requests == []
+    assert store.reservations == []
+
+
+async def test_ambient_chatter_and_career_choices_draw_on_the_background_lane(tmp_path) -> None:
+    """Definition of Done 2, at the point where a request is classified.
+
+    Nobody is waiting on ambient World chatter or on a career decision, so neither may
+    eat the slice held for a player who actually speaks. Getting this classification
+    wrong is how a reserve that exists in the policy stops existing in practice.
+    """
+    assert app._priority_for(parse(valid_request_dict())) is budget.RequestPriority.IMMEDIATE_HUMAN
+    assert app._priority_for(parse(ambient_request_dict())) is budget.RequestPriority.BACKGROUND
+    assert app._priority_for(parse(career_request_dict())) is budget.RequestPriority.BACKGROUND
+
+
+async def test_ambient_requests_never_read_or_append_conversation_history(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
+    store.turns[42] = [("user", "earlier"), ("assistant", "reply")]
+
+    assert await service.process_payload(json.dumps(ambient_request_dict()).encode()) is not None
+
+    assert adapter.histories == [[]]
+    assert store.turns[42] == [("user", "earlier"), ("assistant", "reply")]
+
+
+async def test_a_failed_ambient_attempt_still_consumes_its_rate_slot(tmp_path) -> None:
+    """The rate limit counts attempts, not successes.
+
+    Counting only successes lets a broken provider be retried without limit, which is
+    both a spend loop and a way to keep the World channel busy with nothing.
+    """
+
+    class FailingAdapter(FakeAdapter):
         def count_input_tokens(self, request, history):
-            self.count_calls += 1
-            raise claude.ClaudeProviderError("count failed")
+            raise claude.ClaudeProviderError("provider is down")
 
-    adapter = FailingCountAdapter()
-    store = make_storage(tmp_path)
+    service, store, _ = make_stored_service(tmp_path, adapter=FailingAdapter())
+
+    assert await service.process_payload(json.dumps(ambient_request_dict()).encode()) is None
+    assert store.ambient_taken == 1
+    assert store.calls[0] == "try_begin_ambient"
+
+
+async def test_an_exhausted_ambient_rate_makes_no_provider_call_at_all(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
+    store.ambient_taken = store.ambient_allowance
+
+    assert await service.process_payload(json.dumps(ambient_request_dict()).encode()) is None
+    assert adapter.requests == []
+    assert store.reservations == []
+
+
+async def test_an_oversized_prompt_is_refused_before_any_money_moves(tmp_path) -> None:
+    adapter = FakeAdapter()
+    adapter.input_tokens = claude.MAX_INPUT_TOKENS + 1
+    service, store, _ = make_stored_service(tmp_path, adapter=adapter)
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert store.reservations == []
+    assert adapter.requests == []
+
+
+async def test_career_decisions_stay_out_of_chat_history(tmp_path) -> None:
+    adapter = FakeAdapter(reply='{"candidate_token":"career-def456","spending_style":"progression"}')
+    service, store, _ = make_stored_service(tmp_path, adapter=adapter)
+
+    assert await service.process_payload(json.dumps(career_request_dict()).encode()) is not None
+
+    assert adapter.histories == [[]]
+    assert store.turns.get(42, []) == []
+    assert store.careers[42] == {
+        "career_version": 1,
+        "candidate_token": "career-def456",
+        "spending_style": "progression",
+    }
+
+
+async def test_a_service_without_durable_state_stays_silent(tmp_path) -> None:
+    """No state, no reply. There is no degraded mode that spends money off the books."""
+    adapter = FakeAdapter()
     service = app.SidecarService(
-        config=app.SidecarConfig(
-            enable=True,
-            ambient_world_enable=True,
-            ambient_max_messages_per_hour=1,
-            daily_budget_usd=1,
-        ),
-        token=TEST_TOKEN,
-        adapter=adapter,
-        store=store,
+        config=app.SidecarConfig.load(write_conf(tmp_path)), token=TEST_TOKEN, adapter=adapter
     )
 
-    first = ambient_request_dict()
-    assert await service.process_payload(json.dumps(first).encode()) is None
-    second = ambient_request_dict()
-    second["request_id"] = 9
-    assert await service.process_payload(json.dumps(second).encode()) is None
-    assert adapter.count_calls == 1
-    store.close()
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert adapter.requests == []
 
 
-def test_default_adapter_client_timeout_is_capped_at_deadline(tmp_path, monkeypatch) -> None:
-    # The default SDK client's own timeout must track ResponseDeadlineMs so an
-    # abandoned provider call cannot outlive the deadline by more than one request.
-    monkeypatch.delenv("MOD_PLAYERBOT_CLAUDE_APIKEY", raising=False)
-    conf = write_conf(tmp_path, CONF_TEXT.replace("10000", "2500"))
-    service = app.SidecarService(config=app.SidecarConfig.load(conf), token=TEST_TOKEN)
-    assert service._adapter._client.timeout == 2.5
+def test_the_actual_cost_counts_cache_tokens_at_the_input_rate(tmp_path) -> None:
+    """Nothing sends a cache_control block today, so both counts are always zero.
 
-
-async def test_process_payload_enforces_response_deadline(tmp_path) -> None:
-    # ResponseDeadlineMs bounds the whole sidecar pipeline. A provider call that
-    # outlives it must not produce a response, settle as delivered conversation,
-    # or block later requests for its full provider timeout.
-    release = threading.Event()
-
-    class BlockingAdapter(FakeAdapter):
-        def generate_reply(self, request, history):
-            release.wait(timeout=30)
-            return super().generate_reply(request, history)
-
-    store = make_storage(tmp_path)
-    conf = write_conf(tmp_path, CONF_TEXT.replace("10000", "200"))
-    service = app.SidecarService(
-        config=app.SidecarConfig.load(conf),
-        token=TEST_TOKEN,
-        adapter=BlockingAdapter(),
-        store=store,
+    Charging them at the plain input rate means that if prompt caching is ever enabled,
+    the ledger over-counts cache reads rather than under-counting cache writes.
+    Over-counting is the safe direction under a ceiling.
+    """
+    plain = claude.UsageTotals(input_tokens=1000, output_tokens=100)
+    cached = claude.UsageTotals(
+        input_tokens=600, output_tokens=100, cache_creation_input_tokens=300, cache_read_input_tokens=100
     )
-
-    started = time.monotonic()
-    try:
-        assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-        # Returned near the 0.2s deadline, nowhere near the 30s block.
-        assert time.monotonic() - started < 5.0
-        # Money fails closed: the reservation stays charged at maximum, and the
-        # dead exchange never enters conversation memory.
-        assert store.outstanding_nano() == HAIKU_PRICES.cost_nano(100, claude.MAX_OUTPUT_TOKENS)
-        assert store.recent_turns(42) == []
-    finally:
-        release.set()
+    assert app._actual_cost_nano(plain, ("1.00", "5.00")) == app._actual_cost_nano(cached, ("1.00", "5.00"))
 
 
-def test_doctor_reports_budget_numbers(tmp_path, monkeypatch) -> None:
+def test_the_doctor_reports_budget_numbers_without_secrets(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", TEST_TOKEN)
-    store = make_storage(tmp_path)
-    reservation = store.reserve(7, 2500, 96, HAIKU_PRICES, storage.usd_to_nano(5))
-    assert reservation is not None
-    store.mark_submitted(reservation)
-    store.settle(reservation, 2500, 80, HAIKU_PRICES)
+    monkeypatch.setenv("MOD_PLAYERBOT_CLAUDE_APIKEY", "sk-ant-super-secret")
+    config = app.SidecarConfig.load(write_conf(tmp_path))
 
-    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), store=store)
-    budget = report["budget"]
-    assert isinstance(budget, dict)
-    assert budget["rolling_spent_usd"] == "0.0029"
-    assert budget["rolling_reserved_usd"] == "0"
-    assert budget["rolling_remaining_usd"] == "4.9971"
-    assert budget["next_expiry_at"] is not None
+    report = app.doctor_report(
+        config,
+        budget_state=budget.BudgetState(
+            settled_nano=budget.usd_to_nano("1.25"), outstanding_nano=budget.usd_to_nano("0.25")
+        ),
+    )
 
-
-def test_ambient_rate_gate_is_rolling_persistent_and_exact_at_boundary(tmp_path) -> None:
-    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
-    database = str(tmp_path / "rate.sqlite")
-    store = storage.Storage(database, now=clock)
-
-    for _ in range(6):
-        assert store.try_begin_ambient(6) is True
-    assert store.try_begin_ambient(6) is False
-    store.close()
-
-    reopened = storage.Storage(database, now=clock)
-    assert reopened.try_begin_ambient(6) is False
-    clock.advance(timedelta(seconds=3599, milliseconds=999))
-    assert reopened.try_begin_ambient(6) is False
-    clock.advance(timedelta(milliseconds=1))
-    assert reopened.try_begin_ambient(6) is True
+    assert report["budget"] == {
+        "settled_usd": "1.25",
+        "outstanding_usd": "0.25",
+        "remaining_usd": "3.5",
+        "human_reserve_usd": "1.25",
+        "circuit_open": False,
+    }
+    serialized = json.dumps(report)
+    assert TEST_TOKEN not in serialized
+    assert "sk-ant-super-secret" not in serialized
 
 
-def test_ambient_rate_one_uses_the_same_persistent_gate(tmp_path) -> None:
-    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
-    database = str(tmp_path / "rate-one.sqlite")
-    store = storage.Storage(database, now=clock)
-    assert store.try_begin_ambient(1) is True
-    assert store.try_begin_ambient(1) is False
-    store.close()
-
-    reopened = storage.Storage(database, now=clock)
-    assert reopened.try_begin_ambient(1) is False
-    assert reopened.try_begin_ambient(0) is False
-    assert reopened.try_begin_ambient(7) is False
-
-
-def test_rolling_budget_combines_all_request_types_and_ages_by_reservation_time(tmp_path) -> None:
-    clock = MutableClock(datetime(2026, 7, 30, 12, 0, tzinfo=UTC))
-    store = storage.Storage(str(tmp_path / "rolling.sqlite"), now=clock)
-    budget = storage.usd_to_nano(5)
-
-    reservations = [
-        store.reserve(request_id, 100, 10, HAIKU_PRICES, budget) for request_id in (101, 102, 103, 104)
-    ]
-    assert all(reservation is not None for reservation in reservations)
-    first = reservations[0]
-    assert first is not None
-    store.mark_submitted(first)
-    store.settle(first, 80, 5, HAIKU_PRICES)
-
-    snapshot = store.rolling_budget_snapshot()
-    assert snapshot.spent_nano == HAIKU_PRICES.cost_nano(80, 5)
-    assert snapshot.reserved_nano == 3 * HAIKU_PRICES.cost_nano(100, 10)
-    assert snapshot.next_expiry_at == datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
-
-    clock.advance(timedelta(hours=24))
-    expired = store.rolling_budget_snapshot()
-    assert expired.spent_nano == 0
-    assert expired.reserved_nano == 0
-    assert expired.next_expiry_at is None
-    assert store.usage_count() == 1
-    assert store.outstanding_nano() == 3 * HAIKU_PRICES.cost_nano(100, 10)
+def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("MOD_PLAYERBOT_CLAUDE_APIKEY", "sk-ant-super-secret")
+    report = app.doctor_report(
+        app.SidecarConfig.load(write_conf(tmp_path)),
+        budget_state=budget.BudgetState(circuit_open=True),
+    )
+    assert report["ok"] is False
+    reported = report["budget"]
+    assert isinstance(reported, dict)
+    assert reported["circuit_open"] is True
 
 
-def test_concurrent_reservations_cannot_cross_rolling_budget(tmp_path) -> None:
-    database = str(tmp_path / "concurrent-budget.sqlite")
-    clock_value = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
-    storage.Storage(database, now=lambda: clock_value).close()
-    one_request_budget = HAIKU_PRICES.cost_nano(100, 10)
-    barrier = threading.Barrier(2)
-
-    def reserve(request_id: int) -> int | None:
-        store = storage.Storage(database, now=lambda: clock_value)
-        try:
-            barrier.wait()
-            return store.reserve(request_id, 100, 10, HAIKU_PRICES, one_request_budget)
-        finally:
-            store.close()
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(reserve, (201, 202)))
-
-    assert sum(result is not None for result in results) == 1
-
-
-def test_concurrent_ambient_attempts_cannot_cross_rate_limit(tmp_path) -> None:
-    database = str(tmp_path / "concurrent-rate.sqlite")
-    clock_value = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
-    storage.Storage(database, now=lambda: clock_value).close()
-    barrier = threading.Barrier(2)
-
-    def begin() -> bool:
-        store = storage.Storage(database, now=lambda: clock_value)
-        try:
-            barrier.wait()
-            return store.try_begin_ambient(1)
-        finally:
-            store.close()
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _: begin(), range(2)))
-
-    assert results.count(True) == 1
+def test_nano_amounts_render_as_exact_decimals() -> None:
+    # 2500 input at $1/Mtok plus 80 output at $5/Mtok = 0.0029 exactly.
+    cost = budget.token_cost_nano(2500, 80, "1.00", "5.00")
+    assert cost is not None
+    assert budget.nano_to_usd_string(cost) == "0.0029"
+    assert budget.nano_to_usd_string(0) == "0"
+    assert budget.nano_to_usd_string(-2_500_000_000) == "-2.5"
 
 
 def test_response_rejects_invalid_messages() -> None:

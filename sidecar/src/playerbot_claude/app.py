@@ -13,12 +13,13 @@ import configparser
 import json
 import os
 import signal
-import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from playerbot_claude import budget, claude, protocol, storage
+from playerbot_claude import budget, claude, ledger, protocol, state
+from playerbot_claude.budget import AdmissionDecision, RequestPriority
 
 CONFIG_SECTION = "worldserver"
 CONFIG_PREFIX = "PlayerbotClaude."
@@ -125,7 +126,6 @@ class SidecarConfig:
     human_budget_reserve_ratio: str = "0.25"
     input_usd_per_mtok: str = "1.00"
     output_usd_per_mtok: str = "5.00"
-    database_path: str = "playerbot_claude.sqlite"
     response_deadline_ms: int = 10000
     queue_size: int = 16
     group_cooldown_seconds: int = 120
@@ -153,24 +153,9 @@ class SidecarConfig:
             human_budget_reserve_ratio=option("HumanBudgetReserveRatio", "0.25"),
             input_usd_per_mtok=option("InputUsdPerMTok", "1.00"),
             output_usd_per_mtok=option("OutputUsdPerMTok", "5.00"),
-            database_path=option("SidecarDatabase", "playerbot_claude.sqlite"),
             response_deadline_ms=int(option("ResponseDeadlineMs", "10000")),
             queue_size=int(option("QueueSize", "16")),
             group_cooldown_seconds=int(option("GroupCooldownSeconds", "120")),
-        )
-
-    @property
-    def prices(self) -> storage.PriceSnapshot:
-        """The legacy SQLite pricing view, which still takes floats.
-
-        Kept only while storage.py exists. The float conversion reintroduces exactly the
-        rounding this task removes, which is why the budget path below does NOT use it:
-        `price_texts` hands the configured strings to the Decimal arithmetic in
-        `playerbot_claude.budget` untouched. When storage.py goes, this goes with it.
-        """
-
-        return storage.PriceSnapshot.from_usd_per_mtok(
-            float(Decimal(self.input_usd_per_mtok)), float(Decimal(self.output_usd_per_mtok))
         )
 
     @property
@@ -228,7 +213,7 @@ class SidecarConfig:
     def ambient_allowed(self) -> bool:
         return (
             self.ambient_world_enable
-            and 1 <= self.ambient_max_messages_per_hour <= storage.MAX_AMBIENT_MESSAGES_PER_HOUR
+            and 1 <= self.ambient_max_messages_per_hour <= ledger.MAX_AMBIENT_MESSAGES_PER_HOUR
         )
 
 
@@ -251,7 +236,7 @@ def bridge_token_from_environment() -> str | None:
     return token
 
 
-def doctor_report(config: SidecarConfig, store: storage.Storage | None = None) -> dict[str, object]:
+def doctor_report(config: SidecarConfig, budget_state: budget.BudgetState | None = None) -> dict[str, object]:
     """Health summary as JSON-safe data. Never contains a secret value."""
 
     token_present = bridge_token_from_environment() is not None
@@ -269,19 +254,62 @@ def doctor_report(config: SidecarConfig, store: storage.Storage | None = None) -
         "anthropic_api_key_present": api_key_present,
     }
 
-    if store is not None:
-        snapshot = store.rolling_budget_snapshot()
-        remaining = max(0, config.budget_nano - snapshot.spent_nano - snapshot.reserved_nano)
+    if budget_state is not None:
+        remaining = max(0, config.budget_nano - budget_state.committed_nano)
+        reserve_floor = budget.reserve_floor_nano(config.budget_nano, config.reserve_ratio)
         report["budget"] = {
-            "rolling_spent_usd": storage.nano_to_usd_string(snapshot.spent_nano),
-            "rolling_reserved_usd": storage.nano_to_usd_string(snapshot.reserved_nano),
-            "rolling_remaining_usd": storage.nano_to_usd_string(remaining),
-            "next_expiry_at": (
-                snapshot.next_expiry_at.isoformat() if snapshot.next_expiry_at is not None else None
-            ),
+            "settled_usd": budget.nano_to_usd_string(budget_state.settled_nano),
+            "outstanding_usd": budget.nano_to_usd_string(budget_state.outstanding_nano),
+            "remaining_usd": budget.nano_to_usd_string(remaining),
+            # What background work may not touch, so an operator can see why a bot went
+            # quiet while the headline remaining figure still looks healthy.
+            "human_reserve_usd": budget.nano_to_usd_string(reserve_floor),
+            "circuit_open": budget_state.circuit_open,
         }
+        if budget_state.circuit_open:
+            report["ok"] = False
 
     return report
+
+
+def _priority_for(request: protocol.ChatRequest) -> RequestPriority:
+    """Which budget lane one request belongs in.
+
+    A whisper, a party line, or a social reply has somebody standing there waiting for
+    an answer, so it draws on the protected reserve. Ambient World chatter and career
+    selection are work the server decided to do on its own: nobody is waiting, and a
+    quiet realm that spent its whole day on them would have nothing left the moment a
+    player finally spoke. That is the entire reason the reserve exists.
+    """
+
+    if request.is_ambient or request.is_career:
+        return RequestPriority.BACKGROUND
+
+    return RequestPriority.IMMEDIATE_HUMAN
+
+
+def _actual_cost_nano(usage: claude.UsageTotals, prices: tuple[str, str]) -> int:
+    """What a completed call really cost, from the provider's own token counts.
+
+    Cache tokens are counted at the plain input rate. Nothing in this sidecar sends a
+    cache_control block, so both counts are always zero today; charging them at the
+    ordinary rate means that if prompt caching is ever turned on, the ledger over-counts
+    cache reads rather than under-counting cache writes. Over-counting is the safe
+    direction under a ceiling. Real cache pricing needs its own configured rates.
+
+    An unpriceable completion raises rather than settling. Returning zero would record
+    real spending as free, which is the one outcome a ceiling cannot survive; raising
+    leaves the reservation charged at its maximum for the ledger's expiry to reclaim.
+    """
+
+    input_tokens = usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
+    cost = budget.token_cost_nano(input_tokens, usage.output_tokens, *prices)
+    if cost is None:
+        # Unreachable while generation_allowed gates the request path on usable prices,
+        # and deliberately not a silent zero if that ever stops being true.
+        raise ValueError("completed a request whose cost cannot be priced")
+
+    return cost
 
 
 class SidecarService:
@@ -294,7 +322,11 @@ class SidecarService:
     worker thread (Python cannot interrupt it; the client timeout, capped at the
     same deadline, bounds it). That is safe: httpx clients are thread-safe, and a
     cancelled request can never settle or write conversation memory, so its
-    reservation stays charged at maximum.
+    reservation stays charged at maximum until the ledger's expiry reclaims it.
+
+    The lock is a courtesy rather than the guarantee. The ledger's own day-row lock is
+    what actually makes the ceiling hold, and it holds across processes, which this
+    lock cannot: two sidecars against one database are correct, and were not before.
     """
 
     def __init__(
@@ -302,7 +334,8 @@ class SidecarService:
         config: SidecarConfig,
         token: str,
         adapter: claude.ClaudeAdapter | None = None,
-        store: storage.Storage | None = None,
+        store: state.SidecarState | None = None,
+        now=None,
     ) -> None:
         self._config = config
         self._token = token
@@ -310,6 +343,7 @@ class SidecarService:
         # a provider call cannot outlive the request that paid for it.
         self._adapter = adapter or claude.ClaudeAdapter(timeout_seconds=config.response_deadline_ms / 1000)
         self._store = store
+        self._now = now or (lambda: datetime.now(UTC))
         self._generation_lock = asyncio.Lock()
 
     async def process_payload(self, payload: bytes) -> bytes | None:
@@ -340,78 +374,98 @@ class SidecarService:
             return None
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:
+        if self._store is None:
+            _log(f"request {request.request_id}: no durable state is open, staying silent")
+            return None
+
+        store = self._store
+        input_prices = self._config.price_texts
+
         async with self._generation_lock:
-            if request.is_ambient:
-                if self._store is None or not self._store.try_begin_ambient(
-                    self._config.ambient_max_messages_per_hour
-                ):
-                    _log(f"request {request.request_id}: ambient rate exhausted, staying silent")
-                    return None
+            now = self._now()
 
-            if self._store is not None:
-                self._store.record_profile(request)
-            history = self._history_for(request)
+            if request.is_ambient and not await store.try_begin_ambient(
+                messages_per_hour=self._config.ambient_max_messages_per_hour, now=now
+            ):
+                _log(f"request {request.request_id}: ambient rate exhausted, staying silent")
+                return None
 
-            reservation: int | None = None
-            if self._store is not None:
-                try:
-                    input_tokens = await asyncio.to_thread(self._adapter.count_input_tokens, request, history)
-                except claude.ClaudeError as error:
-                    _log(f"request {request.request_id}: {type(error).__name__}: {error}")
-                    return None
+            await store.record_profile(request, now=now)
+            history = await self._history_for(request)
 
-                if input_tokens > claude.MAX_INPUT_TOKENS:
-                    _log(
-                        f"request {request.request_id}: prompt is {input_tokens} tokens "
-                        f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
-                    )
-                    return None
+            try:
+                input_tokens = await asyncio.to_thread(self._adapter.count_input_tokens, request, history)
+            except claude.ClaudeError as error:
+                _log(f"request {request.request_id}: {type(error).__name__}: {error}")
+                return None
 
-                reservation = self._store.reserve(
-                    request.request_id,
-                    input_tokens,
-                    claude.MAX_OUTPUT_TOKENS,
-                    self._config.prices,
-                    self._config.budget_nano,
+            if input_tokens > claude.MAX_INPUT_TOKENS:
+                _log(
+                    f"request {request.request_id}: prompt is {input_tokens} tokens "
+                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
                 )
-                if reservation is None:
-                    _log(f"request {request.request_id}: budget exhausted, staying silent")
-                    return None
-                self._store.mark_submitted(reservation)
+                return None
+
+            max_cost_nano = budget.conservative_max_cost_nano(
+                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+            )
+            decision, reservation = await store.reserve(
+                request_id=request.request_id,
+                max_cost_nano=max_cost_nano,
+                priority=_priority_for(request),
+                now=now,
+            )
+            if decision is not AdmissionDecision.ADMITTED or reservation is None:
+                _log(f"request {request.request_id}: {decision.value}, staying silent")
+                return None
 
             try:
                 reply, usage = await asyncio.to_thread(self._adapter.generate_reply, request, history)
             except claude.ClaudeError as error:
-                # Fail closed on money: an unsettled reservation deliberately stays
-                # charged at its maximum cost until it leaves the rolling 24 hour window.
+                # The reservation is given back rather than left to expire. The call
+                # raised before any completion existed, so no tokens were billed, and
+                # holding the maximum for ten minutes would deny a request that the
+                # budget can in fact afford. A failure the sidecar never learns about
+                # (a crash, a cancelled deadline) still falls through to expiry.
+                await store.release(reservation=reservation)
                 _log(f"request {request.request_id}: {type(error).__name__}: {error}")
                 return None
 
-            if self._store is not None:
-                if reservation is not None:
-                    self._store.settle(
-                        reservation, usage.input_tokens, usage.output_tokens, self._config.prices
-                    )
-                if request.is_career:
-                    decision = claude.CareerReply.model_validate_json(reply)
-                    self._store.record_career_decision(
-                        request.bot_guid,
-                        request.career_content.career_version,
-                        decision.candidate_token,
-                        decision.spending_style,
-                    )
-                elif not request.is_ambient:
-                    self._store.append_turn(request.bot_guid, "user", claude.build_user_message(request))
-                    self._store.append_turn(request.bot_guid, "assistant", reply)
+            settled_at = self._now()
+            await store.settle(
+                reservation=reservation,
+                actual_cost_nano=_actual_cost_nano(usage, input_prices),
+                now=settled_at,
+            )
+
+            if request.is_career:
+                choice = claude.CareerReply.model_validate_json(reply)
+                await store.record_career_decision(
+                    bot_guid=request.bot_guid,
+                    career_version=request.career_content.career_version,
+                    candidate_token=choice.candidate_token,
+                    spending_style=choice.spending_style,
+                    now=settled_at,
+                )
+            elif not request.is_ambient:
+                await store.append_turn(
+                    bot_guid=request.bot_guid,
+                    role="user",
+                    content=claude.build_user_message(request),
+                    now=settled_at,
+                )
+                await store.append_turn(
+                    bot_guid=request.bot_guid, role="assistant", content=reply, now=settled_at
+                )
 
         _log(f"request {request.request_id}: replied ({usage.input_tokens} in, {usage.output_tokens} out)")
         return protocol.encode_response(request.request_id, reply, self._token)
 
-    def _history_for(self, request: protocol.ChatRequest) -> list[tuple[str, str]]:
+    async def _history_for(self, request: protocol.ChatRequest) -> list[tuple[str, str]]:
         if self._store is None or request.is_ambient or request.is_career:
             return []
 
-        return self._store.recent_turns(request.bot_guid)
+        return await self._store.recent_turns(bot_guid=request.bot_guid)
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -447,11 +501,23 @@ async def serve(
     config: SidecarConfig,
     token: str,
     adapter: claude.ClaudeAdapter | None = None,
-    store: storage.Storage | None = None,
+    store: state.SidecarState | None = None,
+    database: PlayerbotsDatabaseSettings | None = None,
 ) -> None:
-    owned_store = store is None
+    """Runs the loopback server until SIGINT or SIGTERM.
+
+    Opens the pool only when the caller did not supply a state, so a test can drive the
+    real server loop without a database while the deployed path always has one.
+    """
+
+    pool = None
     if store is None:
-        store = storage.Storage(config.database_path)
+        if database is None:
+            raise ValueError("serve needs either an open state or the Playerbots database settings")
+
+        store, pool = await state.open_state(
+            database, ceiling_nano=config.budget_nano, reserve_ratio=config.reserve_ratio
+        )
 
     try:
         service = SidecarService(config=config, token=token, adapter=adapter, store=store)
@@ -470,8 +536,8 @@ async def serve(
         async with server:
             await stop.wait()
     finally:
-        if owned_store:
-            store.close()
+        if pool is not None:
+            await state.close_pool(pool)
 
     _log("shutting down")
 
@@ -480,49 +546,72 @@ def _log(message: str) -> None:
     print(f"playerbot-claude: {message}", file=sys.stderr, flush=True)
 
 
-def _open_store(config: SidecarConfig) -> storage.Storage | None:
+async def _with_state(config: SidecarConfig, database: PlayerbotsDatabaseSettings, work):
+    """Runs one coroutine against an open state, and always closes the pool."""
+
+    store, pool = await state.open_state(
+        database, ceiling_nano=config.budget_nano, reserve_ratio=config.reserve_ratio
+    )
     try:
-        return storage.Storage(config.database_path)
-    except sqlite3.Error:
-        return None
+        return await work(store)
+    finally:
+        await state.close_pool(pool)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="playerbot-claude")
     parser.add_argument("command", choices=["serve", "doctor", "profile"])
     parser.add_argument("--config", required=True, help="Path to mod_playerbot_claude.conf")
+    parser.add_argument(
+        "--playerbots-config",
+        required=True,
+        help=(
+            "Path to the deployed playerbots.conf holding PlayerbotsDatabaseInfo. "
+            "Read rather than duplicated, so there is only one copy of the credentials."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     parser.add_argument("--bot-guid", type=int, help="Bot GUID counter (profile command)")
     arguments = parser.parse_args(argv)
 
     config = SidecarConfig.load(arguments.config)
 
+    try:
+        database = PlayerbotsDatabaseSettings.load(arguments.playerbots_config)
+    except (OSError, ValueError) as error:
+        # str(error) is the parser's own message, which names the setting and the file
+        # but never the value it failed to parse.
+        _log(f"cannot read PlayerbotsDatabaseInfo: {error}")
+        return 1
+
     if arguments.command == "doctor":
-        store = _open_store(config)
         try:
-            report = doctor_report(config, store=store)
-        finally:
-            if store is not None:
-                store.close()
+            budget_state = asyncio.run(
+                _with_state(config, database, lambda store: store.budget_state(now=datetime.now(UTC)))
+            )
+        except OSError as error:
+            _log(f"cannot reach the Playerbots database: {type(error).__name__}")
+            budget_state = None
+        report = doctor_report(config, budget_state=budget_state)
+        report["database_reachable"] = budget_state is not None
+        if budget_state is None:
+            report["ok"] = False
         print(json.dumps(report, indent=None if arguments.json else 2))
         return 0 if report["ok"] else 1
 
     if arguments.command == "profile":
         if arguments.bot_guid is None:
             parser.error("profile requires --bot-guid")
-        store = _open_store(config)
-        profile = None
-        if store is not None:
-            try:
-                profile = store.get_profile(arguments.bot_guid)
-            finally:
-                store.close()
+        bot_guid = arguments.bot_guid
+        profile = asyncio.run(
+            _with_state(config, database, lambda store: store.get_profile(bot_guid=bot_guid))
+        )
         if profile is None:
             # A bot that has never spoken through the bridge has no trustworthy
             # observed profile to report.
-            print(json.dumps({"bot_guid": arguments.bot_guid, "observed": False}))
+            print(json.dumps({"bot_guid": bot_guid, "observed": False}))
         else:
-            print(json.dumps({"bot_guid": arguments.bot_guid, "observed": True, "profile": profile}))
+            print(json.dumps({"bot_guid": bot_guid, "observed": True, "profile": profile}))
         return 0
 
     token = bridge_token_from_environment()
@@ -541,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         _log("disabled by configuration (PlayerbotClaude.Enable / BridgePort); refusing to start")
         return 1
 
-    asyncio.run(serve(config, token))
+    asyncio.run(serve(config, token, database=database))
     return 0
 
 

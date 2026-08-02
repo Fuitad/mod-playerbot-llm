@@ -90,6 +90,19 @@ def usd_to_nano(usd: Decimal | str | int | float) -> int:
     return int((amount * NANO).to_integral_value())
 
 
+def nano_to_usd_string(nano: int) -> str:
+    """Exact decimal rendering of nano-USD, without float artifacts (2900000 -> "0.0029").
+
+    Built by integer division rather than by formatting a float, so a reported figure is
+    the ledger's figure and not the nearest double to it.
+    """
+
+    sign = "-" if nano < 0 else ""
+    whole, fraction = divmod(abs(nano), NANO)
+    digits = f"{fraction:09d}".rstrip("0")
+    return f"{sign}{whole}.{digits}" if digits else f"{sign}{whole}"
+
+
 def validate_daily_ceiling(usd: Decimal | str | int) -> int:
     """The configured ceiling is the sole limit. Returns it in nano-USD.
 
@@ -135,21 +148,20 @@ def reserve_floor_nano(ceiling_nano: int, reserve_ratio: Decimal) -> int:
     return int((Decimal(ceiling_nano) * reserve_ratio).to_integral_value(rounding="ROUND_CEILING"))
 
 
-def conservative_max_cost_nano(
+def token_cost_nano(
     input_tokens: int,
-    max_output_tokens: int,
+    output_tokens: int,
     input_usd_per_mtok: Decimal | str | int | None,
     output_usd_per_mtok: Decimal | str | int | None,
 ) -> int | None:
-    """The most this request could possibly cost, or None when that cannot be known.
+    """What a given token count costs, or None when that cannot be known.
 
-    Charged up front at the maximum rather than estimated, because an estimate that is
-    ever low is a ceiling that can be crossed. Unknown pricing returns None and the
-    caller denies: a request whose cost cannot be bounded cannot be admitted under a
-    ceiling, and guessing a price is how a budget silently stops being one.
+    Unknown or nonsensical pricing returns None rather than a guess. A cost that cannot
+    be computed cannot be admitted under a ceiling, and inventing a price is how a budget
+    silently stops being one.
     """
 
-    if input_tokens < 0 or max_output_tokens < 0:
+    if input_tokens < 0 or output_tokens < 0:
         return None
 
     if input_usd_per_mtok is None or output_usd_per_mtok is None:
@@ -167,10 +179,28 @@ def conservative_max_cost_nano(
     if input_price < 0 or output_price < 0:
         return None
 
-    per_token = (input_price * input_tokens + output_price * max_output_tokens) / Decimal(1_000_000)
+    per_token = (input_price * input_tokens + output_price * output_tokens) / Decimal(1_000_000)
 
-    # Rounded UP. A maximum that rounds down is not a maximum.
+    # Rounded UP, in both of this function's uses. For the reservation, a maximum that
+    # rounds down is not a maximum. For the settlement, rounding a sub-nano fraction
+    # toward the ceiling keeps the error on the side that protects the budget.
     return int((per_token * NANO).to_integral_value(rounding="ROUND_CEILING"))
+
+
+def conservative_max_cost_nano(
+    input_tokens: int,
+    max_output_tokens: int,
+    input_usd_per_mtok: Decimal | str | int | None,
+    output_usd_per_mtok: Decimal | str | int | None,
+) -> int | None:
+    """The most this request could possibly cost, or None when that cannot be known.
+
+    Charged up front at the maximum output length rather than estimated, because an
+    estimate that is ever low is a ceiling that can be crossed. The caller denies on
+    None: a request whose cost cannot be bounded cannot be admitted under a bound.
+    """
+
+    return token_cost_nano(input_tokens, max_output_tokens, input_usd_per_mtok, output_usd_per_mtok)
 
 
 def admit(

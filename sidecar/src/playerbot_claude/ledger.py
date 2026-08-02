@@ -196,8 +196,17 @@ class BudgetLedger:
 
     async def ensure_schema(self, connection) -> None:
         async with connection.cursor() as cursor:
-            for statement in SCHEMA_STATEMENTS:
-                await cursor.execute(statement)
+            # Every start after the first would otherwise print one "table already
+            # exists" note per table. The driver surfaces those as Python warnings on
+            # stderr, which buries a real message in seven fake ones and, for the CLI
+            # commands, prints ahead of the JSON somebody is trying to read. Silenced at
+            # the server for this connection only; genuine errors still raise.
+            await cursor.execute("SET sql_notes = 0")
+            try:
+                for statement in SCHEMA_STATEMENTS:
+                    await cursor.execute(statement)
+            finally:
+                await cursor.execute("SET sql_notes = 1")
 
             # The retired key shapes are deliberately NOT deleted here.
             #
@@ -312,12 +321,31 @@ class BudgetLedger:
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
+    async def _next_attempt(self, cursor, request_id: int) -> int:
+        """The next unused attempt number for one request id.
+
+        Reads the unique key's own leading column, so this is an index lookup rather than
+        a scan, and it runs inside the day lock so two reservations on the same day
+        cannot derive the same number. Two reservations for one request id racing across
+        a UTC midnight would hold different day locks and could; the unique key refuses
+        the second, the transaction rolls back, and the request fails closed rather than
+        quietly sharing a reservation.
+        """
+
+        await cursor.execute(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM playerbot_claude_budget_reservation "
+            "WHERE request_id = %s",
+            (request_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 1
+
     async def reserve(
         self,
         connection,
         *,
         request_id: int,
-        attempt: int,
+        attempt: int | None = None,
         max_cost_nano: int | None,
         priority: RequestPriority,
         now: datetime,
@@ -328,6 +356,15 @@ class BudgetLedger:
         applying the policy, and inserting the row are one atomic step, which is what
         makes Definition of Done 1 hold: two concurrent callers cannot both see the same
         remaining budget.
+
+        ``attempt`` defaults to the next unused number for this request id. The
+        worldserver's request ids come from a per-process counter that restarts at 1, so
+        they are unique only within one worldserver run: after a restart, request id 1
+        comes round again and a fixed attempt of 1 would collide with the row the
+        previous run left behind. Deriving it means a repeat of any kind, a genuine
+        retry or a counter that wrapped back over a restart, gets its own reservation and
+        its own cost record rather than a duplicate key error, which is Definition of
+        Done 3. Callers that know their own attempt number may still pass one.
         """
 
         day = utc_day(now)
@@ -336,6 +373,9 @@ class BudgetLedger:
             async with connection.cursor() as cursor:
                 settled, circuit_open = await self._lock_day(cursor, day)
                 outstanding = await self._outstanding_nano(cursor, day, now)
+
+                if attempt is None:
+                    attempt = await self._next_attempt(cursor, request_id)
 
                 decision = budget.admit(
                     ceiling_nano=self._ceiling_nano,

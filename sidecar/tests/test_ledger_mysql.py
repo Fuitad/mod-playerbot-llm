@@ -12,13 +12,18 @@ removes it afterwards. It never touches a MySQL server that is already running.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import aiomysql
 import pytest
 
-from playerbot_claude import budget, ledger
+from playerbot_claude import budget, ledger, protocol
+from playerbot_claude import state as state_module
+from playerbot_claude.app import PlayerbotsDatabaseSettings
 from playerbot_claude.budget import AdmissionDecision, RequestPriority
 
 pytestmark = [pytest.mark.mysql, pytest.mark.asyncio]
@@ -28,7 +33,6 @@ DSN = os.environ.get("PLAYERBOT_CLAUDE_TEST_MYSQL_DSN")
 if not DSN:  # pragma: no cover - the skip is the point
     pytest.skip("PLAYERBOT_CLAUDE_TEST_MYSQL_DSN is not set", allow_module_level=True)
 
-aiomysql = pytest.importorskip("aiomysql")
 
 CEILING = budget.usd_to_nano("10.00")
 QUARTER = Decimal("0.25")
@@ -37,27 +41,30 @@ NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 # More distinct bots than there are lock buckets, so the bound is actually exercised.
 CONVERSATION_LOCK_SAMPLE = 400
 
-
-def _dsn_parts() -> dict[str, object]:
-    settings = _settings()
-    return {
-        "host": settings.host,
-        "port": settings.port,
-        "user": settings.user,
-        "password": settings.password,
-        "db": settings.database,
-        "autocommit": False,
-    }
+# Same fixture token the unit suite uses; the protocol only checks length and match.
+TOKEN = "0123456789abcdef0123456789abcdef"
 
 
-def _settings():
-    from playerbot_claude.app import PlayerbotsDatabaseSettings
-
+def _settings() -> PlayerbotsDatabaseSettings:
+    # The module-level skip above already guarantees this; restating it keeps the type
+    # checker honest without a cast that would also hide a real None.
+    assert DSN is not None
     return PlayerbotsDatabaseSettings.parse_info(DSN)
 
 
-async def _connect():
-    return await aiomysql.connect(**_dsn_parts())
+async def _connect() -> aiomysql.Connection:
+    # Spelled out rather than splatted from a dict: a **kwargs splat makes every argument
+    # an untyped object, so a misspelled or wrongly typed connection setting reaches the
+    # driver instead of the type checker.
+    settings = _settings()
+    return await aiomysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        db=settings.database,
+        autocommit=False,
+    )
 
 
 @pytest.fixture
@@ -770,3 +777,145 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     # The live keys survive, and so does the low numbered conversation key, which is
     # indistinguishable from a valid bucket.
     assert [r[0] for r in rows] == ["ambient", "budget_day", "conversation:5"]
+
+
+# The façade the service actually talks to ------------------------------------------
+
+
+@pytest.fixture
+async def mysql_state() -> AsyncIterator[tuple[state_module.MySqlSidecarState, aiomysql.Pool]]:
+    """A real MySqlSidecarState over a real pool.
+
+    The unit suite substitutes an in-memory double for this interface, which proves the
+    service's ordering but proves nothing about the delegation itself. A field passed to
+    the wrong parameter, or a connection returned to the pool mid-transaction, is
+    invisible there and visible here.
+    """
+    settings = _settings()
+    state, pool = await state_module.open_state(settings, ceiling_nano=CEILING, reserve_ratio=QUARTER)
+    async with pool.acquire() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute("DELETE FROM playerbot_claude_budget_reservation")
+            await cursor.execute("DELETE FROM playerbot_claude_budget_day")
+            await cursor.execute("DELETE FROM playerbot_claude_profile")
+        await connection.commit()
+    try:
+        yield state, pool
+    finally:
+        await state_module.close_pool(pool)
+
+
+async def test_the_state_facade_carries_every_profile_field_to_the_right_column(mysql_state) -> None:
+    """A swapped pair of affinities is a silent personality change, so read them back.
+
+    Both the double and the real implementation take a whole request, so a mismatched
+    unpacking would agree with itself everywhere except here.
+    """
+    state, _ = mysql_state
+
+    request = protocol.parse_request(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "token": TOKEN,
+                "request_id": 1,
+                "channel": "whisper",
+                "bot_guid": 4242,
+                "speaker_guid": 9001,
+                "bot_name": "Facadebot",
+                "speaker_name": "Speaker",
+                "profile_version": 2,
+                # Deliberately all different, so any two swapped fields fail.
+                "crafting_affinity": 11,
+                "gathering_affinity": 22,
+                "exploration_affinity": 33,
+                "sociability": 44,
+                "voice": "wry",
+                "event_kind": 0,
+                "subject_id": 0,
+                "occurrence": 0,
+                "message": "hello",
+            }
+        ).encode(),
+        TOKEN,
+    )
+
+    await state.record_profile(request, now=NOW)
+
+    assert await state.get_profile(bot_guid=4242) == {
+        "profile_version": 2,
+        "crafting_affinity": 11,
+        "gathering_affinity": 22,
+        "exploration_affinity": 33,
+        "sociability": 44,
+        "voice": "wry",
+        "bot_name": "Facadebot",
+    }
+
+
+async def test_the_state_facade_reserves_settles_and_reports(mysql_state) -> None:
+    state, _ = mysql_state
+    one = budget.usd_to_nano("1.00")
+
+    decision, reservation = await state.reserve(
+        request_id=501, max_cost_nano=one, priority=RequestPriority.IMMEDIATE_HUMAN, now=NOW
+    )
+    assert decision is AdmissionDecision.ADMITTED
+    assert reservation is not None
+    assert (await state.budget_state(now=NOW)).outstanding_nano == one
+
+    assert await state.settle(reservation=reservation, actual_cost_nano=one // 4, now=NOW) is True
+
+    after = await state.budget_state(now=NOW)
+    assert after.outstanding_nano == 0
+    assert after.settled_nano == one // 4
+
+
+async def test_the_state_facade_never_leaks_a_transaction_back_into_the_pool(mysql_state) -> None:
+    """aiomysql DISCARDS a connection released mid-transaction, so a leak is invisible.
+
+    It shows up only as connection churn: every read silently closes a socket and opens
+    a new one. Reads are the risk, because autocommit is off and even a bare SELECT
+    starts a transaction that nothing then closes.
+    """
+    state, pool = mysql_state
+
+    for _ in range(4):
+        await state.get_profile(bot_guid=999999)
+        await state.recent_turns(bot_guid=999999)
+        await state.budget_state(now=NOW)
+
+    assert pool.size <= state_module.POOL_MAX_SIZE
+    assert pool.freesize == pool.size, "a connection was discarded, so one was released mid-transaction"
+
+
+async def test_a_repeated_request_id_gets_its_own_attempt_rather_than_a_duplicate_key(
+    mysql_state,
+) -> None:
+    """The worldserver's request ids restart at 1 on every process start.
+
+    So request id 1 comes round again after a restart. With a fixed attempt number the
+    second reservation violates the (request_id, attempt) unique key and the request
+    fails; deriving the attempt is what makes Definition of Done 3 hold for a repeat of
+    any kind.
+    """
+    state, pool = mysql_state
+    one = budget.usd_to_nano("1.00")
+
+    for _ in range(3):
+        decision, reservation = await state.reserve(
+            request_id=1, max_cost_nano=one, priority=RequestPriority.IMMEDIATE_HUMAN, now=NOW
+        )
+        assert decision is AdmissionDecision.ADMITTED
+        assert reservation is not None
+
+    async with pool.acquire() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT attempt FROM playerbot_claude_budget_reservation "
+                "WHERE request_id = 1 ORDER BY attempt"
+            )
+            rows = await cursor.fetchall()
+        await connection.commit()
+
+    assert [int(row[0]) for row in rows] == [1, 2, 3]

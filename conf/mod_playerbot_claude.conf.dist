@@ -90,13 +90,21 @@ PlayerbotClaude.InputUsdPerMTok = 1.00
 PlayerbotClaude.OutputUsdPerMTok = 5.00
 
 #
-#    PlayerbotClaude.SidecarDatabase
-#        Description: Path of the sidecar's SQLite database (profiles, bounded conversation
-#                     memory, budget ledger). Relative paths resolve against the sidecar's
-#                     working directory. Only the sidecar reads this file.
-#        Default:     "playerbot_claude.sqlite"
-
-PlayerbotClaude.SidecarDatabase = "playerbot_claude.sqlite"
+#    PlayerbotClaude.SidecarDatabase (REMOVED)
+#        The sidecar no longer keeps its own SQLite file. Profiles, conversation memory,
+#        career decisions, the ambient rate, and the budget ledger all live in the shared
+#        acore_playerbots database now, so the budget holds across sidecar restarts and
+#        across two sidecars pointed at one realm.
+#
+#        The sidecar reads those connection settings from the deployed playerbots.conf
+#        rather than duplicating them here: pass --playerbots-config /path/to/playerbots.conf
+#        alongside --config. A second copy of the credentials is a second thing to rotate,
+#        and the one that gets missed is the one that keeps working with the old password
+#        until it suddenly does not.
+#
+#        A leftover PlayerbotClaude.SidecarDatabase line is ignored. Nothing migrates the
+#        old file; the ledger starts empty.
+#
 
 #
 #    PlayerbotClaude.ResponseDeadlineMs

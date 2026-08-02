@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pytest
+from fakes import FakeState
 
-from playerbot_claude import app, claude, protocol, storage
+from playerbot_claude import app, claude, protocol
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -72,14 +73,21 @@ class FakeAdapter(claude.ClaudeAdapter):
 class Harness:
     server: asyncio.Server
     port: int
-    store: storage.Storage
+    store: FakeState
     adapter: FakeAdapter
 
 
 @asynccontextmanager
-async def running_sidecar(tmp_path, budget: float = 1.0):
+async def running_sidecar(tmp_path, budget: str = "1.0"):
+    """The real server loop over an in-memory state.
+
+    What these tests are for is the cross-process contract: framing, authentication,
+    silence, reconnection, shutdown. Pointing them at a real MySQL would make every one
+    of them a database test that fails for database reasons, and the ledger's own
+    behaviour is already proven against a live server in tests/test_ledger_mysql.py.
+    """
+
     adapter = FakeAdapter()
-    store = storage.Storage(str(tmp_path / "integration.sqlite"))
     config = app.SidecarConfig(
         enable=True,
         bridge_port=0,
@@ -87,6 +95,7 @@ async def running_sidecar(tmp_path, budget: float = 1.0):
         ambient_max_messages_per_hour=6,
         daily_budget_usd=budget,
     )
+    store = FakeState(config.budget_nano, config.reserve_ratio)
     service = app.SidecarService(config=config, token=TEST_TOKEN, adapter=adapter, store=store)
     server = await asyncio.start_server(service.handle_connection, host="127.0.0.1", port=0)
     port = server.sockets[0].getsockname()[1]
@@ -95,7 +104,6 @@ async def running_sidecar(tmp_path, budget: float = 1.0):
     finally:
         server.close()
         await server.wait_closed()
-        store.close()
 
 
 async def round_trip(port: int, payload: bytes) -> dict[str, object]:
@@ -119,10 +127,10 @@ async def test_authenticated_request_round_trips_over_real_socket(tmp_path) -> N
         assert response["token"] == TEST_TOKEN
 
         # The full pipeline ran: profile stored, memory appended, budget settled.
-        assert harness.store.get_profile(42) is not None
-        assert len(harness.store.recent_turns(42)) == 2
-        assert harness.store.spent_nano() > 0
-        assert harness.store.outstanding_nano() == 0
+        assert harness.store.profiles.get(42) is not None
+        assert len(harness.store.turns[42]) == 2
+        assert harness.store.settled_nano > 0
+        assert harness.store.outstanding == {}
 
 
 async def test_wrong_token_closes_connection_and_server_keeps_accepting(tmp_path) -> None:
@@ -164,11 +172,11 @@ async def test_oversized_input_is_silent_and_connection_survives(tmp_path) -> No
             await writer.wait_closed()
 
         assert len(harness.adapter.requests) == 1
-        assert harness.store.outstanding_nano() == 0
+        assert harness.store.outstanding == {}
 
 
 async def test_exhausted_budget_is_silent(tmp_path) -> None:
-    async with running_sidecar(tmp_path, budget=0.000001) as harness:
+    async with running_sidecar(tmp_path, budget="0.000001") as harness:
         reader, writer = await asyncio.open_connection("127.0.0.1", harness.port)
         writer.write(protocol.encode_frame(request_payload()))
         writer.write_eof()
@@ -180,7 +188,7 @@ async def test_exhausted_budget_is_silent(tmp_path) -> None:
         await writer.wait_closed()
 
         assert harness.adapter.requests == []
-        assert harness.store.outstanding_nano() == 0
+        assert harness.store.outstanding == {}
 
 
 async def test_reconnect_preserves_conversation_memory(tmp_path) -> None:
