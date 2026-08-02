@@ -251,23 +251,14 @@ namespace
          * the exchange and every rule about what an answer means. False is ProviderFailed, which the
          * coordinator turns into silence.
          */
-        bool Submit(uint64 requestToken, uint64 botGuidCounter, PlayerbotSocialChannel channel,
-                    std::string const& threadPublicId) override
+        bool Submit(uint64 requestToken, uint64 botGuidCounter, uint64 targetGuidCounter,
+                    PlayerbotSocialChannel channel, std::string const& threadPublicId) override
         {
             if (!_socialTransport || !_bridge)
                 return false;
 
             Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(botGuidCounter));
             if (!bot || !bot->IsInWorld())
-                return false;
-
-            /*
-             * The coordinator's own record is the only authority on who this line is for. Re-deriving
-             * the target from the thread would be a second answer to a question that already has one,
-             * and the two would disagree the moment a thread moved on.
-             */
-            PlayerbotSocialPendingDelivery pending;
-            if (!sPlayerbotSocialMgr.PendingDeliveryFor(requestToken, pending))
                 return false;
 
             SocialRequest request;
@@ -283,13 +274,12 @@ namespace
              * guid with no name, or a name for somebody who logged out, would travel as a participant
              * the prompt builder would then describe as present.
              */
-            if (pending.targetGuidCounter)
+            if (targetGuidCounter)
             {
-                Player* target =
-                    ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(pending.targetGuidCounter));
+                Player* target = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(targetGuidCounter));
                 if (target && target->IsInWorld())
                 {
-                    request.subject.guidCounter = pending.targetGuidCounter;
+                    request.subject.guidCounter = targetGuidCounter;
                     request.subject.name = target->GetName();
                     request.subject.human = !GET_PLAYERBOT_AI(target);
                 }

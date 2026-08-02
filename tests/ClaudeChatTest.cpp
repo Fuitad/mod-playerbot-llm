@@ -1601,3 +1601,53 @@ TEST(ClaudeChatSocialTransportTest, TheTransportRefusesBeyondItsOutstandingBound
     EXPECT_EQ(transport.OutstandingCount(), ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS);
     EXPECT_FALSE(transport.Submit(MakeSocialRequest(ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS + 1)));
 }
+
+TEST(ClaudeChatSocialTransportTest, ARequestNothingEverAnswersIsReleasedByItsOwnDeadline)
+{
+    /*
+     * Most ways a request dies are SILENT. A sidecar that accepts the frame and never replies
+     * produces no payload at all, so classification never runs and nothing would ever erase the
+     * exchange. Without a deadline the map fills with dead entries and the transport then refuses
+     * every later request for the rest of the uptime, which is a permanent outage produced by a
+     * temporary one.
+     */
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    // A deadline short enough to observe, and far below the coordinator's own 30 second timeout.
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 200);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+    EXPECT_EQ(transport.OutstandingCount(), 1u);
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = DrainWithin(transport, 5000);
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].socialRequestToken, 77u);
+    EXPECT_EQ(drained[0].outcome, ClaudeChat::SocialExchangeOutcome::Abandon);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, TheBoundRecoversOnceDeadRequestsExpire)
+{
+    // The bound is a ceiling on LIVE requests, not a lifetime quota. A transport that filled up and
+    // stayed full would be indistinguishable from one that had simply stopped working.
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port(), 4096));
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 150);
+    for (std::size_t i = 0; i < ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS; ++i)
+        ASSERT_TRUE(transport.Submit(MakeSocialRequest(i + 1)));
+
+    EXPECT_FALSE(transport.Submit(MakeSocialRequest(ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS + 1)));
+
+    EXPECT_TRUE(WaitFor([&]() {
+        transport.Drain();
+        return transport.OutstandingCount() == 0;
+    }, 5000));
+
+    EXPECT_TRUE(transport.Submit(MakeSocialRequest(ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS + 1)));
+}

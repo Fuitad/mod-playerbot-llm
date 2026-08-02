@@ -704,17 +704,39 @@ bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
     if (_exchanges.size() >= MAX_OUTSTANDING_SOCIAL_REQUESTS)
         return false;
 
-    if (!_bridge.TryEnqueueSocial(request, SteadyNowMs() + _requestDeadlineMs))
+    int64 const expiresAtSteadyMs = SteadyNowMs() + _requestDeadlineMs;
+    if (!_bridge.TryEnqueueSocial(request, expiresAtSteadyMs))
         return false;
 
     _exchanges.emplace(request.socialRequestToken,
-                       Outstanding{SocialExchange(request.socialRequestToken, request.bot.guidCounter), request});
+                       Outstanding{SocialExchange(request.socialRequestToken, request.bot.guidCounter), request,
+                                   expiresAtSteadyMs});
     return true;
 }
 
 std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Drain()
 {
     std::vector<Completed> completed;
+
+    /*
+     * Released first, because most ways a request dies never produce a payload at all: an expired
+     * queue entry, a request that could not be serialized, an oversize frame, a sidecar that never
+     * answered, a dropped connection, and an answer that arrived to a full response queue are all
+     * silent. Without this sweep those exchanges hold their slots forever, and 512 of them is a
+     * transport that refuses every subsequent request for the rest of the uptime.
+     */
+    int64 const nowMs = SteadyNowMs();
+    for (auto entry = _exchanges.begin(); entry != _exchanges.end();)
+    {
+        if (entry->second.expiresAtSteadyMs > nowMs)
+        {
+            ++entry;
+            continue;
+        }
+
+        completed.push_back(Completed{entry->first, SocialExchangeOutcome::Abandon, {}});
+        entry = _exchanges.erase(entry);
+    }
 
     for (SocialRawResponse const& raw : _bridge.DrainSocialResponses())
     {
@@ -736,8 +758,13 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
              * A regeneration the bridge will not take is the end of this exchange: the budget has
              * already been spent, so there is no second retry to fall back on.
              */
-            if (_bridge.TryEnqueueSocial(outstanding->second.request, SteadyNowMs() + _requestDeadlineMs))
+            int64 const retryExpiresAtSteadyMs = SteadyNowMs() + _requestDeadlineMs;
+            if (_bridge.TryEnqueueSocial(outstanding->second.request, retryExpiresAtSteadyMs))
             {
+                // The exchange's own deadline moves with the retry. Leaving it on the original would
+                // let the sweep above drop the exchange while its regeneration was still in flight,
+                // and the answer would then arrive for a token nobody is waiting on.
+                outstanding->second.expiresAtSteadyMs = retryExpiresAtSteadyMs;
                 completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Regenerate, {}});
                 continue;
             }

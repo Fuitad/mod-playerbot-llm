@@ -642,6 +642,18 @@ namespace ClaudeChat
         {
             SocialExchange exchange;
             SocialRequest request;
+
+            /*
+             * When this exchange stops being worth waiting for.
+             *
+             * Most ways a request dies are SILENT: it expired in the queue, it could not be
+             * serialized, its frame was oversize, the sidecar never answered, the connection dropped,
+             * or the answer arrived to a full response queue. None of those produce a payload, so
+             * Drain would never see them and the exchange would occupy one of the 512 slots for the
+             * rest of the uptime. A deadline is the only thing that can release a request nothing
+             * will ever report on.
+             */
+            int64 expiresAtSteadyMs = 0;
         };
 
         ClaudeBridge& _bridge;
