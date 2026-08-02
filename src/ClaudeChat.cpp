@@ -629,12 +629,21 @@ bool ClaudeChat::ActorIsUsable(Actor const& actor)
     if (actor.name.empty() || actor.name.size() > MAX_ACTOR_NAME_BYTES)
         return false;
 
-    // Characters as well as bytes. Counted as UTF-8 code points rather than as bytes, because
-    // twelve characters of a multibyte script is a legitimate name that a byte count would refuse.
-    if (utf8::distance(actor.name.begin(), actor.name.end()) > MAX_ACTOR_NAME_CHARACTERS)
+    /*
+     * Validity BEFORE the character count, and the order is load bearing rather than tidy.
+     *
+     * `utf8::distance` is the checked variant: it walks the string with `utf8::next`, which
+     * THROWS `utf8::invalid_utf8` on a malformed sequence. This runs on the world thread while a
+     * request is being assembled, so counting first would turn a malformed name into an exception
+     * escaping into the caller, which is a far worse outcome than the overlong name the count
+     * exists to refuse.
+     */
+    if (!IsSingleCleanLine(actor.name))
         return false;
 
-    return IsSingleCleanLine(actor.name);
+    // Characters as well as bytes. Counted as UTF-8 code points rather than as bytes, because
+    // twelve characters of a multibyte script is a legitimate name that a byte count would refuse.
+    return utf8::distance(actor.name.begin(), actor.name.end()) <= MAX_ACTOR_NAME_CHARACTERS;
 }
 
 bool ClaudeChat::SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome)

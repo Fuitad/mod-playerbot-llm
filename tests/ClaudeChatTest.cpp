@@ -1931,3 +1931,30 @@ TEST(ClaudeChatSocialProtocolTest, AnOverlongNameNeverReachesTheWire)
     atTheLimit.human = false;
     EXPECT_TRUE(ClaudeChat::ActorIsUsable(atTheLimit));
 }
+
+TEST(ClaudeChatSocialProtocolTest, AMalformedNameIsRefusedRatherThanThrowing)
+{
+    /*
+     * `utf8::distance` is the CHECKED variant: it walks the string with `utf8::next`, which
+     * THROWS `utf8::invalid_utf8` on a malformed sequence. This runs on the world thread while
+     * a request is being built, so an exception here is far worse than the overlong name the
+     * character count exists to refuse.
+     *
+     * The validity check therefore has to come first. This asserts refusal AND, by not
+     * crashing the test binary, that nothing escapes.
+     */
+    ClaudeChat::Actor malformed;
+    malformed.guidCounter = 500;
+    malformed.name = "Grim\xC3\x28" "bold";  // 0xC3 starts a two byte sequence; 0x28 cannot follow
+    malformed.human = false;
+
+    EXPECT_NO_THROW({ EXPECT_FALSE(ClaudeChat::ActorIsUsable(malformed)); });
+
+    // A lone continuation byte, which is invalid with no lead at all.
+    ClaudeChat::Actor orphaned;
+    orphaned.guidCounter = 500;
+    orphaned.name = "\x80Grim";
+    orphaned.human = false;
+
+    EXPECT_NO_THROW({ EXPECT_FALSE(ClaudeChat::ActorIsUsable(orphaned)); });
+}
