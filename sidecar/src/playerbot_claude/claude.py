@@ -11,6 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal, cast
 
 import anthropic
@@ -105,6 +106,36 @@ class ClaudeProviderError(ClaudeError):
     pass
 
 
+class ModerationCategory(StrEnum):
+    """Why a generated answer was refused.
+
+    Objective in the sense that each one is a property of the text, decidable by reading it,
+    rather than a judgement two people could reasonably disagree about. "Broke character" and
+    "carried document structure" are checkable; "unhelpful" or "low quality" would not be, and
+    are deliberately absent.
+
+    These are the categories Key Decision 2 asks for, and they are produced by the
+    deterministic gate rather than reported by the model. A model that labels its own output
+    is vouching for itself, which Key Decision 6 forbids.
+
+    Values are stable strings because durable telemetry and the operator page will carry them.
+    Append, never rename.
+    """
+
+    EMPTY = "empty"
+    NOT_ONE_LINE = "not_one_line"
+    TOO_LONG = "too_long"
+    BROKE_CHARACTER = "broke_character"
+    DOCUMENT_STRUCTURE = "document_structure"
+    TRANSCRIPT = "transcript"
+    FORBIDDEN_CLAIM = "forbidden_claim"
+    QUOTED_THREAD = "quoted_thread"
+    CARRIED_SECRET = "carried_secret"  # noqa: S105 - a category name, not a credential
+    BOTH_ANSWERS = "both_answers"
+    UNKNOWN_EMOTE = "unknown_emote"
+    EMOTE_CHANNEL_ILLEGAL = "emote_channel_illegal"
+
+
 class ClaudeInvalidOutputError(ClaudeError):
     """The provider answered, but the answer is unusable.
 
@@ -112,11 +143,21 @@ class ClaudeInvalidOutputError(ClaudeError):
     every case except a response too malformed to parse at all. The tokens WERE generated
     and billed, so the caller can settle the reservation at the true cost rather than
     guessing at it or letting the charge disappear.
+
+    ``category`` names WHY when the rejection came from the moderation gate, so telemetry can
+    count the reasons rather than parsing a sentence. It is None for the failures that are not
+    a judgement about content, such as a schema mismatch or impossible token counts.
     """
 
-    def __init__(self, message: str, usage: UsageTotals | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: UsageTotals | None = None,
+        category: ModerationCategory | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.category = category
 
 
 def billing_is_impossible(error: ClaudeError) -> bool:
@@ -466,7 +507,11 @@ class ClaudeAdapter:
         # be inventing an intention it did not have; neither filled is silence, which schema 3
         # cannot express, so it is a regeneration rather than something to deliver.
         if parsed.emote and parsed.message.strip():
-            raise ClaudeInvalidOutputError("model answered with both a line and a gesture", totals)
+            raise ClaudeInvalidOutputError(
+                "model answered with both a line and a gesture",
+                totals,
+                ModerationCategory.BOTH_ANSWERS,
+            )
 
         if parsed.emote:
             return "", validate_social_emote(parsed.emote, request, totals), totals
@@ -574,28 +619,44 @@ def validate_social_message(
 
     message = message.strip()
     if not message:
-        raise ClaudeInvalidOutputError("model returned an empty social message", usage)
+        raise ClaudeInvalidOutputError(
+            "model returned an empty social message", usage, ModerationCategory.EMPTY
+        )
 
     if any(ord(character) < 0x20 for character in message):
-        raise ClaudeInvalidOutputError("social message must be a single line", usage)
+        raise ClaudeInvalidOutputError(
+            "social message must be a single line", usage, ModerationCategory.NOT_ONE_LINE
+        )
 
     if len(message.encode("utf-8")) > protocol.MAX_RESPONSE_MESSAGE_BYTES:
-        raise ClaudeInvalidOutputError("social message exceeds 240 UTF-8 bytes", usage)
+        raise ClaudeInvalidOutputError(
+            "social message exceeds 240 UTF-8 bytes", usage, ModerationCategory.TOO_LONG
+        )
 
     lowered = message.casefold()
     for marker in _SOCIAL_LEAK_MARKERS:
         if marker in lowered:
-            raise ClaudeInvalidOutputError(f"social message broke character near {marker!r}", usage)
+            raise ClaudeInvalidOutputError(
+                f"social message broke character near {marker!r}",
+                usage,
+                ModerationCategory.BROKE_CHARACTER,
+            )
 
     for marker in _SOCIAL_STRUCTURE_MARKERS:
         if marker in message:
-            raise ClaudeInvalidOutputError("social message carried document structure", usage)
+            raise ClaudeInvalidOutputError(
+                "social message carried document structure",
+                usage,
+                ModerationCategory.DOCUMENT_STRUCTURE,
+            )
 
     # The bot answering as somebody else is the tell that a "you are now X" injection landed.
     # Checked against the name the COORDINATOR gave, not against anything in the context.
     speaker_prefix = f"{request.bot_name.casefold()}:"
     if lowered.startswith(speaker_prefix):
-        raise ClaudeInvalidOutputError("social message was formatted as a transcript", usage)
+        raise ClaudeInvalidOutputError(
+            "social message was formatted as a transcript", usage, ModerationCategory.TRANSCRIPT
+        )
 
     return message
 
@@ -763,7 +824,9 @@ def build_biography(
         term = _contains_forbidden_claim(value)
         if term is not None:
             raise ClaudeInvalidOutputError(
-                f"biography field {name} claims {term!r}, which the bot cannot have", usage
+                f"biography field {name} claims {term!r}, which the bot cannot have",
+                usage,
+                ModerationCategory.FORBIDDEN_CLAIM,
             )
 
     # Identity last and unconditionally, so it is the request's and never the model's.
@@ -808,14 +871,20 @@ def validate_memory_reply(
 
         for pattern in _MEMORY_FORBIDDEN_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):
-                raise ClaudeInvalidOutputError("memory candidate carries content it must not", usage)
+                raise ClaudeInvalidOutputError(
+                    "memory candidate carries content it must not",
+                    usage,
+                    ModerationCategory.CARRIED_SECRET,
+                )
 
         # A paraphrase that reproduces a line verbatim is a transcript, and storing it turns
         # the memory table into a chat log with a longer retention period.
         compared = _normalized(text)
         if any(compared and compared in line for line in normalized):
             raise ClaudeInvalidOutputError(
-                "memory candidate quotes the thread rather than paraphrasing it", usage
+                "memory candidate quotes the thread rather than paraphrasing it",
+                usage,
+                ModerationCategory.QUOTED_THREAD,
             )
 
         accepted.append(candidate.model_dump())
@@ -842,10 +911,18 @@ def validate_social_emote(
 
     emote_id = SOCIAL_EMOTES.get(name)
     if emote_id is None:
-        raise ClaudeInvalidOutputError(f"model chose an emote outside the vocabulary: {name!r}", usage)
+        raise ClaudeInvalidOutputError(
+            f"model chose an emote outside the vocabulary: {name!r}",
+            usage,
+            ModerationCategory.UNKNOWN_EMOTE,
+        )
 
     if request.speak_on_channel not in SOCIAL_EMOTE_CHANNELS:
-        raise ClaudeInvalidOutputError("an emote cannot be seen on this channel", usage)
+        raise ClaudeInvalidOutputError(
+            "an emote cannot be seen on this channel",
+            usage,
+            ModerationCategory.EMOTE_CHANNEL_ILLEGAL,
+        )
 
     return emote_id
 
