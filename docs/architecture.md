@@ -82,9 +82,12 @@ The ceiling is per UTC calendar day, so it rolls over at one instant regardless 
 
 Failure handling depends on what can be proven:
 
-- An authentication or rate limit failure proves nothing was generated, so the reservation is released immediately.
-- Invalid output, a timeout, or a provider error may already have been billed, so the reservation is settled at its maximum. Over-charging is absorbed by the day's ceiling; under-recording admits later requests against money already gone.
-- A crash or a cancelled deadline tells the sidecar nothing at all. Those reservations stay charged at maximum until another transaction reclaims them, ten minutes after creation. A completion arriving after that reclaim is refused rather than charged twice, because `settle` only accepts a reservation still in the reserved state.
+- An authentication or rate limit failure was rejected before generation, so the reservation is released immediately.
+- Invalid output arrives with the provider's own usage attached, because the adapter reads usage before it validates content. The completion was generated and billed, so the reservation settles at that exact cost. Releasing would spend money the ledger never records; charging the maximum would overcharge the realm permanently for a reply that was merely unusable.
+- A timeout or a provider error carries no usage and nothing can be concluded, so the reservation is left alone for expiry.
+- A crash or a cancelled deadline tells the sidecar nothing at all, and is treated the same way.
+
+Anything left outstanding stays charged at its maximum until another transaction reclaims it, ten minutes after creation. That holds the money against the ceiling while the request might still matter and stops guessing once it cannot. A completion arriving after the reclaim is refused rather than charged twice, because `settle` only accepts a reservation still in the reserved state.
 
 The ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary.
 
@@ -120,9 +123,10 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Ambient hourly rate exhausted | Dropped before token counting |
 | No connected human or eligible World bot | No ambient request is enqueued |
 | Provider auth or rate limit refusal | Dropped; reservation released, since nothing was generated |
-| Provider timeout or error | Dropped; reservation settled at maximum, since billing cannot be ruled out |
-| Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation stays outstanding for expiry reclaim |
-| Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped; reservation settled at maximum, since the tokens were billed |
+| Provider timeout or error | Dropped; reservation left outstanding for expiry, since billing cannot be determined |
+| Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation left outstanding for expiry reclaim |
+| Model output invalid (empty, multiline, above 240 bytes) | Dropped; reservation settled at the cost the provider reported |
+| Model output unparseable | Dropped; no usage came back, so left outstanding for expiry |
 | Completion cannot be priced | Dropped; reservation stays outstanding rather than settling as free |
 | Circuit breaker open | Every request denied until it is cleared |
 | Playerbots database unreachable | Sidecar refuses to start; `doctor` reports it and exits nonzero |

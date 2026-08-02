@@ -46,6 +46,14 @@ _SPENDING_STYLE_ORDER = {
 }
 
 
+@dataclass(frozen=True)
+class UsageTotals:
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+
 class ClaudeError(Exception):
     """Base class for bounded adapter failures. The bot stays silent on all of them."""
 
@@ -67,7 +75,17 @@ class ClaudeProviderError(ClaudeError):
 
 
 class ClaudeInvalidOutputError(ClaudeError):
-    pass
+    """The provider answered, but the answer is unusable.
+
+    Carries the reported ``usage`` whenever a completion actually came back, which is
+    every case except a response too malformed to parse at all. The tokens WERE generated
+    and billed, so the caller can settle the reservation at the true cost rather than
+    guessing at it or letting the charge disappear.
+    """
+
+    def __init__(self, message: str, usage: UsageTotals | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 def billing_is_impossible(error: ClaudeError) -> bool:
@@ -77,18 +95,21 @@ def billing_is_impossible(error: ClaudeError) -> bool:
     before any generation, so a reservation held for one of those is money that was never
     going to be spent and giving it back is correct.
 
-    Everything else is treated as billable, including failures that probably were not:
+    A caller uses this to decide the fate of a reservation, alongside
+    ``ClaudeInvalidOutputError.usage``:
 
-    - ``ClaudeInvalidOutputError`` is raised AFTER a completion came back. The tokens were
-      generated and charged; only the content was unusable.
-    - ``ClaudeTimeoutError`` and ``ClaudeProviderError`` are genuinely ambiguous. The SDK
-      is configured with ``max_retries=1``, so a request may have been received, processed,
-      and billed before the connection failed.
+    - True here means release. Nothing was generated.
+    - Otherwise, if the error carries usage, the completion happened and its exact cost is
+      known, so settle at that.
+    - Otherwise the outcome is genuinely unknown. ``ClaudeTimeoutError`` and
+      ``ClaudeProviderError`` carry no usage, and with ``max_retries=1`` a request may
+      have been received and billed before the connection failed. Those reservations are
+      left outstanding for the ledger's expiry, which holds the money against the ceiling
+      while the answer might still matter and stops guessing once it cannot.
 
-    Being wrong in the billable direction costs an over-charge that the day's ceiling
-    absorbs. Being wrong in the other direction lets real spending go unrecorded and admits
-    further requests against money already gone, which is the failure a ceiling exists to
-    prevent. When it cannot be known, charge.
+    Note the limit of what a status code proves. A 401 or a 429 shows the request was
+    refused before generation, which is the provider's documented behaviour; it is not the
+    same as a billing guarantee from the contract.
     """
 
     return isinstance(error, ClaudeAuthError | ClaudeRateLimitError)
@@ -109,14 +130,6 @@ class CareerReply(BaseModel):
 
     candidate_token: str
     spending_style: Literal["none", "minimal", "progression", "completionist"]
-
-
-@dataclass(frozen=True)
-class UsageTotals:
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
 
 
 def build_system_prompt(request: protocol.ChatRequest) -> str:
@@ -253,27 +266,10 @@ class ClaudeAdapter:
         except ValidationError as error:
             raise ClaudeInvalidOutputError("model output did not match the reply schema") from error
 
-        parsed = response.parsed_output
-        if parsed is None:
-            raise ClaudeInvalidOutputError("model output did not match the reply schema")
-
-        if request.is_career:
-            if not isinstance(parsed, CareerReply):
-                raise ClaudeInvalidOutputError("model output did not match the career reply schema")
-            message = _validate_career_reply(request, parsed)
-        else:
-            if not isinstance(parsed, ChatReply):
-                raise ClaudeInvalidOutputError("model output did not match the chat reply schema")
-            message = parsed.message.strip()
-        if not message:
-            raise ClaudeInvalidOutputError("model returned an empty message")
-
-        if any(ord(character) < 0x20 for character in message):
-            raise ClaudeInvalidOutputError("model message must be a single line")
-
-        if len(message.encode("utf-8")) > protocol.MAX_RESPONSE_MESSAGE_BYTES:
-            raise ClaudeInvalidOutputError("model message exceeds 240 UTF-8 bytes")
-
+        # Read BEFORE validating the content. Everything below this line rejects a
+        # completion that was generated and billed, and the caller has to settle the real
+        # cost of it; discovering the tokens after deciding to raise is how that charge
+        # goes missing.
         usage = response.usage
         totals = UsageTotals(
             input_tokens=usage.input_tokens,
@@ -281,16 +277,40 @@ class ClaudeAdapter:
             cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
             cache_read_input_tokens=usage.cache_read_input_tokens or 0,
         )
+
+        parsed = response.parsed_output
+        if parsed is None:
+            raise ClaudeInvalidOutputError("model output did not match the reply schema", totals)
+
+        if request.is_career:
+            if not isinstance(parsed, CareerReply):
+                raise ClaudeInvalidOutputError("model output did not match the career reply schema", totals)
+            message = _validate_career_reply(request, parsed, totals)
+        else:
+            if not isinstance(parsed, ChatReply):
+                raise ClaudeInvalidOutputError("model output did not match the chat reply schema", totals)
+            message = parsed.message.strip()
+        if not message:
+            raise ClaudeInvalidOutputError("model returned an empty message", totals)
+
+        if any(ord(character) < 0x20 for character in message):
+            raise ClaudeInvalidOutputError("model message must be a single line", totals)
+
+        if len(message.encode("utf-8")) > protocol.MAX_RESPONSE_MESSAGE_BYTES:
+            raise ClaudeInvalidOutputError("model message exceeds 240 UTF-8 bytes", totals)
+
         return message, totals
 
 
-def _validate_career_reply(request: protocol.ChatRequest, reply: CareerReply) -> str:
+def _validate_career_reply(
+    request: protocol.ChatRequest, reply: CareerReply, usage: UsageTotals | None = None
+) -> str:
     candidates = {candidate.token: candidate for candidate in request.career_content.candidates}
     candidate = candidates.get(reply.candidate_token)
     if candidate is None:
-        raise ClaudeInvalidOutputError("model selected an unknown career candidate")
+        raise ClaudeInvalidOutputError("model selected an unknown career candidate", usage)
     if _SPENDING_STYLE_ORDER[reply.spending_style] > _SPENDING_STYLE_ORDER[candidate.maximum_spending_style]:
-        raise ClaudeInvalidOutputError("model selected spending above the candidate maximum")
+        raise ClaudeInvalidOutputError("model selected spending above the candidate maximum", usage)
 
     return json.dumps(
         {

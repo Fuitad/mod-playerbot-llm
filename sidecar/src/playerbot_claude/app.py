@@ -422,26 +422,7 @@ class SidecarService:
             try:
                 reply, usage = await asyncio.to_thread(self._adapter.generate_reply, request, history)
             except claude.ClaudeError as error:
-                # Only a refusal gives the money back. An authentication or rate limit
-                # failure PROVES nothing was generated, so holding its maximum for ten
-                # minutes would deny a later request money the budget demonstrably has.
-                #
-                # Every other failure is charged at the reservation's maximum, because it
-                # may already have been billed: invalid output arrives after a completion
-                # that was, and a timeout or provider error is ambiguous with the SDK's
-                # own retry. Charging the maximum is an over-charge the day's ceiling
-                # absorbs; releasing would let real spending go unrecorded and admit
-                # further requests against money already gone.
-                if claude.billing_is_impossible(error):
-                    await store.release(reservation=reservation)
-                    outcome = "reservation released"
-                else:
-                    await store.settle(
-                        reservation=reservation,
-                        actual_cost_nano=reservation.max_cost_nano,
-                        now=self._now(),
-                    )
-                    outcome = "charged at the reserved maximum, billing could not be ruled out"
+                outcome = await self._account_for_failure(store, reservation, error)
                 _log(f"request {request.request_id}: {type(error).__name__}: {error} ({outcome})")
                 return None
 
@@ -484,6 +465,43 @@ class SidecarService:
 
         _log(f"request {request.request_id}: replied ({usage.input_tokens} in, {usage.output_tokens} out)")
         return protocol.encode_response(request.request_id, reply, self._token)
+
+    async def _account_for_failure(
+        self, store: state.SidecarState, reservation: ledger.Reservation, error: claude.ClaudeError
+    ) -> str:
+        """Decides what a failed generation owes, and returns what was done for the log.
+
+        Three outcomes, and which one applies is a question of what is actually known
+        rather than a preference:
+
+        1. A refusal generated nothing, so the reservation is released. Holding its
+           maximum for the full expiry window would deny a later request money the budget
+           demonstrably has.
+        2. Invalid output arrives with the provider's own usage attached, so the exact
+           cost is known and settled. This is the case that makes the whole split worth
+           having: the tokens were billed, and neither releasing them nor charging the
+           maximum would be true.
+        3. A timeout or provider error carries no usage and nothing can be concluded, so
+           the reservation is left alone. The ledger's expiry holds it at maximum while
+           the request might still matter, then reclaims it. Settling an unknown cost at
+           the maximum would permanently overcharge the realm for one dropped connection;
+           releasing it would spend money the ledger never recorded.
+        """
+
+        if claude.billing_is_impossible(error):
+            await store.release(reservation=reservation)
+            return "reservation released, nothing was generated"
+
+        usage = getattr(error, "usage", None)
+        if usage is not None:
+            await store.settle(
+                reservation=reservation,
+                actual_cost_nano=_actual_cost_nano(usage, self._config.price_texts),
+                now=self._now(),
+            )
+            return "settled at the reported cost, the completion was billed"
+
+        return "reservation left outstanding for expiry, billing could not be determined"
 
     async def _history_for(self, request: protocol.ChatRequest) -> list[tuple[str, str]]:
         if self._store is None or request.is_ambient or request.is_career:

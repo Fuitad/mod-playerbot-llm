@@ -1157,34 +1157,87 @@ def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -
 # --- Failure accounting: who gets their money back and who does not ---
 
 
-async def test_only_a_proven_refusal_gives_the_reservation_back(tmp_path) -> None:
-    """A refusal generated nothing. Everything else may already have been billed.
+async def test_a_refusal_gives_the_reservation_back(tmp_path) -> None:
+    """A 401 or a 429 was rejected before generation, so the money was never spent.
 
-    Releasing an ambiguous failure lets real spending go unrecorded and admits further
-    requests against money already gone, which is the exact failure a ceiling exists to
-    prevent. Charging the maximum is an over-charge the day's ceiling absorbs.
+    Holding its maximum for the full expiry window would deny a later request money the
+    budget demonstrably still has.
     """
-    refusals = (claude.ClaudeAuthError("401"), claude.ClaudeRateLimitError("429"))
-    billable = (
-        claude.ClaudeInvalidOutputError("model returned junk"),
-        claude.ClaudeTimeoutError("timed out"),
-        claude.ClaudeProviderError("provider error: InternalServerError"),
-    )
-
-    for error in refusals:
+    for error in (claude.ClaudeAuthError("401"), claude.ClaudeRateLimitError("429")):
         service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
         assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
         assert len(store.released) == 1, f"{type(error).__name__} should release"
         assert store.settled_nano == 0
         assert store.outstanding == {}
 
-    for error in billable:
+
+async def test_invalid_output_settles_at_the_cost_the_provider_reported(tmp_path) -> None:
+    """The completion happened and was billed. Its exact cost is known, so charge that.
+
+    Releasing would spend money the ledger never records. Charging the reservation's
+    maximum would overcharge the realm permanently for a reply that was merely unusable.
+    Neither is necessary: the usage travels with the error.
+    """
+    usage = claude.UsageTotals(input_tokens=100, output_tokens=10)
+    error = claude.ClaudeInvalidOutputError("model message must be a single line", usage)
+    service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+
+    assert store.released == []
+    assert store.settled_nano == budget.usd_to_nano("0.00015")
+    assert store.settled_nano < store.reservations[0].max_cost_nano, "the maximum is not the cost"
+    assert store.outstanding == {}
+    # Settling below the reservation must not trip the breaker: it exists for a provider
+    # reporting MORE than was authorised.
+    assert store.circuit_open is False
+
+
+async def test_an_undeterminable_failure_is_left_for_expiry_rather_than_guessed_at(tmp_path) -> None:
+    """A timeout or provider error carries no usage, so nothing can be concluded.
+
+    The reservation is left alone: the ledger's expiry holds it at maximum while the
+    request might still matter, then reclaims it. Settling at the maximum would
+    permanently overcharge the realm for one dropped connection, and releasing would spend
+    money the ledger never recorded.
+    """
+    undeterminable = (
+        claude.ClaudeTimeoutError("timed out"),
+        claude.ClaudeProviderError("provider error: InternalServerError"),
+        # An output too malformed to parse at all: no completion object, so no usage.
+        claude.ClaudeInvalidOutputError("model output did not match the reply schema"),
+    )
+
+    for error in undeterminable:
         service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
         assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-        assert store.released == [], f"{type(error).__name__} must not release"
-        # Charged at the reservation's maximum, since the real cost is unknowable.
-        assert store.settled_nano == store.reservations[0].max_cost_nano
-        assert store.outstanding == {}
+        name = type(error).__name__
+        assert store.released == [], f"{name} must not release"
+        assert store.settlements == [], f"{name} must not settle a cost nobody knows"
+        # Still held at its maximum. Expiry, not this code path, decides its fate.
+        assert list(store.outstanding.values()) == [store.reservations[0].max_cost_nano]
+        assert store.circuit_open is False
+
+
+def test_a_rejected_completion_carries_the_usage_that_was_billed(tmp_path) -> None:
+    """The adapter must read usage BEFORE it validates content.
+
+    Every content check rejects a completion that was already generated and charged.
+    Discovering the tokens after deciding to raise is how that charge goes missing, and
+    the settle path above depends on it being there.
+    """
+    long_line = "x" * 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return messages_response(long_line)
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    with pytest.raises(claude.ClaudeInvalidOutputError) as caught:
+        adapter.generate_reply(make_request_model(), history=[])
+
+    assert caught.value.usage is not None
+    assert caught.value.usage.input_tokens == 2500
+    assert caught.value.usage.output_tokens == 80
 
 
 def test_the_billing_classification_covers_every_adapter_error(tmp_path) -> None:
@@ -1193,7 +1246,17 @@ def test_the_billing_classification_covers_every_adapter_error(tmp_path) -> None
     Enumerated rather than spot-checked, so adding a subclass without deciding its
     billing status cannot silently start releasing reservations.
     """
-    subclasses = {cls.__name__ for cls in claude.ClaudeError.__subclasses__()}
+
+    def descendants(cls) -> set[str]:
+        # Recursive: a subclass of a subclass is still an error this code must classify,
+        # and a direct-children-only check would not see one.
+        found = set()
+        for child in cls.__subclasses__():
+            found.add(child.__name__)
+            found |= descendants(child)
+        return found
+
+    subclasses = descendants(claude.ClaudeError)
     assert subclasses == {
         "ClaudeTimeoutError",
         "ClaudeAuthError",
