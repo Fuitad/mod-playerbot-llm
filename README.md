@@ -171,7 +171,7 @@ Sharing the Playerbots database rather than a private file means the budget surv
 
 To delete all retained data, stop the sidecar and drop those tables; the sidecar recreates them empty on next start. To delete only player text, `TRUNCATE TABLE playerbot_claude_conversation_turn`. Anthropic's own data handling is governed by their API terms.
 
-Nothing migrates from a pre-existing `playerbot_claude.sqlite`. The old file can be deleted once the sidecar starts successfully against MySQL.
+Upgrading from a version that kept its own file: nothing is migrated, and no code reads it. Delete it once the sidecar starts successfully against MySQL. A leftover `PlayerbotClaude.SidecarDatabase` line in the config is ignored.
 
 ## Development
 

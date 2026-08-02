@@ -50,10 +50,14 @@ PlayerbotClaude.BridgePort = 0
 #
 #    PlayerbotClaude.DailyBudgetUsd
 #        Description: The spending ceiling shared by every Claude generation. Settled actual cost
-#                     plus unsettled maximum reservations may not exceed this value in any rolling
-#                     24 hour window. This is the SOLE ceiling: no larger limit is applied in code,
-#                     so a large configured value is honoured as written. 0 or a negative value
-#                     disables all generation.
+#                     plus live maximum reservations may not exceed this value within one UTC
+#                     calendar day, so it rolls over at one instant regardless of server timezone
+#                     or daylight saving. This is the SOLE ceiling: no policy limit is applied
+#                     above it, so a large configured value is honoured as written. The one hard
+#                     limit is physical rather than policy, since the ledger records money in
+#                     BIGINT UNSIGNED columns: a value above roughly 18400000000 is refused rather
+#                     than clamped, because it is a ceiling the ledger could not enforce. 0, a
+#                     negative value, or an unrecordable value disables all generation.
 #        Default:     5
 
 PlayerbotClaude.DailyBudgetUsd = 5
