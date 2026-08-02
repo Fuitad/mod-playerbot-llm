@@ -96,8 +96,19 @@ class SidecarConfig:
 
 
 def bridge_token_from_environment() -> str | None:
+    """Both bounds, at the one place the token enters the process.
+
+    The floor is for entropy and the ceiling is for the same reason every other string in
+    this protocol has one: without it a very long token is copied, compared, and written
+    into every frame before anything refuses it. Mirrors ClaudeChat::BridgeTokenIsUsable.
+    """
+
     token = os.environ.get(TOKEN_ENV_VAR)
-    if token is None or len(token.encode("utf-8")) < protocol.MIN_BRIDGE_TOKEN_BYTES:
+    if token is None:
+        return None
+
+    length = len(token.encode("utf-8"))
+    if length < protocol.MIN_BRIDGE_TOKEN_BYTES or length > protocol.MAX_BRIDGE_TOKEN_BYTES:
         return None
 
     return token

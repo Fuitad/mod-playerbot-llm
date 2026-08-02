@@ -63,6 +63,18 @@ def _byte_length(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _validated_token(value: str) -> str:
+    """Both bridge token bounds, in UTF-8 bytes. Shared by every request model."""
+
+    length = _byte_length(value)
+    if length < MIN_BRIDGE_TOKEN_BYTES or length > MAX_BRIDGE_TOKEN_BYTES:
+        raise ValueError(
+            f"bridge token must be {MIN_BRIDGE_TOKEN_BYTES} to {MAX_BRIDGE_TOKEN_BYTES} UTF-8 bytes"
+        )
+
+    return value
+
+
 class CareerCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -105,7 +117,7 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[3]
-    token: Annotated[str, StringConstraints(min_length=MIN_BRIDGE_TOKEN_BYTES, max_length=MAX_BRIDGE_TOKEN_BYTES)]
+    token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     channel: Literal["whisper", "party", "world", "career", "social"]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -122,6 +134,13 @@ class ChatRequest(BaseModel):
     subject_id: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     occurrence: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     message: str
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        # Bytes, not characters. StringConstraints would have counted characters, which is the
+        # same trap every other bounded string in this protocol carries a validator to avoid.
+        return _validated_token(value)
 
     @field_validator("bot_name", "speaker_name")
     @classmethod
@@ -238,7 +257,7 @@ class SocialRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[3]
-    token: Annotated[str, StringConstraints(min_length=MIN_BRIDGE_TOKEN_BYTES, max_length=MAX_BRIDGE_TOKEN_BYTES)]
+    token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -250,6 +269,11 @@ class SocialRequest(BaseModel):
     speak_on_channel: Annotated[int, Field(ge=0, le=255)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
     context: str
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        return _validated_token(value)
 
     @model_validator(mode="after")
     def _subject_is_present_or_absent(self) -> Self:

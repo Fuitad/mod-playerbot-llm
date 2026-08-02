@@ -1470,3 +1470,27 @@ def test_social_request_bounds_names_and_thread_id_in_bytes() -> None:
 
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_social_request(_social_request_payload(thread_id=long_thread), TEST_TOKEN)
+
+
+def test_bridge_token_is_bounded_in_bytes_at_both_ends() -> None:
+    """The floor is for entropy and the ceiling is for the same reason every other string has one.
+
+    Bytes rather than characters, because StringConstraints counts characters and a multibyte
+    token would pass a character ceiling and still be copied into every frame.
+    """
+    at_ceiling = "k" * protocol.MAX_BRIDGE_TOKEN_BYTES
+    protocol.parse_social_request(_social_request_payload(token=at_ceiling), at_ceiling)
+
+    too_long = "k" * (protocol.MAX_BRIDGE_TOKEN_BYTES + 1)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(token=too_long), too_long)
+
+    too_short = "k" * (protocol.MIN_BRIDGE_TOKEN_BYTES - 1)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(token=too_short), too_short)
+
+    # A multibyte token that passes a CHARACTER ceiling but not a byte one.
+    multibyte = "é" * (protocol.MAX_BRIDGE_TOKEN_BYTES // 2 + 1)
+    assert len(multibyte) <= protocol.MAX_BRIDGE_TOKEN_BYTES
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(token=multibyte), multibyte)
