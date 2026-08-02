@@ -910,6 +910,71 @@ bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string
     return true;
 }
 
+namespace
+{
+    /*
+     * The length of the longest prefix of `text` that fits in `limit` bytes and ends where a
+     * character ends.
+     *
+     * Walks forward by whole sequences rather than cutting and backing off, which also makes a
+     * sequence that is already malformed a stopping point: bytes past it cannot be decoded, and
+     * carrying them would fail the same UTF-8 decode this exists to avoid.
+     *
+     * The core's utf8truncate does not fit here. It bounds a count of characters where this bounds
+     * a count of bytes, which is what the frame is measured in, and it answers a string it cannot
+     * decode by clearing the whole thing: a subject with one bad byte would become no subject at
+     * all rather than the part that was fine.
+     */
+    size_t Utf8PrefixLength(std::string const& text, size_t limit)
+    {
+        size_t kept = 0;
+
+        while (kept < text.size())
+        {
+            unsigned char const lead = static_cast<unsigned char>(text[kept]);
+
+            size_t width = 0;
+            if (lead < 0x80)
+                width = 1;
+            else if ((lead & 0xE0) == 0xC0)
+                width = 2;
+            else if ((lead & 0xF0) == 0xE0)
+                width = 3;
+            else if ((lead & 0xF8) == 0xF0)
+                width = 4;
+            else
+                break;  // A continuation byte or an invalid lead: nothing from here on decodes.
+
+            if (kept + width > text.size() || kept + width > limit)
+                break;
+
+            bool complete = true;
+            for (size_t offset = 1; offset < width; ++offset)
+                if ((static_cast<unsigned char>(text[kept + offset]) & 0xC0) != 0x80)
+                    complete = false;
+
+            if (!complete)
+                break;
+
+            kept += width;
+        }
+
+        return kept;
+    }
+}  // namespace
+
+std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
+{
+    if (subject.empty())
+        return std::string();
+
+    std::string out;
+    out += "{\"starter\":";
+    AppendEscapedJsonString(out, subject.substr(0, Utf8PrefixLength(subject, MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
+    out += '}';
+    return out;
+}
+
 std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest const& request,
                                                                std::string const& token)
 {

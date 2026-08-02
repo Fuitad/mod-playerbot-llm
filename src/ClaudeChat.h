@@ -152,6 +152,13 @@ namespace ClaudeChat
     inline constexpr size_t MAX_THREAD_ID_BYTES = 64;
 
     /*
+     * One entry inside the assembled context, mirroring the sidecar's per field bound rather than
+     * the whole context's. A field longer than this is refused there, so bounding it here is what
+     * keeps an oversize entry from costing a round trip to find that out.
+     */
+    inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512;
+
+    /*
      * At most one regeneration for a fresh invalid response.
      *
      * A sidecar that keeps returning malformed output would otherwise be retried indefinitely on
@@ -320,6 +327,20 @@ namespace ClaudeChat
     [[nodiscard]] int64 SocialRequestDeadlineMs(int64 configuredDeadlineMs);
 
     std::optional<std::string> SerializeSocialRequest(SocialRequest const& request, std::string const& token);
+
+    /*
+     * A starter's subject as the context shape the sidecar parses, or empty for a reply.
+     *
+     * Not the raw subject. An unparseable context is dropped on every channel but a whisper, which
+     * is a deliberate privacy rule and not something to work around, so loose text would arrive
+     * nowhere on General: exactly the surface starters use.
+     *
+     * The subject is truncated rather than refused, and truncated on a character boundary. Losing
+     * the tail of what a bot meant to bring up is a smaller failure than the bot saying nothing;
+     * splitting a character is not, because the sidecar decodes the whole frame as UTF-8 before it
+     * reads any field and would refuse the request outright.
+     */
+    [[nodiscard]] std::string EncodeStarterContext(std::string const& subject);
 
     /*
      * Strict parser for a social answer.

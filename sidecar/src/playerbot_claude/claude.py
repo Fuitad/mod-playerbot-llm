@@ -369,6 +369,16 @@ def build_social_user_message(request: protocol.SocialRequest) -> str:
     if context.thread:
         lines += _fenced("THREAD", "\n".join(context.thread))
 
+    if context.starter:
+        """What this bot wants to bring up, for a line that answers nothing.
+
+        Rendered on every channel rather than filtered like a memory. A starter subject is a
+        converted ambient broadcast, which was already addressed to a public channel before the
+        feature saw it, so it carries no privacy scope to honour. Fenced like everything else
+        here: a bot wrote it, so it is untrusted whatever it is about.
+        """
+        lines += _fenced("STARTER", context.starter)
+
     # Filtered by what this channel is allowed to know, not by what was sent.
     memories = context.memories_within(request.speak_on_channel)
     if memories:

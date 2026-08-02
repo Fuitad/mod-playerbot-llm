@@ -1212,6 +1212,70 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
     }
 }
 
+TEST(ClaudeChatSocialProtocolTest, AStarterSubjectTravelsAsTheTypedContextShapeNotAsLooseText)
+{
+    /*
+     * Task 9B. The subject has to survive as far as the prompt on General, which is the only
+     * surface starters use. Loose text does not: the sidecar drops a context it cannot parse on
+     * every channel but a whisper, deliberately, so that one producer changing shape can never
+     * become a bot repeating a private line to a zone. The subject therefore travels as the
+     * agreed shape rather than as the raw string.
+     */
+    std::string const encoded = ClaudeChat::EncodeStarterContext("the harvest golems are out again");
+    EXPECT_EQ(encoded, "{\"starter\":\"the harvest golems are out again\"}");
+
+    // A reply has no subject, and an empty context is what "nothing was assembled" already means.
+    EXPECT_EQ(ClaudeChat::EncodeStarterContext(""), "");
+}
+
+TEST(ClaudeChatSocialProtocolTest, AStarterSubjectIsEscapedAndBounded)
+{
+    // Quotes and control characters would otherwise close the field and inject siblings into it.
+    EXPECT_EQ(ClaudeChat::EncodeStarterContext("say \"hi\"\n"), "{\"starter\":\"say \\\"hi\\\"\\n\"}");
+
+    std::string const long_subject(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 500, 'a');
+    std::string const bounded = ClaudeChat::EncodeStarterContext(long_subject);
+
+    EXPECT_LE(bounded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+    EXPECT_NE(bounded.find(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'a')), std::string::npos);
+    EXPECT_EQ(bounded.find(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 1, 'a')), std::string::npos);
+}
+
+TEST(ClaudeChatSocialProtocolTest, ABoundedStarterSubjectIsNeverCutThroughAMultibyteCharacter)
+{
+    /*
+     * Truncating by byte count splits a multibyte character when the limit lands inside one. The
+     * escaper passes bytes at or above 0x20 through unchanged, so the broken halves would reach
+     * the sidecar, whose first act is to decode the frame as UTF-8: the whole request is refused
+     * over a character nobody needed. The cut lands on a character boundary instead.
+     *
+     * A three byte character tiles the limit unevenly, so the naive cut is guaranteed to land
+     * mid-character rather than only doing so on some inputs.
+     */
+    std::string subject;
+    while (subject.size() < ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 30)
+        subject += "\xE6\xBC\xA2";  // U+6F22, three bytes.
+
+    std::string const encoded = ClaudeChat::EncodeStarterContext(subject);
+
+    // Strip the wrapper to weigh only the subject the sidecar will decode.
+    std::string const prefix = "{\"starter\":\"";
+    ASSERT_EQ(encoded.rfind(prefix, 0), 0u);
+    ASSERT_GE(encoded.size(), prefix.size() + 2);
+    std::string const carried = encoded.substr(prefix.size(), encoded.size() - prefix.size() - 2);
+
+    EXPECT_LE(carried.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES);
+    EXPECT_FALSE(carried.empty());
+    EXPECT_EQ(carried.size() % 3, 0u) << "cut landed inside a character";
+
+    for (size_t index = 0; index < carried.size(); index += 3)
+    {
+        EXPECT_EQ(static_cast<unsigned char>(carried[index]), 0xE6u);
+        EXPECT_EQ(static_cast<unsigned char>(carried[index + 1]), 0xBCu);
+        EXPECT_EQ(static_cast<unsigned char>(carried[index + 2]), 0xA2u);
+    }
+}
+
 TEST(ClaudeChatSocialProtocolTest, TheBridgeTokenIsBoundedLikeEveryOtherProtocolString)
 {
     // It had a floor for entropy and a frame ceiling that bounded it only incidentally. The rule

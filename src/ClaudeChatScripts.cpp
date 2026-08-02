@@ -271,17 +271,14 @@ namespace
             request.threadPublicId = threadPublicId;
 
             /*
-             * The starter's subject, and empty for a reply, where the thread is the subject. It rides
-             * the existing context field rather than a new one: the transport already bounds and
-             * escapes that field, and it is untrusted text either way, so a second channel for the
-             * same kind of content would be a second thing to bound.
+             * The starter's subject, and empty for a reply, where the thread is the subject.
              *
-             * Truncated rather than refused. Losing the tail of what a bot wanted to mention is a
-             * smaller failure than the bot saying nothing at all.
+             * It travels as the assembled context shape rather than as loose text in the same
+             * field. The two are not interchangeable: a context that does not parse is dropped on
+             * every channel but a whisper, so a raw subject would reach the prompt nowhere on
+             * General, which is the only surface a starter speaks on.
              */
-            request.context = starterSubject.size() > MAX_SOCIAL_CONTEXT_BYTES
-                                  ? starterSubject.substr(0, MAX_SOCIAL_CONTEXT_BYTES)
-                                  : starterSubject;
+            request.context = ClaudeChat::EncodeStarterContext(starterSubject);
 
             /*
              * The subject is left fully absent when it cannot be resolved, never half described. A

@@ -467,6 +467,7 @@ class SocialContext(BaseModel):
 
     persona: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
     relationship: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
+    starter: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
     nearby: Annotated[
         list[Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
         Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
