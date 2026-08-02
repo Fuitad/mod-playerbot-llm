@@ -2043,13 +2043,15 @@ def test_a_starter_subject_reaches_the_prompt_on_a_public_channel() -> None:
     ambient broadcast that was already destined for General, so a subject is public-scoped by
     construction rather than by a filter somebody has to remember to apply.
     """
+    # The producer's exact output, not a json.dumps of what it is assumed to emit. Asserting a
+    # shape this side builds for itself is how the subject went missing to begin with: each half
+    # agreed with itself and with nothing else. The C++ counterpart pinning this same string is
+    # ClaudeChatSocialProtocolTest.AStarterSubjectTravelsAsTheTypedContextShapeNotAsLooseText.
+    emitted = '{"starter":"the harvest golems are out of control again"}'
+
     for channel in (0, 1, 2, 3):
         request = protocol.parse_social_request(
-            _social_request_payload(
-                speak_on_channel=channel,
-                context=json.dumps({"starter": "the harvest golems are out of control again"}),
-            ),
-            TEST_TOKEN,
+            _social_request_payload(speak_on_channel=channel, context=emitted), TEST_TOKEN
         )
 
         rendered = claude.build_social_user_message(request)
