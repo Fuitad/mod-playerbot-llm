@@ -30,7 +30,62 @@ from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestPrior
 # reclaimed underneath itself.
 RESERVATION_EXPIRY = timedelta(minutes=10)
 
+# Bounded per bot conversation memory, trimmed on every write. An unbounded history is
+# an unbounded prompt, which is an unbounded cost, which is the thing this whole module
+# exists to prevent.
+CONVERSATION_TURN_LIMIT = 12
+
+AMBIENT_WINDOW = timedelta(hours=1)
+MAX_AMBIENT_MESSAGES_PER_HOUR = 6
+
 SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS playerbot_claude_profile (
+        `bot_guid` BIGINT UNSIGNED NOT NULL,
+        `profile_version` INT UNSIGNED NOT NULL,
+        `crafting_affinity` TINYINT UNSIGNED NOT NULL,
+        `gathering_affinity` TINYINT UNSIGNED NOT NULL,
+        `exploration_affinity` TINYINT UNSIGNED NOT NULL,
+        `sociability` TINYINT UNSIGNED NOT NULL,
+        `voice` VARCHAR(32) NOT NULL,
+        `bot_name` VARCHAR(48) NOT NULL,
+        `updated_at` DATETIME NOT NULL,
+        PRIMARY KEY (`bot_guid`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='Last observed personality profile per bot, written by the worldserver.'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS playerbot_claude_conversation_turn (
+        `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        `bot_guid` BIGINT UNSIGNED NOT NULL,
+        `role` ENUM('user','assistant') NOT NULL,
+        `content` TEXT NOT NULL,
+        `created_at` DATETIME NOT NULL,
+        PRIMARY KEY (`id`),
+        KEY `ix_bot` (`bot_guid`, `id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='Bounded per bot conversation memory. Trimmed on write, never unbounded.'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS playerbot_claude_career_decision (
+        `bot_guid` BIGINT UNSIGNED NOT NULL,
+        `career_version` INT UNSIGNED NOT NULL,
+        `candidate_token` VARCHAR(64) NOT NULL,
+        `spending_style` VARCHAR(32) NOT NULL,
+        `updated_at` DATETIME NOT NULL,
+        PRIMARY KEY (`bot_guid`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='One current career decision per bot.'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS playerbot_claude_ambient_attempt (
+        `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        `created_at` DATETIME NOT NULL,
+        PRIMARY KEY (`id`),
+        KEY `ix_created` (`created_at`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='Rolling hourly ambient rate, surviving restart.'
+    """,
     """
     CREATE TABLE IF NOT EXISTS playerbot_claude_budget_day (
         `usage_date` DATE NOT NULL,
@@ -330,3 +385,190 @@ class BudgetLedger:
             outstanding_nano=int(outstanding_row[0]) if outstanding_row else 0,
             circuit_open=circuit_open,
         )
+
+
+class SidecarStore:
+    """The non-budget durable state, on the shared Playerbots database.
+
+    Everything here used to live in a private SQLite file. Sharing the Playerbots
+    database instead removes a second thing to back up, a second thing to migrate, and a
+    file whose absence or corruption was a failure mode nobody monitored.
+
+    Like :class:`BudgetLedger`, every method takes an open connection rather than owning
+    a pool, so the caller decides connection lifetime.
+    """
+
+    async def record_profile(
+        self,
+        connection,
+        *,
+        bot_guid: int,
+        profile_version: int,
+        crafting_affinity: int,
+        gathering_affinity: int,
+        exploration_affinity: int,
+        sociability: int,
+        voice: str,
+        bot_name: str,
+        now: datetime,
+    ) -> None:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO playerbot_claude_profile (bot_guid, profile_version, crafting_affinity, "
+                "gathering_affinity, exploration_affinity, sociability, voice, bot_name, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE profile_version = VALUES(profile_version), "
+                "crafting_affinity = VALUES(crafting_affinity), "
+                "gathering_affinity = VALUES(gathering_affinity), "
+                "exploration_affinity = VALUES(exploration_affinity), "
+                "sociability = VALUES(sociability), voice = VALUES(voice), "
+                "bot_name = VALUES(bot_name), updated_at = VALUES(updated_at)",
+                (
+                    bot_guid,
+                    profile_version,
+                    crafting_affinity,
+                    gathering_affinity,
+                    exploration_affinity,
+                    sociability,
+                    voice,
+                    bot_name,
+                    now,
+                ),
+            )
+        await connection.commit()
+
+    async def get_profile(self, connection, *, bot_guid: int) -> dict[str, object] | None:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT profile_version, crafting_affinity, gathering_affinity, exploration_affinity, "
+                "sociability, voice, bot_name FROM playerbot_claude_profile WHERE bot_guid = %s",
+                (bot_guid,),
+            )
+            row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "profile_version": int(row[0]),
+            "crafting_affinity": int(row[1]),
+            "gathering_affinity": int(row[2]),
+            "exploration_affinity": int(row[3]),
+            "sociability": int(row[4]),
+            "voice": row[5],
+            "bot_name": row[6],
+        }
+
+    async def append_turn(self, connection, *, bot_guid: int, role: str, content: str, now: datetime) -> None:
+        """Appends one turn and trims the bot's history to the limit.
+
+        Trimmed on write rather than on read, so the table is bounded on disk and not
+        merely in what a query returns. The subquery is wrapped in a derived table
+        because MySQL will not read from the table it is deleting from otherwise.
+        """
+
+        if role not in ("user", "assistant"):
+            raise LedgerError(f"unsupported conversation role: {role!r}")
+
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO playerbot_claude_conversation_turn (bot_guid, role, content, created_at) "
+                "VALUES (%s, %s, %s, %s)",
+                (bot_guid, role, content, now),
+            )
+            await cursor.execute(
+                "DELETE FROM playerbot_claude_conversation_turn WHERE bot_guid = %s AND id NOT IN "
+                "(SELECT id FROM (SELECT id FROM playerbot_claude_conversation_turn WHERE bot_guid = %s "
+                "ORDER BY id DESC LIMIT %s) AS keep)",
+                (bot_guid, bot_guid, CONVERSATION_TURN_LIMIT),
+            )
+        await connection.commit()
+
+    async def recent_turns(self, connection, *, bot_guid: int) -> list[tuple[str, str]]:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT role, content FROM playerbot_claude_conversation_turn "
+                "WHERE bot_guid = %s ORDER BY id ASC",
+                (bot_guid,),
+            )
+            rows = await cursor.fetchall()
+
+        return [(row[0], row[1]) for row in rows]
+
+    async def record_career_decision(
+        self,
+        connection,
+        *,
+        bot_guid: int,
+        career_version: int,
+        candidate_token: str,
+        spending_style: str,
+        now: datetime,
+    ) -> None:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "INSERT INTO playerbot_claude_career_decision "
+                "(bot_guid, career_version, candidate_token, spending_style, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE career_version = VALUES(career_version), "
+                "candidate_token = VALUES(candidate_token), spending_style = VALUES(spending_style), "
+                "updated_at = VALUES(updated_at)",
+                (bot_guid, career_version, candidate_token, spending_style, now),
+            )
+        await connection.commit()
+
+    async def get_career_decision(self, connection, *, bot_guid: int) -> dict[str, object] | None:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT career_version, candidate_token, spending_style "
+                "FROM playerbot_claude_career_decision WHERE bot_guid = %s",
+                (bot_guid,),
+            )
+            row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "career_version": int(row[0]),
+            "candidate_token": row[1],
+            "spending_style": row[2],
+        }
+
+    async def try_begin_ambient(self, connection, *, messages_per_hour: int, now: datetime) -> bool:
+        """Consumes one ambient slot if the rolling hour has room.
+
+        The whole check and insert run in one transaction with the count taken under a
+        write lock, so two sidecar workers cannot both read the same count and both
+        decide there was room.
+        """
+
+        if not 1 <= messages_per_hour <= MAX_AMBIENT_MESSAGES_PER_HOUR:
+            return False
+
+        cutoff = now - AMBIENT_WINDOW
+        try:
+            await connection.begin()
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "DELETE FROM playerbot_claude_ambient_attempt WHERE created_at <= %s",
+                    (cutoff,),
+                )
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM playerbot_claude_ambient_attempt FOR UPDATE",
+                )
+                row = await cursor.fetchone()
+                if row is not None and int(row[0]) >= messages_per_hour:
+                    await connection.commit()
+                    return False
+
+                await cursor.execute(
+                    "INSERT INTO playerbot_claude_ambient_attempt (created_at) VALUES (%s)",
+                    (now,),
+                )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+
+        return True

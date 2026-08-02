@@ -367,3 +367,150 @@ async def test_the_ceiling_rolls_over_at_utc_midnight(clean_ledger) -> None:
         now=tomorrow,
     )
     assert fresh is AdmissionDecision.ADMITTED
+
+
+# The non-budget durable state ------------------------------------------------------
+
+
+@pytest.fixture
+async def store(clean_ledger):
+    _, connection = clean_ledger
+    # Written out rather than looped over an interpolated name. A table name cannot be a
+    # bound parameter, so a loop here means building SQL from a string, and a test that
+    # does that teaches the pattern even when its own inputs are literals.
+    async with connection.cursor() as cursor:
+        await cursor.execute("DELETE FROM playerbot_claude_profile")
+        await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+        await cursor.execute("DELETE FROM playerbot_claude_career_decision")
+        await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
+    await connection.commit()
+    return ledger.SidecarStore(), connection
+
+
+async def test_a_profile_round_trips_and_the_latest_write_wins(store) -> None:
+    book, connection = store
+
+    assert await book.get_profile(connection, bot_guid=7) is None
+
+    await book.record_profile(
+        connection,
+        bot_guid=7,
+        profile_version=2,
+        crafting_affinity=10,
+        gathering_affinity=20,
+        exploration_affinity=30,
+        sociability=40,
+        voice="wry",
+        bot_name="Grimbold",
+        now=NOW,
+    )
+    await book.record_profile(
+        connection,
+        bot_guid=7,
+        profile_version=2,
+        crafting_affinity=11,
+        gathering_affinity=20,
+        exploration_affinity=30,
+        sociability=40,
+        voice="earnest",
+        bot_name="Grimbold",
+        now=NOW,
+    )
+
+    profile = await book.get_profile(connection, bot_guid=7)
+    assert profile["crafting_affinity"] == 11
+    assert profile["voice"] == "earnest"
+
+
+async def test_conversation_memory_is_trimmed_on_disk_not_merely_on_read(store) -> None:
+    """An unbounded history is an unbounded prompt, which is an unbounded cost."""
+    book, connection = store
+
+    for index in range(ledger.CONVERSATION_TURN_LIMIT + 5):
+        await book.append_turn(connection, bot_guid=7, role="user", content=f"turn {index}", now=NOW)
+
+    turns = await book.recent_turns(connection, bot_guid=7)
+    assert len(turns) == ledger.CONVERSATION_TURN_LIMIT
+    # The OLDEST are the ones dropped, and order is preserved.
+    assert turns[0][1] == "turn 5"
+    assert turns[-1][1] == f"turn {ledger.CONVERSATION_TURN_LIMIT + 4}"
+
+    # And the trim really happened in the table, not just in what the query returned.
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_conversation_turn WHERE bot_guid = 7")
+        row = await cursor.fetchone()
+    assert int(row[0]) == ledger.CONVERSATION_TURN_LIMIT
+
+
+async def test_one_bots_memory_does_not_trim_another(store) -> None:
+    book, connection = store
+
+    await book.append_turn(connection, bot_guid=1, role="user", content="mine", now=NOW)
+    for index in range(ledger.CONVERSATION_TURN_LIMIT + 3):
+        await book.append_turn(connection, bot_guid=2, role="user", content=str(index), now=NOW)
+
+    assert len(await book.recent_turns(connection, bot_guid=1)) == 1
+
+
+async def test_an_unsupported_role_is_refused_rather_than_stored(store) -> None:
+    book, connection = store
+
+    with pytest.raises(ledger.LedgerError):
+        await book.append_turn(connection, bot_guid=7, role="system", content="x", now=NOW)
+
+
+async def test_a_career_decision_round_trips_and_is_one_per_bot(store) -> None:
+    book, connection = store
+
+    assert await book.get_career_decision(connection, bot_guid=7) is None
+
+    await book.record_career_decision(
+        connection,
+        bot_guid=7,
+        career_version=1,
+        candidate_token="career-alpha",
+        spending_style="minimal",
+        now=NOW,
+    )
+    await book.record_career_decision(
+        connection,
+        bot_guid=7,
+        career_version=1,
+        candidate_token="career-beta",
+        spending_style="progression",
+        now=NOW,
+    )
+
+    decision = await book.get_career_decision(connection, bot_guid=7)
+    assert decision["candidate_token"] == "career-beta"
+    assert decision["spending_style"] == "progression"
+
+
+async def test_the_ambient_rate_holds_across_a_rolling_hour(store) -> None:
+    book, connection = store
+
+    for _ in range(3):
+        assert await book.try_begin_ambient(connection, messages_per_hour=3, now=NOW) is True
+
+    assert await book.try_begin_ambient(connection, messages_per_hour=3, now=NOW) is False
+
+    # An hour later the window has rolled and the slots are back.
+    later = NOW + ledger.AMBIENT_WINDOW + timedelta(seconds=1)
+    assert await book.try_begin_ambient(connection, messages_per_hour=3, now=later) is True
+
+
+async def test_an_out_of_range_ambient_rate_consumes_nothing(store) -> None:
+    book, connection = store
+
+    assert await book.try_begin_ambient(connection, messages_per_hour=0, now=NOW) is False
+    assert (
+        await book.try_begin_ambient(
+            connection, messages_per_hour=ledger.MAX_AMBIENT_MESSAGES_PER_HOUR + 1, now=NOW
+        )
+        is False
+    )
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_ambient_attempt")
+        row = await cursor.fetchone()
+    assert int(row[0]) == 0
