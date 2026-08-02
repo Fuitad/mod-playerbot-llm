@@ -16,15 +16,19 @@ import signal
 import sqlite3
 import sys
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
-from playerbot_claude import claude, protocol, storage
+from playerbot_claude import budget, claude, protocol, storage
 
 CONFIG_SECTION = "worldserver"
 CONFIG_PREFIX = "PlayerbotClaude."
 # Environment variable *names*, not secret values.
 TOKEN_ENV_VAR = "PLAYERBOT_CLAUDE_BRIDGE_TOKEN"  # noqa: S105
 API_KEY_ENV_VAR = claude.API_KEY_ENV_VAR
-MAX_DAILY_BUDGET_USD = 5.0
+
+# There is deliberately no maximum above the configured ceiling. A second limit in the
+# code silently ignores what the operator asked for, and PlayerbotClaude.DailyBudgetUsd
+# is documented as the sole ceiling.
 
 
 @dataclass(frozen=True)
@@ -33,9 +37,13 @@ class SidecarConfig:
     bridge_port: int = 0
     ambient_world_enable: bool = False
     ambient_max_messages_per_hour: int = 6
-    daily_budget_usd: float = 0.0
-    input_usd_per_mtok: float = 1.00
-    output_usd_per_mtok: float = 5.00
+    # Kept as text through parsing and converted with Decimal, never float: a ceiling
+    # read from a config file is text, and going through float bakes in the rounding the
+    # integer nano-USD arithmetic exists to avoid.
+    daily_budget_usd: str = "0"
+    human_budget_reserve_ratio: str = "0.25"
+    input_usd_per_mtok: str = "1.00"
+    output_usd_per_mtok: str = "5.00"
     database_path: str = "playerbot_claude.sqlite"
     response_deadline_ms: int = 10000
     queue_size: int = 16
@@ -60,9 +68,10 @@ class SidecarConfig:
             bridge_port=int(option("BridgePort", "0")),
             ambient_world_enable=option("AmbientWorldEnable", "0") == "1",
             ambient_max_messages_per_hour=int(option("AmbientMaxMessagesPerHour", "6")),
-            daily_budget_usd=float(option("DailyBudgetUsd", "0")),
-            input_usd_per_mtok=float(option("InputUsdPerMTok", "1.00")),
-            output_usd_per_mtok=float(option("OutputUsdPerMTok", "5.00")),
+            daily_budget_usd=option("DailyBudgetUsd", "0"),
+            human_budget_reserve_ratio=option("HumanBudgetReserveRatio", "0.25"),
+            input_usd_per_mtok=option("InputUsdPerMTok", "1.00"),
+            output_usd_per_mtok=option("OutputUsdPerMTok", "5.00"),
             database_path=option("SidecarDatabase", "playerbot_claude.sqlite"),
             response_deadline_ms=int(option("ResponseDeadlineMs", "10000")),
             queue_size=int(option("QueueSize", "16")),
@@ -71,21 +80,48 @@ class SidecarConfig:
 
     @property
     def prices(self) -> storage.PriceSnapshot:
-        return storage.PriceSnapshot.from_usd_per_mtok(self.input_usd_per_mtok, self.output_usd_per_mtok)
+        return storage.PriceSnapshot.from_usd_per_mtok(
+            float(Decimal(self.input_usd_per_mtok)), float(Decimal(self.output_usd_per_mtok))
+        )
 
     @property
     def budget_nano(self) -> int:
-        return storage.usd_to_nano(self.daily_budget_usd)
+        """The configured ceiling in nano-USD, or 0 when it is unusable.
+
+        Zero reads as "no budget configured", which every caller already treats as a
+        reason to stay silent, so an unparseable ceiling fails closed rather than
+        raising out of a property.
+        """
+
+        try:
+            return budget.validate_daily_ceiling(self.daily_budget_usd)
+        except budget.BudgetConfigurationError:
+            return 0
+
+    @property
+    def reserve_ratio(self) -> Decimal:
+        """The protected share of the ceiling. An unusable value protects everything.
+
+        Failing closed here means a typo silences background work rather than quietly
+        removing the protection it was meant to configure.
+        """
+
+        try:
+            return budget.validate_reserve_ratio(self.human_budget_reserve_ratio)
+        except budget.BudgetConfigurationError:
+            return Decimal(1)
 
     @property
     def generation_allowed(self) -> bool:
-        """Positive budget and positive rates are required for any provider call."""
+        """A usable ceiling and positive rates are required for any provider call."""
 
-        return (
-            0 < self.daily_budget_usd <= MAX_DAILY_BUDGET_USD
-            and self.input_usd_per_mtok > 0
-            and self.output_usd_per_mtok > 0
-        )
+        if self.budget_nano <= 0:
+            return False
+
+        try:
+            return Decimal(self.input_usd_per_mtok) > 0 and Decimal(self.output_usd_per_mtok) > 0
+        except (InvalidOperation, TypeError, ValueError):
+            return False
 
     @property
     def ambient_allowed(self) -> bool:
@@ -126,6 +162,7 @@ def doctor_report(config: SidecarConfig, store: storage.Storage | None = None) -
         "enable": config.enable,
         "bridge_port": config.bridge_port,
         "daily_budget_usd": config.daily_budget_usd,
+        "human_budget_reserve_ratio": config.human_budget_reserve_ratio,
         "response_deadline_ms": config.response_deadline_ms,
         "bridge_token_present": token_present,
         "anthropic_api_key_present": api_key_present,

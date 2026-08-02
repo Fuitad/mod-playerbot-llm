@@ -49,13 +49,27 @@ PlayerbotClaude.BridgePort = 0
 
 #
 #    PlayerbotClaude.DailyBudgetUsd
-#        Description: Emergency spending circuit breaker shared by every Claude generation.
-#                     Settled actual cost plus unsettled maximum reservations may not exceed this
-#                     value in any rolling 24 hour window. Values above 5 or below 0 disable all
-#                     generation. 0 also disables all generation.
+#        Description: The spending ceiling shared by every Claude generation. Settled actual cost
+#                     plus unsettled maximum reservations may not exceed this value in any rolling
+#                     24 hour window. This is the SOLE ceiling: no larger limit is applied in code,
+#                     so a large configured value is honoured as written. 0 or a negative value
+#                     disables all generation.
 #        Default:     5
 
 PlayerbotClaude.DailyBudgetUsd = 5
+
+#
+#    PlayerbotClaude.HumanBudgetReserveRatio
+#        Description: The share of the daily ceiling held for players who are actually waiting on
+#                     an answer. Background work, bot only continuation, and memory extraction
+#                     cannot spend into this remainder, so a server that spent the day on
+#                     background work still has budget left when somebody talks. Immediate human
+#                     work is protected FROM that work rather than exempt from the ceiling itself.
+#        Valid:       0.0 through 1.0 inclusive. 0 disables the protection and 1 stops background
+#                     work using any budget at all. An unusable value fails closed to 1.
+#        Default:     0.25
+
+PlayerbotClaude.HumanBudgetReserveRatio = 0.25
 
 #
 #    PlayerbotClaude.InputUsdPerMTok

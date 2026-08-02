@@ -13,13 +13,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import anthropic
 import httpx
 import pytest
 
-from playerbot_claude import app, claude, protocol, storage
+from playerbot_claude import app, budget, claude, protocol, storage
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -723,7 +724,7 @@ def test_config_parses_worldserver_conf(tmp_path) -> None:
     assert config.bridge_port == 40123
     assert config.ambient_world_enable is True
     assert config.ambient_max_messages_per_hour == 6
-    assert config.daily_budget_usd == 5.0
+    assert config.budget_nano == budget.usd_to_nano("5")
 
 
 def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
@@ -741,19 +742,62 @@ def test_config_defaults_fail_closed(tmp_path) -> None:
     config = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\n"))
     assert config.enable is False
     assert config.bridge_port == 0
-    assert config.daily_budget_usd == 0.0
+    assert config.budget_nano == 0
 
 
-def test_config_replaces_lifetime_budget_and_enforces_hard_ceiling(tmp_path) -> None:
+def test_config_replaces_lifetime_budget_and_has_no_ceiling_above_the_configured_one(tmp_path) -> None:
+    """The old 5.00 cap is gone: the configured value is the sole ceiling.
+
+    A second limit in the code silently ignores what the operator asked for, which is
+    why a large configured budget must now be honoured rather than clamped.
+    """
     old_only = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\nPlayerbotClaude.BudgetUsd = 1\n"))
-    assert old_only.daily_budget_usd == 0.0
+    assert old_only.budget_nano == 0
     assert old_only.generation_allowed is False
 
-    for value, allowed in ((0, False), (0.5, True), (5, True), (-1, False), (5.01, False)):
+    for value, allowed in ((0, False), (0.5, True), (5, True), (-1, False), (5.01, True), (500, True)):
         config = app.SidecarConfig.load(
             write_conf(tmp_path, f"[worldserver]\nPlayerbotClaude.DailyBudgetUsd = {value}\n")
         )
-        assert config.generation_allowed is allowed
+        assert config.generation_allowed is allowed, value
+
+    # And the ceiling is carried exactly rather than through a float.
+    large = app.SidecarConfig.load(
+        write_conf(tmp_path, "[worldserver]\nPlayerbotClaude.DailyBudgetUsd = 500.10\n")
+    )
+    assert large.budget_nano == budget.usd_to_nano("500.10")
+
+
+def test_config_reserve_ratio_defaults_to_a_quarter_and_fails_closed(tmp_path) -> None:
+    """An unusable ratio protects everything.
+
+    Failing closed here means a typo silences background work rather than quietly
+    removing the protection it was meant to configure.
+    """
+    default = app.SidecarConfig.load(
+        write_conf(tmp_path, "[worldserver]\nPlayerbotClaude.DailyBudgetUsd = 5\n")
+    )
+    assert default.reserve_ratio == Decimal("0.25")
+
+    for value, expected in (("0", Decimal(0)), ("1", Decimal(1)), ("0.5", Decimal("0.5"))):
+        config = app.SidecarConfig.load(
+            write_conf(
+                tmp_path,
+                "[worldserver]\nPlayerbotClaude.DailyBudgetUsd = 5\n"
+                f"PlayerbotClaude.HumanBudgetReserveRatio = {value}\n",
+            )
+        )
+        assert config.reserve_ratio == expected
+
+    for bad in ("-0.1", "1.1", "banana"):
+        config = app.SidecarConfig.load(
+            write_conf(
+                tmp_path,
+                "[worldserver]\nPlayerbotClaude.DailyBudgetUsd = 5\n"
+                f"PlayerbotClaude.HumanBudgetReserveRatio = {bad}\n",
+            )
+        )
+        assert config.reserve_ratio == Decimal(1), bad
 
 
 def test_config_bounds_ambient_rate_without_disabling_direct_chat(tmp_path) -> None:
