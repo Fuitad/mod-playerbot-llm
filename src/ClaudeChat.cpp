@@ -587,6 +587,54 @@ bool ClaudeChat::ActorIsUsable(Actor const& actor)
     return IsSingleCleanLine(actor.name);
 }
 
+bool ClaudeChat::SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome)
+{
+    switch (outcome)
+    {
+        case SocialExchangeOutcome::Deliver:
+        case SocialExchangeOutcome::Regenerate:
+        case SocialExchangeOutcome::Abandon:
+            return true;
+        default:
+            break;
+    }
+
+    return false;
+}
+
+ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::string const& payload,
+                                                                       std::string const& expectedToken,
+                                                                       SocialResponse& out)
+{
+    /*
+     * The parser already refuses a mismatched schema, token, kind, request identity, and bot
+     * identity, so anything it rejects is abandoned here without further inspection. That is the
+     * fail closed path for a missing sidecar, a protocol mismatch, and an invalid response alike:
+     * all three arrive as "this did not parse".
+     */
+    std::optional<SocialResponse> const parsed =
+        ParseSocialResponsePayload(payload, expectedToken, _socialRequestToken, _botGuidCounter);
+    if (!parsed)
+        return SocialExchangeOutcome::Abandon;
+
+    if (parsed->regenerate)
+    {
+        /*
+         * At most MAX_REGENERATIONS_PER_REQUEST. A sidecar that keeps reporting its own output
+         * unusable would otherwise be retried forever on one request, and the coordinator, not this
+         * class, decides whether a second REQUEST is worth making at all.
+         */
+        if (_regenerations >= MAX_REGENERATIONS_PER_REQUEST)
+            return SocialExchangeOutcome::Abandon;
+
+        ++_regenerations;
+        return SocialExchangeOutcome::Regenerate;
+    }
+
+    out = *parsed;
+    return SocialExchangeOutcome::Deliver;
+}
+
 std::string ClaudeChat::SerializeSocialRequest(SocialRequest const& request, std::string const& token)
 {
     /*

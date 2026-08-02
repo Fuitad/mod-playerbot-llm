@@ -164,6 +164,50 @@ namespace ClaudeChat
         bool regenerate = false;
     };
 
+/*
+     * Tracks one social request across the bridge, and decides what to do with what comes back.
+     *
+     * Pure state: it holds the identity of the outstanding request and the regeneration count, and
+     * answers "may this response be delivered, should I ask again, or is this over". The socket, the
+     * queue, and the coordinator all live outside it, which is what makes every rule here testable
+     * without either of them.
+     */
+    enum class SocialExchangeOutcome : uint8
+    {
+        Deliver = 0,     // A usable line for the coordinator.
+        Regenerate,      // The sidecar asked to try again, and it is allowed to.
+        Abandon          // Refused, exhausted, or not ours. Nothing is delivered.
+    };
+
+    [[nodiscard]] bool SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome);
+
+    class SocialExchange
+    {
+    public:
+        SocialExchange(uint64 socialRequestToken, uint64 botGuidCounter)
+            : _socialRequestToken(socialRequestToken), _botGuidCounter(botGuidCounter)
+        {
+        }
+
+        [[nodiscard]] uint64 SocialRequestToken() const { return _socialRequestToken; }
+        [[nodiscard]] uint32 Regenerations() const { return _regenerations; }
+
+        /*
+         * Classifies one raw payload against this exchange.
+         *
+         * Fails closed on every path: an unparseable payload, an answer for a different request or
+         * bot, and an exhausted regeneration budget all abandon rather than deliver. `out` is only
+         * written when the outcome is Deliver.
+         */
+        SocialExchangeOutcome Classify(std::string const& payload, std::string const& expectedToken,
+                                       SocialResponse& out);
+
+    private:
+        uint64 _socialRequestToken = 0;
+        uint64 _botGuidCounter = 0;
+        uint32 _regenerations = 0;
+    };
+
     // Serializes a social request. Same framing and token rules as a chat request.
     std::string SerializeSocialRequest(SocialRequest const& request, std::string const& token);
 

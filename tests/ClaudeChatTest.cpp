@@ -1105,3 +1105,54 @@ TEST(ClaudeChatSocialProtocolTest, EveryLegacyConversationalHookYieldsToTheCoord
     EXPECT_TRUE(ClaudeChat::LegacyAmbientWorldAllowed(true, false));
     EXPECT_FALSE(ClaudeChat::LegacyAmbientWorldAllowed(false, false));
 }
+
+TEST(ClaudeChatSocialProtocolTest, AnExchangeDeliversRegeneratesOnceThenAbandons)
+{
+    /*
+     * Key Decision 5. One regeneration covers a transient glitch; a sidecar that keeps reporting its
+     * own output unusable must not be retried forever on one request, and the coordinator rather
+     * than this class decides whether a second REQUEST is worth making.
+     */
+    ClaudeChat::SocialExchange exchange(77, 500);
+    ClaudeChat::SocialResponse out;
+
+    EXPECT_EQ(exchange.Classify(SocialPayload("social", 77, 500, "", 1), SOCIAL_TOKEN, out),
+              ClaudeChat::SocialExchangeOutcome::Regenerate);
+    EXPECT_EQ(exchange.Regenerations(), 1u);
+
+    // The budget is spent, so a second request to try again is abandoned rather than honoured.
+    EXPECT_EQ(exchange.Classify(SocialPayload("social", 77, 500, "", 1), SOCIAL_TOKEN, out),
+              ClaudeChat::SocialExchangeOutcome::Abandon);
+    EXPECT_EQ(exchange.Regenerations(), 1u);
+
+    // A usable line still delivers afterwards.
+    EXPECT_EQ(exchange.Classify(SocialPayload(), SOCIAL_TOKEN, out), ClaudeChat::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(out.message, "Aye, that pack hits hard.");
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnExchangeFailsClosedOnEveryBadPayload)
+{
+    // A missing sidecar, a protocol mismatch, and an invalid response all arrive as "this did not
+    // parse", and every one of them abandons rather than delivering.
+    ClaudeChat::SocialExchange exchange(77, 500);
+    ClaudeChat::SocialResponse out;
+
+    for (std::string const& bad : {std::string(""), std::string("not json"), SocialPayload("career"),
+                                   SocialPayload("social", 78), SocialPayload("social", 77, 501)})
+    {
+        EXPECT_EQ(exchange.Classify(bad, SOCIAL_TOKEN, out), ClaudeChat::SocialExchangeOutcome::Abandon);
+    }
+
+    // None of those spent the regeneration budget, so a real glitch afterwards still gets its retry.
+    EXPECT_EQ(exchange.Regenerations(), 0u);
+    EXPECT_EQ(exchange.Classify(SocialPayload("social", 77, 500, "", 1), SOCIAL_TOKEN, out),
+              ClaudeChat::SocialExchangeOutcome::Regenerate);
+}
+
+TEST(ClaudeChatSocialProtocolTest, TheExchangeOutcomeEnumFailsClosed)
+{
+    EXPECT_TRUE(ClaudeChat::SocialExchangeOutcomeIsValid(ClaudeChat::SocialExchangeOutcome::Deliver));
+    EXPECT_TRUE(ClaudeChat::SocialExchangeOutcomeIsValid(ClaudeChat::SocialExchangeOutcome::Regenerate));
+    EXPECT_TRUE(ClaudeChat::SocialExchangeOutcomeIsValid(ClaudeChat::SocialExchangeOutcome::Abandon));
+    EXPECT_FALSE(ClaudeChat::SocialExchangeOutcomeIsValid(static_cast<ClaudeChat::SocialExchangeOutcome>(88)));
+}
