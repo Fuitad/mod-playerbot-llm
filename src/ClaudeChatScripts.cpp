@@ -252,7 +252,8 @@ namespace
          * coordinator turns into silence.
          */
         bool Submit(uint64 requestToken, uint64 botGuidCounter, uint64 targetGuidCounter,
-                    PlayerbotSocialChannel channel, std::string const& threadPublicId) override
+                    PlayerbotSocialChannel channel, std::string const& threadPublicId,
+                    std::string const& starterSubject) override
         {
             if (!_socialTransport || !_bridge)
                 return false;
@@ -268,6 +269,19 @@ namespace
             request.bot.human = false;
             request.speakOnChannel = static_cast<uint8>(channel);
             request.threadPublicId = threadPublicId;
+
+            /*
+             * The starter's subject, and empty for a reply, where the thread is the subject. It rides
+             * the existing context field rather than a new one: the transport already bounds and
+             * escapes that field, and it is untrusted text either way, so a second channel for the
+             * same kind of content would be a second thing to bound.
+             *
+             * Truncated rather than refused. Losing the tail of what a bot wanted to mention is a
+             * smaller failure than the bot saying nothing at all.
+             */
+            request.context = starterSubject.size() > MAX_SOCIAL_CONTEXT_BYTES
+                                  ? starterSubject.substr(0, MAX_SOCIAL_CONTEXT_BYTES)
+                                  : starterSubject;
 
             /*
              * The subject is left fully absent when it cannot be resolved, never half described. A
