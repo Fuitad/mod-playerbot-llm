@@ -443,11 +443,24 @@ class SidecarService:
                 _log(f"request {request.request_id}: cannot price the completion: {error}")
                 return None
 
-            await store.settle(
+            if not await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            )
+            ):
+                # The reservation was no longer reserved, which means expiry already
+                # reclaimed it: this request took longer than the expiry window and the
+                # ledger has refused to charge it rather than charge it twice.
+                #
+                # The reply is dropped rather than delivered. Delivering it would speak a
+                # line whose cost the ledger declined to record, which is spending outside
+                # the ceiling, and the worldserver's own deadline has long since expired
+                # the request anyway. Nothing is written to memory for the same reason.
+                _log(
+                    f"request {request.request_id}: settlement refused, the reservation had "
+                    "already expired; dropping the reply"
+                )
+                return None
 
             if request.is_career:
                 choice = claude.CareerReply.model_validate_json(reply)
@@ -509,11 +522,13 @@ class SidecarService:
                 # into a connection handler that only understands protocol errors.
                 return "reservation left outstanding for expiry, the reported cost was unusable"
 
-            await store.settle(
+            if not await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=self._now(),
-            )
+            ):
+                return "settlement refused, the reservation had already expired"
+
             return "settled at the reported cost, the completion was billed"
 
         return "reservation left outstanding for expiry, billing could not be determined"

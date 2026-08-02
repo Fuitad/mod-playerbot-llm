@@ -14,7 +14,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Runtime state (sidecar SQLite database and journals).
+# Legacy sidecar SQLite files, left by versions before the move to the shared
+# Playerbots database. Nothing writes these any more; ignored so an unremoved
+# leftover on a developer machine cannot be committed by accident.
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

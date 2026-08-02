@@ -116,6 +116,8 @@ class FakeState:
 
     async def settle(self, *, reservation, actual_cost_nano: int, now: datetime) -> bool:
         self.calls.append("settle")
+        # Mirrors the ledger: a reservation expiry has already reclaimed is no longer in
+        # the reserved state, so settling it is refused rather than charged twice.
         if self.outstanding.pop(reservation.reservation_id, None) is None:
             return False
 

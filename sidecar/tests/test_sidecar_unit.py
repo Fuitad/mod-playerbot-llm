@@ -1172,6 +1172,36 @@ def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -
 # --- Failure accounting: who gets their money back and who does not ---
 
 
+async def test_a_reply_whose_reservation_expired_is_dropped_rather_than_spoken(tmp_path) -> None:
+    """The ledger refusing to charge a completion must stop it being delivered.
+
+    settle returns False when expiry has already reclaimed the reservation, which happens
+    when a request outlives the expiry window. Speaking the line anyway would put a
+    delivered reply outside the enforced ceiling, and the worldserver has long since given
+    up on the request in any case. Ignoring that return value was the defect: the ledger
+    said no and the service spoke regardless.
+    """
+    service, store, adapter = make_stored_service(tmp_path)
+
+    # Reclaim the reservation the instant it is made, exactly as expiry would.
+    original_reserve = store.reserve
+
+    async def reserve_then_expire(**kwargs):
+        decision, reservation = await original_reserve(**kwargs)
+        if reservation is not None:
+            store.outstanding.pop(reservation.reservation_id, None)
+        return decision, reservation
+
+    store.reserve = reserve_then_expire  # type: ignore[method-assign]
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+
+    # The provider was called and billed, but nothing was delivered or remembered.
+    assert len(adapter.requests) == 1
+    assert store.settled_nano == 0
+    assert store.turns.get(42, []) == []
+
+
 async def test_a_refusal_gives_the_reservation_back(tmp_path) -> None:
     """A 401 or a 429 was rejected before generation, so the money was never spent.
 
