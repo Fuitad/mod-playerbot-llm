@@ -231,7 +231,7 @@ TEST(ClaudeChatProtocolTest, RequestSerializationEscapesUntrustedText)
     ChatRequest request = MakeFixtureRequest();
     request.message = "say \"hi\" \\ and\nrun\tfast \x01 caf\xC3\xA9";
 
-    std::string const serialized = SerializeRequest(request, TEST_TOKEN);
+    std::string const serialized = SerializeRequest(request, TEST_TOKEN).value();
     EXPECT_NE(serialized.find("say \\\"hi\\\" \\\\ and\\nrun\\tfast \\u0001 caf\xC3\xA9"), std::string::npos);
 }
 
@@ -239,7 +239,7 @@ TEST(ClaudeChatProtocolTest, PartyChannelSerializesAsParty)
 {
     ChatRequest request = MakeFixtureRequest();
     request.channel = ChatChannel::Party;
-    EXPECT_NE(SerializeRequest(request, TEST_TOKEN).find("\"channel\":\"party\""), std::string::npos);
+    EXPECT_NE(SerializeRequest(request, TEST_TOKEN).value().find("\"channel\":\"party\""), std::string::npos);
 }
 
 TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
@@ -273,7 +273,7 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
         "\"occurrence\":9,"
         "\"message\":\"ambient_world\"}";
 
-    EXPECT_EQ(SerializeRequest(request, TEST_TOKEN), expected);
+    EXPECT_EQ(SerializeRequest(request, TEST_TOKEN).value(), expected);
 }
 
 TEST(ClaudeChatProtocolTest, CareerRequestUsesOpaqueCandidates)
@@ -289,7 +289,7 @@ TEST(ClaudeChatProtocolTest, CareerRequestUsesOpaqueCandidates)
     };
 
     EXPECT_EQ(
-        SerializeCareerRequestContent(request),
+        SerializeCareerRequestContent(request).value(),
         "{\"personality_version\":2,\"career_version\":1,\"candidates\":["
         "{\"token\":\"career-none\",\"summary\":\"no professions\","
         "\"maximum_spending_style\":\"none\",\"market_eligible\":0,\"engagement\":0},"
@@ -1261,4 +1261,52 @@ TEST(ClaudeChatSocialProtocolTest, AnUnusableBridgeTokenRefusesTheRequest)
     EXPECT_FALSE(
         ClaudeChat::SerializeSocialRequest(request, std::string(ClaudeChat::MAX_BRIDGE_TOKEN_BYTES + 1, 'k'))
             .has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, EveryLegacyStringIsBoundedOnTheCppSideToo)
+{
+    /*
+     * The sidecar bounded these and C++ did not, so the far side was the only thing standing between
+     * a bad request and an oversize frame. That asymmetry is the same shape as the four before it.
+     */
+    ClaudeChat::ChatRequest request;
+    request.requestId = 1;
+    request.channel = ClaudeChat::ChatChannel::Whisper;
+    request.botGuidCounter = 500;
+    request.speakerGuidCounter = 900;
+    request.botName = "Grimbold";
+    request.speakerName = "Deszy";
+    request.message = "hello";
+    ASSERT_TRUE(ClaudeChat::SerializeRequest(request, SOCIAL_TOKEN).has_value());
+
+    // An unusable token is refused before anything is signed with it.
+    EXPECT_FALSE(ClaudeChat::SerializeRequest(request, "short").has_value());
+
+    ClaudeChat::ChatRequest longBot = request;
+    longBot.botName = std::string(ClaudeChat::MAX_ACTOR_NAME_BYTES + 1, 'a');
+    EXPECT_FALSE(ClaudeChat::SerializeRequest(longBot, SOCIAL_TOKEN).has_value());
+
+    ClaudeChat::ChatRequest longSpeaker = request;
+    longSpeaker.speakerName = std::string(ClaudeChat::MAX_ACTOR_NAME_BYTES + 1, 'a');
+    EXPECT_FALSE(ClaudeChat::SerializeRequest(longSpeaker, SOCIAL_TOKEN).has_value());
+
+    ClaudeChat::ChatRequest longMessage = request;
+    longMessage.message = std::string(ClaudeChat::MAX_REQUEST_MESSAGE_BYTES + 1, 'a');
+    EXPECT_FALSE(ClaudeChat::SerializeRequest(longMessage, SOCIAL_TOKEN).has_value());
+
+    // A career payload is a bounded nested document, not one remark, so it keeps its own budget.
+    ClaudeChat::ChatRequest career = longMessage;
+    career.channel = ClaudeChat::ChatChannel::Career;
+    EXPECT_TRUE(ClaudeChat::SerializeRequest(career, SOCIAL_TOKEN).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, ACareerTokenIsBoundedWhenParsedBackToo)
+{
+    // The prefix check proved the shape and nothing proved the size.
+    std::string const overlong = "career-" + std::string(ClaudeChat::MAX_CAREER_TOKEN_BYTES, 'a');
+    ASSERT_GT(overlong.size(), ClaudeChat::MAX_CAREER_TOKEN_BYTES);
+
+    EXPECT_FALSE(ClaudeChat::ParseCareerDecision(
+                     "{\"candidate_token\":\"" + overlong + "\",\"spending_style\":\"minimal\"}")
+                     .has_value());
 }

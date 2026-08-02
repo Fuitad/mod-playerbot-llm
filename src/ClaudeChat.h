@@ -44,6 +44,10 @@ namespace ClaudeChat
      * refused it, and the rule this protocol claims is that no string is bounded incidentally.
      */
     inline constexpr size_t MAX_BRIDGE_TOKEN_BYTES = 256;
+    inline constexpr size_t MAX_REQUEST_MESSAGE_BYTES = 512;
+    inline constexpr size_t MAX_CAREER_MESSAGE_BYTES = 60 * 1024;
+    inline constexpr size_t MAX_CAREER_TOKEN_BYTES = 64;
+    inline constexpr size_t MAX_CAREER_SUMMARY_BYTES = 160;
 
     // Whether a token is usable at all. Both bounds, checked before it is carried anywhere.
     [[nodiscard]] bool BridgeTokenIsUsable(std::string const& token);
@@ -269,7 +273,9 @@ namespace ClaudeChat
 
     // Serializes a request with a fixed field order. The token authenticates the frame to
     // the sidecar and never appears in logs.
-    std::string SerializeRequest(ChatRequest const& request, std::string const& token);
+    // Refuses rather than building a frame the far side will reject: the token, both names, and the
+    // message are each held to their byte budget here, matching what the sidecar enforces.
+    std::optional<std::string> SerializeRequest(ChatRequest const& request, std::string const& token);
 
     // Strict parser for sidecar responses. Accepts exactly the contract fields with a
     // matching schema version and token, one line of at most MAX_RESPONSE_MESSAGE_BYTES of
@@ -282,7 +288,9 @@ namespace ClaudeChat
         PlayerbotRecipeSpendingStyle spendingStyle = PlayerbotRecipeSpendingStyle::None;
     };
 
-    std::string SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request);
+    // Same rule for the career payload: every candidate token and summary is bounded here as well as
+    // in the sidecar, so neither side is the only thing standing between a model and an oversize frame.
+    std::optional<std::string> SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request);
     std::optional<CareerDecision> ParseCareerDecision(std::string const& content);
 
     // Bounded FIFO shared between the world thread and the bridge worker. A full or

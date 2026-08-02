@@ -429,7 +429,10 @@ std::optional<std::string> ClaudeChat::BridgeTokenFromEnvironment()
         return std::nullopt;
 
     std::string token(raw);
-    if (token.size() < MIN_BRIDGE_TOKEN_BYTES)
+
+    // Both bounds at the one place the token enters the process, so nothing downstream has to be
+    // the last thing standing between a misconfigured environment and every frame it would sign.
+    if (!BridgeTokenIsUsable(token))
         return std::nullopt;
 
     return token;
@@ -461,8 +464,30 @@ std::optional<uint32> ClaudeChat::DecodeFrameLength(std::array<uint8, FRAME_HEAD
     return length;
 }
 
-std::string ClaudeChat::SerializeRequest(ChatRequest const& request, std::string const& token)
+std::optional<std::string> ClaudeChat::SerializeRequest(ChatRequest const& request, std::string const& token)
 {
+    /*
+     * Every string is checked here as well as in the sidecar. Relying on the far side means an
+     * oversize frame is built, sent, and rejected, and the caller learns nothing about which request
+     * caused it. std::string::size() is a byte count in C++, so these are the same budgets rather
+     * than a looser character version of them.
+     */
+    if (!BridgeTokenIsUsable(token))
+        return std::nullopt;
+
+    if (request.botName.empty() || request.botName.size() > MAX_ACTOR_NAME_BYTES)
+        return std::nullopt;
+
+    if (request.speakerName.size() > MAX_ACTOR_NAME_BYTES)
+        return std::nullopt;
+
+    // A career payload is a bounded nested document rather than one remark, so it has its own,
+    // much larger budget. Everything else is held to the conversational one.
+    size_t const messageBudget =
+        request.channel == ChatChannel::Career ? MAX_CAREER_MESSAGE_BYTES : MAX_REQUEST_MESSAGE_BYTES;
+    if (request.message.empty() || request.message.size() > messageBudget)
+        return std::nullopt;
+
     std::string out;
     out.reserve(512 + request.message.size());
     out += '{';
@@ -788,8 +813,19 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     return response;
 }
 
-std::string ClaudeChat::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
+std::optional<std::string> ClaudeChat::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
 {
+    // Refused whole rather than emitted with one bad candidate in it, so a single oversize summary
+    // cannot make the entire legal set unusable on the far side.
+    for (PlayerbotCareerCandidateView const& candidate : request.candidates)
+    {
+        if (candidate.token.empty() || candidate.token.size() > MAX_CAREER_TOKEN_BYTES)
+            return std::nullopt;
+
+        if (candidate.summary.empty() || candidate.summary.size() > MAX_CAREER_SUMMARY_BYTES)
+            return std::nullopt;
+    }
+
     std::string out;
     out += '{';
     AppendJsonField(out, "personality_version", request.personalityVersion, true);
@@ -822,7 +858,7 @@ std::optional<ClaudeChat::CareerDecision> ClaudeChat::ParseCareerDecision(std::s
     auto style = fields->find("spending_style");
     if (token == fields->end() || style == fields->end() ||
         !token->second.isString || !style->second.isString ||
-        token->second.text.find("career-") != 0u)
+        token->second.text.find("career-") != 0u || token->second.text.size() > MAX_CAREER_TOKEN_BYTES)
         return std::nullopt;
 
     std::optional<PlayerbotRecipeSpendingStyle> parsedStyle = ParseSpendingStyle(style->second.text);
@@ -1203,8 +1239,13 @@ struct ClaudeChat::ClaudeBridge::Impl
             if (SteadyNowMs() > request.expiresAtSteadyMs)
                 continue;  // expired in queue: discard, fail closed
 
-            std::optional<std::vector<uint8>> const frame =
-                EncodeFrame(SerializeRequest(request, config.token));
+            // A request that cannot be serialized within its budgets is discarded here rather than
+            // sent for the far side to reject. Same fail closed posture as an expired one above.
+            std::optional<std::string> const payload = SerializeRequest(request, config.token);
+            if (!payload)
+                continue;
+
+            std::optional<std::vector<uint8>> const frame = EncodeFrame(*payload);
             if (!frame)
                 continue;  // oversized request: drop
 

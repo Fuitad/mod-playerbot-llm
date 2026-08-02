@@ -4,6 +4,8 @@
 
 #include "ClaudeChat.h"
 
+#include <algorithm>
+
 #include "ChannelMgr.h"
 #include "Chat.h"
 #include "Config.h"
@@ -209,7 +211,11 @@ namespace
             request.botGuidCounter = careerRequest.botGuid;
             request.botName = bot->GetName();
             request.profile = careerRequest.profile;
-            request.message = SerializeCareerRequestContent(careerRequest);
+            std::optional<std::string> careerContent = SerializeCareerRequestContent(careerRequest);
+            if (!careerContent)
+                return false;
+
+            request.message = *std::move(careerContent);
             request.eventKind = CAREER_EVENT_KIND;
             request.expiresAtSteadyMs = SteadyNowMs() + _responseDeadlineMs;
 
@@ -368,9 +374,27 @@ namespace
                 if (career != _careerPending.end())
                 {
                     std::optional<CareerDecision> decision = ParseCareerDecision(response.message);
-                    if (decision)
+
+                    /*
+                     * The chosen token has to be one this request actually offered. Parsing only
+                     * proves the shape is legal, and accepting an unoffered token would let a
+                     * response name a candidate the bot was never given, which is the whole point of
+                     * sending an opaque legal set rather than free text.
+                     */
+                    PlayerbotCareerPlanRequest const& request = career->second.request;
+                    bool const offered =
+                        decision && std::any_of(request.candidates.begin(), request.candidates.end(),
+                                                [&decision](PlayerbotCareerCandidateView const& candidate)
+                                                { return candidate.token == decision->candidateToken; });
+
+                    if (decision && !offered)
+                        LOG_INFO("playerbot.claude",
+                                 "mod-playerbot-claude: career decision for request {} named a candidate "
+                                 "that was never offered; discarded",
+                                 response.requestId);
+
+                    if (offered)
                     {
-                        PlayerbotCareerPlanRequest const& request = career->second.request;
                         _careerResponses[request.requestId] = {
                             request.requestId,
                             request.botGuid,
