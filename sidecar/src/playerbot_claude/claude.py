@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -247,28 +248,52 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
     )
 
 
-def build_social_user_message(request: protocol.SocialRequest) -> str:
-    """Untrusted content, explicitly fenced and labeled.
+def _fenced(heading: str, body: str) -> list[str]:
+    # Every section gets its own fence. One big block would let text inside an earlier section
+    # claim to end the fence and open a heading of its own; a reader that always expects the
+    # next heading to be one it printed itself does not have that ambiguity.
+    return [f"=== UNTRUSTED {heading} BEGINS ===", body, f"=== UNTRUSTED {heading} ENDS ===", ""]
 
-    The context is whatever the coordinator assembled: nearby chat, the thread so far, and
-    privacy filtered memory. It is passed through as one labeled block rather than being
-    interpolated into a sentence, so there is no phrasing around it for injected text to
-    complete or escape.
+
+def build_social_user_message(request: protocol.SocialRequest) -> str:
+    """Untrusted content, explicitly fenced and labeled, section by section.
+
+    Nothing here is interpolated into a sentence. There is no phrasing around any of it for
+    injected text to complete or escape, and the instructions in the system prompt say
+    plainly that everything under one of these headings is data.
     """
 
-    lines = [
-        "Answer with one line, in character.",
-        "",
-        "=== UNTRUSTED CONTEXT BEGINS ===",
-        request.context,
-        "=== UNTRUSTED CONTEXT ENDS ===",
-    ]
-    if not request.context:
-        # An absent context is stated rather than left as an empty fence, so the model is not
-        # guessing whether something failed to arrive.
-        lines[3] = "(nothing was supplied)"
+    lines = ["Answer in character, using only what follows as background.", ""]
 
-    return "\n".join(lines)
+    context = protocol.parse_social_context(request.context)
+    if context is None:
+        # Either empty, or not the agreed shape. Both are carried as opaque text rather than
+        # refused: nothing populates this field yet, and a bot going silent because a producer
+        # changed shape would be an outage with no error anywhere.
+        lines += _fenced("CONTEXT", request.context or "(nothing was supplied)")
+        return "\n".join(lines).rstrip()
+
+    if context.persona:
+        lines += _fenced("PERSONA", context.persona)
+
+    if context.relationship:
+        lines += _fenced("RELATIONSHIP", context.relationship)
+
+    if context.nearby:
+        lines += _fenced("NEARBY", "\n".join(context.nearby))
+
+    if context.thread:
+        lines += _fenced("THREAD", "\n".join(context.thread))
+
+    # Filtered by what this channel is allowed to know, not by what was sent.
+    memories = context.memories_within(request.speak_on_channel)
+    if memories:
+        lines += _fenced("MEMORIES", "\n".join(memory.text for memory in memories))
+
+    if len(lines) == 2:
+        lines += _fenced("CONTEXT", "(nothing was supplied)")
+
+    return "\n".join(lines).rstrip()
 
 
 def build_system_prompt(request: protocol.ChatRequest) -> str:
@@ -573,6 +598,236 @@ def validate_social_message(
         raise ClaudeInvalidOutputError("social message was formatted as a transcript", usage)
 
     return message
+
+
+"""Terms that mark a generated backstory as a claim rather than a background.
+
+Mirrors `FORBIDDEN_CLAIM_TERMS` in `PlayerbotPersonality.cpp`, which is the authority. A test
+asserts the two have not drifted by reading that source, because a rule kept in two places
+drifts and the copy that drifts is the one nobody re-reads.
+
+Matched as whole words against lowercased text, so "prince" does not fire on "principle".
+"""
+FORBIDDEN_CLAIM_TERMS = (
+    # Kinship, by relation and by degree.
+    "son of",
+    "daughter of",
+    "brother of",
+    "sister of",
+    "child of",
+    "heir of",
+    "heir to",
+    "descendant of",
+    "descended from",
+    "cousin of",
+    "nephew of",
+    "niece of",
+    "grandson of",
+    "granddaughter of",
+    "married to",
+    "widow of",
+    "widower of",
+    "betrothed to",
+    # Invented relationships with other characters.
+    "friend of",
+    "friends with",
+    "apprentice of",
+    "apprenticed to",
+    "student of",
+    "mentor of",
+    "mentored by",
+    "trained by",
+    "rival of",
+    "sworn to",
+    "served under",
+    "squire to",
+    "companion of",
+    "ally of",
+    # Shared history: having been somewhere or done something alongside someone.
+    "fought alongside",
+    "fought beside",
+    "fought with",
+    "rode with",
+    "marched with",
+    "personally met",
+    "once met",
+    "grew up with",
+    "survived together",
+    "witnessed the fall",
+    # Titles and ranks.
+    "highlord",
+    "high lord",
+    "warchief",
+    "archmage",
+    "lich king",
+    "lord commander",
+    "grand marshal",
+    "grand admiral",
+    "high priestess",
+    "chieftain",
+    "prince",
+    "princess",
+    "king of",
+    "queen of",
+    "lord of",
+    "lady of",
+    "captain of",
+    "master of",
+    # Personal achievements and renown.
+    "hero of",
+    "champion of",
+    "slayer of",
+    "single-handedly",
+    "singlehandedly",
+    "legendary",
+    "vanquished",
+    "saved azeroth",
+    "renowned",
+    "renown",
+    "famed",
+    "famous",
+    # Named figures. Places are deliberately absent: being from Lordaeron is an ordinary origin.
+    "arthas",
+    "thrall",
+    "jaina",
+    "sylvanas",
+    "illidan",
+    "muradin",
+)
+
+# Matches the worldserver's PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH. Anything longer is a
+# sign the model wrote prose where a field was asked for.
+MAX_BIOGRAPHY_FIELD_LENGTH = 240
+
+"""Shapes that mean a remembered fact is carrying something it should not.
+
+Contact details and credentials are the obvious ones. Instruction-like content matters just as
+much: a memory is replayed into a later prompt as context, so a stored line reading like an
+order is a delayed injection that arrives already inside the fence.
+"""
+_MEMORY_FORBIDDEN_PATTERNS = (
+    r"\b[\w.+-]+@[\w-]+\.[\w.]+\b",
+    r"\bpassword\b",
+    r"\bpasscode\b",
+    r"\bapi[ _-]?key\b",
+    r"\b\d+\s+\w+(\s+\w+)?\s+(lane|street|road|avenue|way)\b",
+    r"\bignore (all )?(previous|prior|above)\b",
+    r"\bsystem prompt\b",
+    r"\bdisregard\b.*\binstructions?\b",
+    r"\byou are now\b",
+)
+
+
+def _contains_forbidden_claim(text: str) -> str | None:
+    lowered = text.casefold()
+    for term in FORBIDDEN_CLAIM_TERMS:
+        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lowered):
+            return term
+
+    return None
+
+
+class BiographyReply(BaseModel):
+    """A generated backstory, WITHOUT any identity field.
+
+    Name, race, class, and gender are authoritative character data and are deliberately not
+    fields here: the model is never asked for them and has nowhere to put one, so a generated
+    value cannot become an identity. They are stamped on afterwards from the request.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    origin: str
+    motivation: str
+    formative_experience: str
+    interests: str
+    aversions: str
+    preferred_topics: str
+    mannerisms: str
+    values: str
+
+
+def build_biography(
+    reply: BiographyReply, identity: dict[str, object], usage: UsageTotals | None = None
+) -> dict[str, object]:
+    """Validates a generated backstory and stamps the authoritative identity onto it."""
+
+    fields = reply.model_dump()
+    for name, value in fields.items():
+        if not value.strip():
+            raise ClaudeInvalidOutputError(f"biography field {name} is empty", usage)
+
+        if len(value.encode("utf-8")) > MAX_BIOGRAPHY_FIELD_LENGTH:
+            raise ClaudeInvalidOutputError(f"biography field {name} runs to prose", usage)
+
+        term = _contains_forbidden_claim(value)
+        if term is not None:
+            raise ClaudeInvalidOutputError(
+                f"biography field {name} claims {term!r}, which the bot cannot have", usage
+            )
+
+    # Identity last and unconditionally, so it is the request's and never the model's.
+    return {**fields, **identity}
+
+
+class MemoryCandidate(BaseModel):
+    """One thing worth remembering, as a paraphrase with provenance."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    paraphrase: str
+    about_guid: int
+    scope: Literal["public", "party", "whisper"]
+
+
+class MemoryReply(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    candidates: list[MemoryCandidate] = []
+
+
+def validate_memory_reply(
+    reply: MemoryReply, thread: list[str], usage: UsageTotals | None = None
+) -> list[dict[str, object]]:
+    """Accepts paraphrases drawn from this thread, and refuses anything else.
+
+    An empty list is a correct answer: most conversations are not worth remembering, and a
+    model that always finds something to store fills the table with noise.
+    """
+
+    normalized = [_normalized(line) for line in thread]
+    accepted: list[dict[str, object]] = []
+
+    for candidate in reply.candidates:
+        text = candidate.paraphrase.strip()
+        if not text:
+            raise ClaudeInvalidOutputError("memory candidate is empty", usage)
+
+        if len(text.encode("utf-8")) > protocol.MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
+            raise ClaudeInvalidOutputError("memory candidate runs to prose", usage)
+
+        for pattern in _MEMORY_FORBIDDEN_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                raise ClaudeInvalidOutputError("memory candidate carries content it must not", usage)
+
+        # A paraphrase that reproduces a line verbatim is a transcript, and storing it turns
+        # the memory table into a chat log with a longer retention period.
+        compared = _normalized(text)
+        if any(compared and compared in line for line in normalized):
+            raise ClaudeInvalidOutputError(
+                "memory candidate quotes the thread rather than paraphrasing it", usage
+            )
+
+        accepted.append(candidate.model_dump())
+
+    return accepted
+
+
+def _normalized(line: str) -> str:
+    # Speaker prefixes and punctuation are not part of what was said, so a paraphrase that only
+    # strips them is still a quote.
+    _, _, spoken = line.partition(": ")
+    return re.sub(r"[^\w ]+", "", (spoken or line)).casefold().strip()
 
 
 def validate_social_emote(

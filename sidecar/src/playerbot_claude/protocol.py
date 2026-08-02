@@ -81,6 +81,22 @@ SOCIAL_EMOTES = {
 
 SOCIAL_EMOTE_IDS = frozenset(SOCIAL_EMOTES.values())
 
+"""Privacy scopes a remembered fact can carry, least to most private.
+
+The order is the lattice and it is load bearing: a memory may be drawn on only when the channel
+it would be spoken over is at least as private as the scope it was learned in. Mirrors
+`PlayerbotSocialPrivacyScope` on the coordinator side.
+"""
+SOCIAL_MEMORY_SCOPES = ("public", "party", "whisper")
+
+# Channel index to the most private memory scope it may draw on. General and say are heard by
+# anyone nearby, so they get public only; party may use what the party knows; a whisper is
+# already the most private thing there is.
+SOCIAL_CHANNEL_MEMORY_SCOPE = (0, 0, 1, 2)
+
+MAX_SOCIAL_CONTEXT_ENTRIES = 12
+MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512
+
 _UINT64_MAX = 2**64 - 1
 _FRAME_HEADER = struct.Struct("!I")
 
@@ -367,6 +383,78 @@ class SocialRequest(BaseModel):
             raise ValueError(f"context must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
 
         return value
+
+
+class SocialMemory(BaseModel):
+    """One remembered fact, and the privacy it was learned under."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    text: Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]
+    scope: Literal["public", "party", "whisper"]
+
+
+class SocialContext(BaseModel):
+    """What the coordinator assembled for one social line.
+
+    Every field is optional, because nothing populates this yet: Task 8's transport sends an
+    empty context and Task 9A is what will fill it. A context that does not parse as this
+    shape is not an error either, it is just text, and the caller falls back to treating it
+    as one opaque untrusted block rather than going silent.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    persona: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
+    relationship: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
+    nearby: Annotated[
+        list[Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
+        Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
+    ] = []
+    thread: Annotated[
+        list[Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
+        Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
+    ] = []
+    memories: Annotated[list[SocialMemory], Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES)] = []
+
+    def memories_within(self, channel: int) -> list[SocialMemory]:
+        """The memories this channel may draw on, most private allowed first computed.
+
+        A memory learned in a whisper cannot be repeated to a zone. The coordinator is meant
+        to filter before sending, and this does not replace that; it is the second layer, so
+        that one bug at the producer is not a bot repeating a private confidence in General.
+        """
+
+        if not 0 <= channel < len(SOCIAL_CHANNEL_MEMORY_SCOPE):
+            return []
+
+        allowed = SOCIAL_CHANNEL_MEMORY_SCOPE[channel]
+        return [memory for memory in self.memories if SOCIAL_MEMORY_SCOPES.index(memory.scope) <= allowed]
+
+
+def parse_social_context(context: str) -> SocialContext | None:
+    """The assembled context, or None when it is not that shape.
+
+    None is a normal answer rather than a failure. Nothing populates this field yet, and a
+    producer that changes shape should not silence every bot on the realm; the caller carries
+    an unparseable context through as opaque untrusted text instead.
+    """
+
+    if not context:
+        return None
+
+    try:
+        data = json.loads(context, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    try:
+        return SocialContext.model_validate(data)
+    except ValidationError:
+        return None
 
 
 def declared_kind(payload: bytes) -> str | None:
