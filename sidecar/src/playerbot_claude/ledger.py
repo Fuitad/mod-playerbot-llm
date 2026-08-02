@@ -107,21 +107,37 @@ class BudgetLedger:
     async def _lock_day(self, cursor, day: date) -> tuple[int, bool]:
         """Takes the day row's write lock and returns its settled total and circuit state.
 
-        Inserted on demand with ``INSERT IGNORE`` before the lock is taken, because
-        ``SELECT ... FOR UPDATE`` on a row that does not exist locks nothing and two
-        concurrent first-requests of the day would both proceed.
+        The SELECT comes FIRST and the insert only runs when there is nothing to lock.
+        The obvious ordering, insert-then-lock, deadlocks under real contention:
+        ``INSERT IGNORE`` on an existing row takes a shared lock on the duplicate key,
+        and two transactions both holding that shared lock while both wait to upgrade it
+        to exclusive is the textbook deadlock. It passes every test that does not
+        actually contend, which is how it survived until the concurrency test grew a
+        barrier.
+
+        On the first request of a day the select finds nothing, both callers insert, one
+        wins, and the re-select takes a clean exclusive lock on the row that exists.
         """
 
-        await cursor.execute(
-            "INSERT IGNORE INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0)",
-            (day,),
-        )
         await cursor.execute(
             "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day "
             "WHERE usage_date = %s FOR UPDATE",
             (day,),
         )
         row = await cursor.fetchone()
+
+        if row is None:
+            await cursor.execute(
+                "INSERT IGNORE INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0)",
+                (day,),
+            )
+            await cursor.execute(
+                "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day "
+                "WHERE usage_date = %s FOR UPDATE",
+                (day,),
+            )
+            row = await cursor.fetchone()
+
         if row is None:  # pragma: no cover - the insert above guarantees a row
             raise LedgerError("budget day row vanished between insert and lock")
 
@@ -223,6 +239,13 @@ class BudgetLedger:
         actually broken, and the breach is the thing worth knowing.
         """
 
+        # Decided BEFORE anything is written, and against the value as reported. An
+        # out-of-range cost would fail the SQL update, roll the transaction back, and
+        # leave the reservation outstanding with the breaker never firing, which is
+        # exactly the case the breaker exists for.
+        breach = budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano)
+        storable = budget.storable_actual_cost_nano(actual_cost_nano)
+
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
@@ -232,7 +255,7 @@ class BudgetLedger:
                     "UPDATE playerbot_claude_budget_reservation "
                     "SET state = 'settled', actual_cost_nano = %s, settled_at = %s "
                     "WHERE id = %s AND state = 'reserved'",
-                    (actual_cost_nano, now, reservation.reservation_id),
+                    (storable, now, reservation.reservation_id),
                 )
                 if cursor.rowcount == 0:
                     await connection.commit()
@@ -241,16 +264,18 @@ class BudgetLedger:
                 await cursor.execute(
                     "UPDATE playerbot_claude_budget_day SET settled_nano = settled_nano + %s "
                     "WHERE usage_date = %s",
-                    (actual_cost_nano, reservation.usage_date),
+                    (storable, reservation.usage_date),
                 )
 
-                if budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano):
+                if breach:
+                    # The REPORTED figure goes in the reason even when it could not be
+                    # stored in the column, because the number is the evidence.
                     await cursor.execute(
                         "UPDATE playerbot_claude_budget_day SET circuit_open = 1, circuit_reason = %s "
                         "WHERE usage_date = %s",
                         (
                             f"reported cost {actual_cost_nano} exceeded reservation "
-                            f"{reservation.max_cost_nano}",
+                            f"{reservation.max_cost_nano}"[:255],
                             reservation.usage_date,
                         ),
                     )

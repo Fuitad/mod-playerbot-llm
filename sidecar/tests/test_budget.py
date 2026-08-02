@@ -226,3 +226,33 @@ def test_a_nonsensical_cost_opens_the_circuit_too() -> None:
     # impossible value is safe.
     assert budget.circuit_should_open(1000, -1) is True
     assert budget.circuit_should_open(-1, 0) is True
+
+
+def test_the_reserve_floor_rounds_up_so_a_fraction_never_costs_the_player() -> None:
+    """Default half-even rounding hands background work part of the protected slice.
+
+    The reserve is the amount a player is guaranteed, so the rounding error has to fall
+    on the side that protects rather than the side that spends.
+    """
+    # A ceiling and ratio whose product is not a whole nano.
+    ceiling = 1_000_000_001
+    assert budget.reserve_floor_nano(ceiling, Decimal("0.25")) == 250_000_001
+
+    # And the boundary case that half-even would have rounded down.
+    assert budget.reserve_floor_nano(5, Decimal("0.5")) == 3
+
+
+def test_an_unstorable_cost_is_clamped_so_the_breaker_can_still_fire() -> None:
+    """The breaker exists for impossible reports, so storing one must not fail.
+
+    A value outside BIGINT UNSIGNED would fail the SQL update, roll the transaction
+    back, and leave the reservation outstanding with the breaker never firing. Clamping
+    loses the exact number, which the reason string keeps, and preserves the incident.
+    """
+    assert budget.storable_actual_cost_nano(-5) == 0
+    assert budget.storable_actual_cost_nano(budget.MAX_STORABLE_NANO + 1) == budget.MAX_STORABLE_NANO
+    assert budget.storable_actual_cost_nano(1000) == 1000
+
+    # Both still open the circuit, which is the point of clamping rather than rejecting.
+    assert budget.circuit_should_open(1000, -5) is True
+    assert budget.circuit_should_open(1000, budget.MAX_STORABLE_NANO + 1) is True

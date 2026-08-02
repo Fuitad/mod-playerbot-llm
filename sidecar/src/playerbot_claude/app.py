@@ -161,9 +161,29 @@ class SidecarConfig:
 
     @property
     def prices(self) -> storage.PriceSnapshot:
+        """The legacy SQLite pricing view, which still takes floats.
+
+        Kept only while storage.py exists. The float conversion reintroduces exactly the
+        rounding this task removes, which is why the budget path below does NOT use it:
+        `price_texts` hands the configured strings to the Decimal arithmetic in
+        `playerbot_claude.budget` untouched. When storage.py goes, this goes with it.
+        """
+
         return storage.PriceSnapshot.from_usd_per_mtok(
             float(Decimal(self.input_usd_per_mtok)), float(Decimal(self.output_usd_per_mtok))
         )
+
+    @property
+    def price_texts(self) -> tuple[str, str]:
+        """Input and output price per million tokens, as configured text.
+
+        Text end to end into the Decimal arithmetic. A price that has been through a
+        float is a price whose last digits are whatever the binary representation
+        happened to land on, and a ceiling enforced against that is not the ceiling
+        anyone configured.
+        """
+
+        return self.input_usd_per_mtok, self.output_usd_per_mtok
 
     @property
     def budget_nano(self) -> int:

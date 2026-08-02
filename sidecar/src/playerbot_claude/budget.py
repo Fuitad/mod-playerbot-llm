@@ -124,9 +124,15 @@ def validate_reserve_ratio(ratio: Decimal | str | int) -> Decimal:
 
 
 def reserve_floor_nano(ceiling_nano: int, reserve_ratio: Decimal) -> int:
-    """How much of the ceiling background work may not touch."""
+    """How much of the ceiling background work may not touch.
 
-    return int((Decimal(ceiling_nano) * reserve_ratio).to_integral_value())
+    Rounded UP. Default half-even rounding lets a fractional reserve round down, which
+    hands background work part of the slice being protected. The whole point of the
+    reserve is that it is the amount a player is guaranteed, so the rounding error has
+    to fall on the side that protects rather than the side that spends.
+    """
+
+    return int((Decimal(ceiling_nano) * reserve_ratio).to_integral_value(rounding="ROUND_CEILING"))
 
 
 def conservative_max_cost_nano(
@@ -210,6 +216,30 @@ def admit(
             return AdmissionDecision.DENIED_RESERVE
 
     return AdmissionDecision.ADMITTED
+
+
+# The widest value the ledger's BIGINT UNSIGNED columns can hold. A reported cost outside
+# this cannot be stored at all, which matters because the breaker exists precisely for
+# impossible reports: if storing one fails, the transaction rolls back and the breaker
+# never fires for the case it was built for.
+MAX_STORABLE_NANO = 2**64 - 1
+
+
+def storable_actual_cost_nano(actual_cost_nano: int) -> int:
+    """Clamps a reported cost into what the ledger can physically record.
+
+    Deliberately NOT a silent correction: the caller opens the circuit for the same
+    value, so the clamped figure is stored alongside an open breaker and a reason rather
+    than passing as an ordinary settlement. Losing the exact impossible number is worth
+    it to keep the breaker able to fire, which is the difference between a recorded
+    integrity incident and a rolled back transaction that leaves the reservation
+    outstanding forever.
+    """
+
+    if actual_cost_nano < 0:
+        return 0
+
+    return min(actual_cost_nano, MAX_STORABLE_NANO)
 
 
 def circuit_should_open(max_cost_nano: int, actual_cost_nano: int) -> bool:

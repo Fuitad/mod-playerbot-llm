@@ -105,7 +105,26 @@ async def test_two_concurrent_reservations_cannot_jointly_exceed_the_ceiling(cle
     try:
         six = budget.usd_to_nano("6.00")
 
+        # A barrier, because asyncio.gather alone does not guarantee contention: the
+        # first coroutine can finish and commit before the second begins, which would
+        # make this pass while proving only that two sequential reservations behave.
+        #
+        # Both connections take a real write lock on the SAME day row here, before either
+        # calls reserve, so the second reserve genuinely has to wait on the first.
+        barrier = asyncio.Barrier(2)
+
+        # The day row is created first, outside the barrier, so what the two coroutines
+        # actually contend on is the row lock rather than the insert.
+        await first_connection.begin()
+        async with first_connection.cursor() as cursor:
+            await cursor.execute(
+                "INSERT IGNORE INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0)",
+                (ledger.utc_day(NOW),),
+            )
+        await first_connection.commit()
+
         async def reserve(connection, request_id):
+            await barrier.wait()
             return await book.reserve(
                 connection,
                 request_id=request_id,
