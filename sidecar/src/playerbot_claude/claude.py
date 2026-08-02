@@ -304,12 +304,22 @@ _FENCE_LINE = re.compile(r"^\s*=+\s*(UNTRUSTED|TRUSTED)\b.*$", re.IGNORECASE | r
 def _neutralised(body: str) -> str:
     """Untrusted text with anything resembling a fence marker defanged.
 
+    Every line separator is normalised to a newline FIRST. `re.MULTILINE` anchors `^` only
+    after `\\n`, but a carriage return, a vertical tab, a form feed, and Unicode's own line
+    and paragraph separators are all line breaks to whatever reads this prompt. A marker
+    introduced after one of those was a line to the reader and not to the pattern, so it
+    survived untouched and could still act as a heading.
+
+    `str.splitlines` is the definition being borrowed here: it already knows every boundary
+    Python considers one, so the two cannot disagree about what a line is.
+
     The line is kept rather than dropped. Removing it would silently discard content, and a
-    reader comparing what a player typed against what the bot saw would find text missing with
-    no explanation; a visibly quoted marker is honest about what happened.
+    reader comparing what a player typed against what the bot saw would find text missing
+    with no explanation; a visibly quoted marker is honest about what happened.
     """
 
-    return _FENCE_LINE.sub(lambda match: "[quoted marker] " + match.group(0).replace("=", "-"), body)
+    normalised = "\n".join(body.splitlines())
+    return _FENCE_LINE.sub(lambda match: "[quoted marker] " + match.group(0).replace("=", "-"), normalised)
 
 
 def _fenced(heading: str, body: str) -> list[str]:

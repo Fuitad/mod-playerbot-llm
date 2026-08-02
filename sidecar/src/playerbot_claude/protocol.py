@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
-import re
 import struct
+import unicodedata
 from typing import Annotated, Literal, Self
 
 from pydantic import (
@@ -82,18 +82,34 @@ SOCIAL_EMOTES = {
 
 SOCIAL_EMOTE_IDS = frozenset(SOCIAL_EMOTES.values())
 
-"""What a character name is allowed to look like.
 
-A participant name reaches the TRUSTED system prompt, because the bot has to be told who it
-is and who it is speaking to. Bounding it by length alone made it 48 bytes of arbitrary text
-sitting inside the instructions, which is an injection vector regardless of how narrow the
-worldserver's own naming rules happen to be. This side cannot assume those rules, so it
-states them.
+def actor_name_is_usable(value: str) -> bool:
+    """Whether a string can be a character name.
 
-Letters, marks, spaces, apostrophes, and hyphens. No punctuation that could end a sentence,
-open a heading, or introduce a delimiter, and no control characters or newlines.
-"""
-SOCIAL_ACTOR_NAME_PATTERN = re.compile(r"^[^\W\d_][\w' \-]*$", re.UNICODE)
+    A participant name reaches the TRUSTED system prompt, because the bot has to be told who
+    it is and who it is speaking to, so the SHAPE of this value is a security property rather
+    than a formatting preference.
+
+    The rule is the game's own. `ObjectMgr::CheckPlayerName` calls
+    `isValidString(name, mask, numericOrSpace=false)`, so a real character name is letters
+    only: no digits, no spaces, no punctuation, at most twelve characters. Enforcing exactly
+    that closes the vector rather than narrowing it, because a name that cannot contain a
+    space cannot spell a sentence. A rule that merely excluded delimiters would still have
+    admitted "Ignore all previous rules", which reads as an instruction because it is one.
+
+    Decided by Unicode category rather than by a character class: `\\w` admits digits and the
+    underscore, and excludes the combining marks that legitimately appear in names.
+    """
+
+    if not value:
+        return False
+
+    if unicodedata.category(value[0])[0] != "L":
+        return False
+
+    # Letters, and the marks that attach to them. Nothing else, in any script.
+    return all(unicodedata.category(character)[0] in {"L", "M"} for character in value[1:])
+
 
 # Valid values of PlayerbotSocialChannel. Bounded to the enum rather than to a byte, because
 # every consumer indexes a four-entry table with it.
@@ -388,7 +404,7 @@ class SocialRequest(BaseModel):
         # name bounded only by length is 48 bytes of arbitrary text sitting inside the
         # instructions. An absent subject is the empty string and is allowed through here; the
         # model validator below is what decides absence is coherent.
-        if value and not SOCIAL_ACTOR_NAME_PATTERN.match(value):
+        if value and not actor_name_is_usable(value):
             raise ValueError("actor name is not a usable character name")
 
         return value
