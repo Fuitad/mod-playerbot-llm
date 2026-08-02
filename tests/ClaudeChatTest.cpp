@@ -1310,3 +1310,22 @@ TEST(ClaudeChatSocialProtocolTest, ACareerTokenIsBoundedWhenParsedBackToo)
                      "{\"candidate_token\":\"" + overlong + "\",\"spending_style\":\"minimal\"}")
                      .has_value());
 }
+
+TEST(ClaudeChatSocialProtocolTest, ResponseParsersBoundTheTokenExplicitly)
+{
+    /*
+     * Equality against a validated token and the frame ceiling bounded this only as a side effect.
+     * The rule this protocol claims is that no string is bounded as a side effect, and a response
+     * parser handed an unusable expected token should refuse rather than compare against it.
+     */
+    std::string const tooLong(ClaudeChat::MAX_BRIDGE_TOKEN_BYTES + 1, 'k');
+
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), tooLong, 77, 500).has_value());
+    EXPECT_FALSE(ClaudeChat::ParseResponsePayload(
+                     "{\"schema_version\":3,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     tooLong)
+                     .has_value());
+
+    std::string const tooShort(ClaudeChat::MIN_BRIDGE_TOKEN_BYTES - 1, 'k');
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), tooShort, 77, 500).has_value());
+}

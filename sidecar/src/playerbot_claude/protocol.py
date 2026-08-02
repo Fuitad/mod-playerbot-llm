@@ -64,11 +64,15 @@ def _byte_length(text: str) -> int:
 
 
 def _validated_token(value: str) -> str:
-    """Both bridge token bounds, in UTF-8 bytes. Shared by every request model."""
+    """Both bridge token bounds, in UTF-8 bytes. Shared by every request model and encoder.
+
+    Raises ValueError so a pydantic field validator reports it as a schema violation, which
+    parse_request and parse_social_request already translate into a ProtocolError.
+    """
 
     length = _byte_length(value)
     if length < MIN_BRIDGE_TOKEN_BYTES or length > MAX_BRIDGE_TOKEN_BYTES:
-        raise ValueError(
+        raise ProtocolError(
             f"bridge token must be {MIN_BRIDGE_TOKEN_BYTES} to {MAX_BRIDGE_TOKEN_BYTES} UTF-8 bytes"
         )
 
@@ -364,6 +368,8 @@ def encode_social_response(
     if not 0 <= speak_on_channel <= 255:
         raise ProtocolError("speak_on_channel out of range")
 
+    token = _validated_token(token)
+
     if regenerate:
         message = ""
     else:
@@ -423,6 +429,11 @@ def encode_response(request_id: int, message: str, token: str) -> bytes:
 
     if not 1 <= request_id <= _UINT64_MAX:
         raise ProtocolError("request_id out of range")
+
+    # Explicit rather than incidental. The runtime token was validated when it was read, but an
+    # encoder that only ever relies on that is one refactor away from signing a frame with
+    # whatever it was handed.
+    token = _validated_token(token)
 
     _validate_response_message(message)
 

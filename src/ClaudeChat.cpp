@@ -534,7 +534,14 @@ std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::st
     if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
         return std::nullopt;
 
-    if (!tokenIt->second.isString || !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+    // Explicit rather than incidental. Equality against a validated token and the frame ceiling
+    // bounded this only as a side effect, and the rule this protocol claims is that no string is
+    // bounded as a side effect.
+    if (!BridgeTokenIsUsable(expectedToken))
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !BridgeTokenIsUsable(tokenIt->second.text) ||
+        !ConstantTimeEquals(tokenIt->second.text, expectedToken))
         return std::nullopt;
 
     if (requestIt->second.isString)
@@ -757,7 +764,11 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
         return std::nullopt;
 
-    if (!tokenIt->second.isString || !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+    if (!BridgeTokenIsUsable(expectedToken))
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !BridgeTokenIsUsable(tokenIt->second.text) ||
+        !ConstantTimeEquals(tokenIt->second.text, expectedToken))
         return std::nullopt;
 
     /*
