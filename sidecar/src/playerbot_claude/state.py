@@ -39,6 +39,11 @@ POOL_MAX_SIZE = 4
 # difference between the next request working and it failing with "server has gone away".
 POOL_RECYCLE_SECONDS = 3600
 
+# What a caller should catch around opening or using the database. The driver's own error
+# base does NOT derive from OSError, so catching OSError alone lets a refused connection
+# escape as a bare traceback rather than the bounded refusal every caller here promises.
+DatabaseUnavailable = (OSError, aiomysql.Error)
+
 
 class SidecarState(Protocol):
     """Every durable operation the request path can perform.

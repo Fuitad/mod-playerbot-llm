@@ -6,11 +6,15 @@ inserting a reservation, and settling or releasing one. That split is deliberate
 rule embedded in a transaction is a rule the tests can reach only through a
 transaction, and the arithmetic is the part that has to be right.
 
-Concurrency rests on one row. Every reservation for a given UTC day serializes on
-``SELECT ... FOR UPDATE`` of that day's row, so two requests deciding at the same
-instant cannot both read the same remaining budget and both spend it. The day row is
-created on demand and never deleted, because a row that can vanish is a lock that can
-be skipped.
+Concurrency rests on one named lock. Every reservation takes ``budget_day`` through
+:func:`acquire_named_lock` before reading anything, so two requests deciding at the same
+instant cannot both see the same remaining budget and both spend it. One global key
+rather than one per date: only one day is ever being written at a time in practice, so a
+per-date key bought no concurrency and grew the lock table by a row a day forever.
+
+The lock is an upsert rather than a locking read. Both of the obvious alternatives raced,
+in opposite directions, and each one's test covered only the case the other broke. That
+history is written out at :meth:`BudgetLedger._lock_day`.
 """
 
 from __future__ import annotations
@@ -325,11 +329,16 @@ class BudgetLedger:
         """The next unused attempt number for one request id.
 
         Reads the unique key's own leading column, so this is an index lookup rather than
-        a scan, and it runs inside the day lock so two reservations on the same day
-        cannot derive the same number. Two reservations for one request id racing across
-        a UTC midnight would hold different day locks and could; the unique key refuses
-        the second, the transaction rolls back, and the request fails closed rather than
-        quietly sharing a reservation.
+        a scan. It runs under :meth:`_lock_day`, whose key is the single global
+        ``budget_day`` rather than one key per date, so every reservation in the process
+        serializes here regardless of which calendar day it falls on and no two can derive
+        the same number, midnight included.
+
+        If that key ever became per-day, this would need revisiting: two reservations for
+        one request id either side of a UTC midnight would then hold different locks. The
+        unique key would refuse the second and the request would fail closed rather than
+        quietly sharing a reservation, which is survivable, but it would stop being
+        impossible.
         """
 
         await cursor.execute(
@@ -455,14 +464,21 @@ class BudgetLedger:
                 if breach:
                     # The REPORTED figure goes in the reason even when it could not be
                     # stored in the column, because the number is the evidence.
+                    #
+                    # Built as one string and then sliced. Slicing the expression inline
+                    # is equivalent, because adjacent literals concatenate into a single
+                    # atom before the subscript applies, but it reads as though the bound
+                    # covers only the last fragment and a reviewer has already misread it
+                    # that way. The column is VARCHAR(255); an over-long reason would
+                    # fail the update, roll the transaction back, and leave the breaker
+                    # shut for the exact case it exists to catch.
+                    reason = (
+                        f"reported cost {actual_cost_nano} exceeded reservation {reservation.max_cost_nano}"
+                    )
                     await cursor.execute(
                         "UPDATE playerbot_claude_budget_day SET circuit_open = 1, circuit_reason = %s "
                         "WHERE usage_date = %s",
-                        (
-                            f"reported cost {actual_cost_nano} exceeded reservation "
-                            f"{reservation.max_cost_nano}"[:255],
-                            reservation.usage_date,
-                        ),
+                        (reason[:255], reservation.usage_date),
                     )
 
             await connection.commit()

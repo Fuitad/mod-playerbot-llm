@@ -21,7 +21,7 @@ from decimal import Decimal
 import aiomysql
 import pytest
 
-from playerbot_claude import budget, ledger, protocol
+from playerbot_claude import app, budget, claude, ledger, protocol
 from playerbot_claude import state as state_module
 from playerbot_claude.app import PlayerbotsDatabaseSettings
 from playerbot_claude.budget import AdmissionDecision, RequestPriority
@@ -793,11 +793,19 @@ async def mysql_state() -> AsyncIterator[tuple[state_module.MySqlSidecarState, a
     """
     settings = _settings()
     state, pool = await state_module.open_state(settings, ceiling_nano=CEILING, reserve_ratio=QUARTER)
+    # Every table this fixture's tests touch, not just the budget ones. Leaving the
+    # ambient attempts behind made the first try_begin_ambient of a later test see a
+    # rolling hour that was already full, which is a test failing for another test's
+    # reason. Written out rather than looped over an interpolated name: a table name
+    # cannot be a bound parameter, so a loop means building SQL from a string.
     async with pool.acquire() as connection:
         async with connection.cursor() as cursor:
             await cursor.execute("DELETE FROM playerbot_claude_budget_reservation")
             await cursor.execute("DELETE FROM playerbot_claude_budget_day")
             await cursor.execute("DELETE FROM playerbot_claude_profile")
+            await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+            await cursor.execute("DELETE FROM playerbot_claude_career_decision")
+            await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
         await connection.commit()
     try:
         yield state, pool
@@ -919,3 +927,159 @@ async def test_a_repeated_request_id_gets_its_own_attempt_rather_than_a_duplicat
         await connection.commit()
 
     assert [int(row[0]) for row in rows] == [1, 2, 3]
+
+
+async def test_the_state_facade_carries_every_remaining_operation(mysql_state) -> None:
+    """The methods the reserve and settle test does not touch.
+
+    Each is a delegation with its own parameter list, and a delegation is exactly where a
+    misrouted argument hides: the in-memory double the unit suite uses takes the same
+    arguments and would agree with a wrong mapping. Read back rather than assumed.
+    """
+    state, pool = mysql_state
+
+    assert await state.try_begin_ambient(messages_per_hour=2, now=NOW) is True
+    assert await state.try_begin_ambient(messages_per_hour=2, now=NOW) is True
+    assert await state.try_begin_ambient(messages_per_hour=2, now=NOW) is False
+
+    await state.append_turn(bot_guid=7788, role="user", content="first", now=NOW)
+    await state.append_turn(bot_guid=7788, role="assistant", content="second", now=NOW)
+    assert await state.recent_turns(bot_guid=7788) == [("user", "first"), ("assistant", "second")]
+    # A different bot's memory is its own.
+    assert await state.recent_turns(bot_guid=7789) == []
+
+    await state.record_career_decision(
+        bot_guid=7788,
+        career_version=1,
+        candidate_token="career-def456",
+        spending_style="progression",
+        now=NOW,
+    )
+    # Read straight from the table rather than through a facade accessor. Nothing in the
+    # sidecar reads a career decision back yet, and adding a method so a test can call it
+    # is production surface that exists only for the test.
+    async with pool.acquire() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT career_version, candidate_token, spending_style "
+                "FROM playerbot_claude_career_decision WHERE bot_guid = %s",
+                (7788,),
+            )
+            row = await cursor.fetchone()
+        await connection.commit()
+    assert row is not None
+    assert (int(row[0]), row[1], row[2]) == (1, "career-def456", "progression")
+
+    reserved = await state.reserve(
+        request_id=990,
+        max_cost_nano=budget.usd_to_nano("1.00"),
+        priority=RequestPriority.BACKGROUND,
+        now=NOW,
+    )
+    assert reserved[1] is not None
+    assert await state.release(reservation=reserved[1]) is True
+    assert (await state.budget_state(now=NOW)).outstanding_nano == 0
+
+
+class _StubAdapter(claude.ClaudeAdapter):
+    """Stands in for the Anthropic SDK so no HTTP request is made. Everything else is real."""
+
+    reply = "A fine day for fishing."
+
+    def __init__(self) -> None:
+        # Deliberately no super().__init__(): the stub never builds a real client.
+        pass
+
+    def count_input_tokens(self, request, history) -> int:
+        return 100
+
+    def generate_reply(self, request, history):
+        return self.reply, claude.UsageTotals(input_tokens=100, output_tokens=10)
+
+
+def _service_request_payload(request_id: int, bot_guid: int) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 3,
+            "token": TOKEN,
+            "request_id": request_id,
+            "channel": "whisper",
+            "bot_guid": bot_guid,
+            "speaker_guid": 9001,
+            "bot_name": "Facadebot",
+            "speaker_name": "Speaker",
+            "profile_version": 2,
+            "crafting_affinity": 11,
+            "gathering_affinity": 22,
+            "exploration_affinity": 33,
+            "sociability": 44,
+            "voice": "wry",
+            "event_kind": 0,
+            "subject_id": 0,
+            "occurrence": 0,
+            "message": "What do you enjoy doing?",
+        }
+    ).encode()
+
+
+async def test_a_complete_service_request_runs_against_real_mysql(mysql_state) -> None:
+    """The whole pipeline through the real facade, not the in-memory double.
+
+    Every unit test of the service substitutes a double for the state, so the wiring
+    between the service and MySQL is exercised by nothing else: a facade method that
+    reached the wrong ledger call, or a connection returned mid-transaction under real
+    load, would pass the entire unit suite. This reserves, generates, settles, and writes
+    memory through the real pool, then reads the rows back.
+    """
+    state, pool = mysql_state
+    request_id, bot_guid = 4242, 55555
+
+    config = app.SidecarConfig(
+        enable=True,
+        bridge_port=0,
+        daily_budget_usd="10.00",
+        human_budget_reserve_ratio="0.25",
+        input_usd_per_mtok="1.00",
+        output_usd_per_mtok="5.00",
+    )
+    service = app.SidecarService(
+        config=config, token=TOKEN, adapter=_StubAdapter(), store=state, now=lambda: NOW
+    )
+
+    payload = await service.process_payload(_service_request_payload(request_id, bot_guid))
+    assert payload is not None
+    assert json.loads(payload)["message"] == _StubAdapter.reply
+
+    request = protocol.parse_request(_service_request_payload(request_id, bot_guid), TOKEN)
+    assert await state.recent_turns(bot_guid=bot_guid) == [
+        ("user", claude.build_user_message(request)),
+        ("assistant", _StubAdapter.reply),
+    ]
+
+    profile = await state.get_profile(bot_guid=bot_guid)
+    assert profile is not None
+    assert profile["bot_name"] == "Facadebot"
+    assert profile["gathering_affinity"] == 22
+
+    after = await state.budget_state(now=NOW)
+    assert after.outstanding_nano == 0
+    # 100 input at $1/Mtok plus 10 output at $5/Mtok.
+    assert after.settled_nano == budget.usd_to_nano("0.00015")
+
+    async with pool.acquire() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT state, actual_cost_nano, attempt FROM playerbot_claude_budget_reservation "
+                "WHERE request_id = %s",
+                (request_id,),
+            )
+            rows = await cursor.fetchall()
+        await connection.commit()
+
+    assert len(rows) == 1
+    assert rows[0][0] == "settled"
+    assert int(rows[0][1]) == after.settled_nano
+    assert int(rows[0][2]) == 1
+
+    # The pool is intact: nothing was discarded for holding a transaction open.
+    assert pool.freesize == pool.size

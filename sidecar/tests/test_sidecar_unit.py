@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -933,6 +934,17 @@ async def test_the_service_makes_no_generation_call_without_a_budget(tmp_path) -
     assert store.calls == []
 
 
+class RaisingAdapter(FakeAdapter):
+    """Fails generation with one supplied error, after the reservation exists."""
+
+    def __init__(self, error: claude.ClaudeError) -> None:
+        super().__init__()
+        self.error = error
+
+    def generate_reply(self, request, history):
+        raise self.error
+
+
 def make_stored_service(
     tmp_path,
     adapter=None,
@@ -985,28 +997,6 @@ async def test_the_money_is_reserved_before_the_provider_is_ever_called(tmp_path
 
     assert store.calls.index("reserve") < store.calls.index("settle")
     assert adapter.generated_at_call_index == store.calls.index("reserve") + 1
-
-
-async def test_a_provider_failure_gives_the_reservation_back(tmp_path) -> None:
-    """Definition of Done 3's other half: a failed attempt must not hold the budget.
-
-    The call raised before any completion existed, so nothing was billed. Leaving the
-    maximum charged for the full expiry window would deny later requests money the
-    budget demonstrably still has.
-    """
-
-    class FailingAdapter(FakeAdapter):
-        def generate_reply(self, request, history):
-            raise claude.ClaudeTimeoutError("provider timed out")
-
-    service, store, _ = make_stored_service(tmp_path, adapter=FailingAdapter())
-
-    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
-
-    assert len(store.released) == 1
-    assert store.outstanding == {}
-    assert store.settled_nano == 0
-    assert store.settlements == []
 
 
 async def test_a_denied_request_never_reaches_the_provider(tmp_path) -> None:
@@ -1162,6 +1152,129 @@ def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -
     reported = report["budget"]
     assert isinstance(reported, dict)
     assert reported["circuit_open"] is True
+
+
+# --- Failure accounting: who gets their money back and who does not ---
+
+
+async def test_only_a_proven_refusal_gives_the_reservation_back(tmp_path) -> None:
+    """A refusal generated nothing. Everything else may already have been billed.
+
+    Releasing an ambiguous failure lets real spending go unrecorded and admits further
+    requests against money already gone, which is the exact failure a ceiling exists to
+    prevent. Charging the maximum is an over-charge the day's ceiling absorbs.
+    """
+    refusals = (claude.ClaudeAuthError("401"), claude.ClaudeRateLimitError("429"))
+    billable = (
+        claude.ClaudeInvalidOutputError("model returned junk"),
+        claude.ClaudeTimeoutError("timed out"),
+        claude.ClaudeProviderError("provider error: InternalServerError"),
+    )
+
+    for error in refusals:
+        service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
+        assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+        assert len(store.released) == 1, f"{type(error).__name__} should release"
+        assert store.settled_nano == 0
+        assert store.outstanding == {}
+
+    for error in billable:
+        service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
+        assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+        assert store.released == [], f"{type(error).__name__} must not release"
+        # Charged at the reservation's maximum, since the real cost is unknowable.
+        assert store.settled_nano == store.reservations[0].max_cost_nano
+        assert store.outstanding == {}
+
+
+def test_the_billing_classification_covers_every_adapter_error(tmp_path) -> None:
+    """A new error type defaults to billable, which is the safe direction.
+
+    Enumerated rather than spot-checked, so adding a subclass without deciding its
+    billing status cannot silently start releasing reservations.
+    """
+    subclasses = {cls.__name__ for cls in claude.ClaudeError.__subclasses__()}
+    assert subclasses == {
+        "ClaudeTimeoutError",
+        "ClaudeAuthError",
+        "ClaudeRateLimitError",
+        "ClaudeProviderError",
+        "ClaudeInvalidOutputError",
+    }
+    assert claude.billing_is_impossible(claude.ClaudeError("unclassified")) is False
+
+
+async def test_an_unpriceable_completion_stays_silent_rather_than_settling_free(tmp_path) -> None:
+    """Settling a real completion at zero is the one outcome a ceiling cannot survive.
+
+    The reservation is left outstanding at its maximum for the ledger's expiry to
+    reclaim, and the failure is bounded rather than escaping into the connection handler,
+    which only understands protocol and connection errors.
+    """
+
+    class NegativeUsageAdapter(FakeAdapter):
+        def generate_reply(self, request, history):
+            self.requests.append(request)
+            return self.reply, claude.UsageTotals(input_tokens=-1, output_tokens=10)
+
+    service, store, _ = make_stored_service(tmp_path, adapter=NegativeUsageAdapter())
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+    assert store.settlements == []
+    assert store.released == []
+    # Still held at maximum: expiry reclaims it, nothing records it as free.
+    assert list(store.outstanding.values()) == [store.reservations[0].max_cost_nano]
+
+
+# --- The response deadline, which bounds the whole pipeline ---
+
+
+def test_the_default_adapter_client_timeout_is_capped_at_the_deadline(tmp_path, monkeypatch) -> None:
+    """A provider call must not outlive the request that paid for it."""
+    captured: dict[str, object] = {}
+
+    class RecordingAdapter(claude.ClaudeAdapter):
+        def __init__(self, client=None, timeout_seconds: float = claude.REQUEST_TIMEOUT_SECONDS) -> None:
+            captured["timeout_seconds"] = timeout_seconds
+
+    monkeypatch.setattr(claude, "ClaudeAdapter", RecordingAdapter)
+    config = app.SidecarConfig.load(write_conf(tmp_path))
+    app.SidecarService(config=config, token=TEST_TOKEN, store=FakeState(config.budget_nano))
+
+    assert captured["timeout_seconds"] == config.response_deadline_ms / 1000
+
+
+async def test_the_response_deadline_stops_a_slow_request_without_charging_it_free(tmp_path) -> None:
+    """Definition of Done: an expired request stays silent and writes no memory.
+
+    The worldserver has already given up by then, so finishing late would only spend on a
+    reply nobody can receive. The reservation deliberately stays outstanding at its
+    maximum for expiry to reclaim: a request cancelled mid-generation may well have been
+    billed.
+    """
+    started = asyncio.Event()
+
+    class SlowAdapter(FakeAdapter):
+        def generate_reply(self, request, history):
+            started.set()
+            time.sleep(0.5)
+            return self.reply, claude.UsageTotals(input_tokens=100, output_tokens=10)
+
+    config_text = CONF_TEXT.replace(
+        "PlayerbotClaude.ResponseDeadlineMs = 10000", "PlayerbotClaude.ResponseDeadlineMs = 50"
+    )
+    config = app.SidecarConfig.load(write_conf(tmp_path, config_text))
+    store = FakeState(config.budget_nano, config.reserve_ratio)
+    service = app.SidecarService(
+        config=config, token=TEST_TOKEN, adapter=SlowAdapter(), store=store, now=lambda: FIXED_NOW
+    )
+
+    assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+
+    assert started.is_set(), "the deadline must cut a call that actually started"
+    assert store.settlements == []
+    assert store.turns.get(42, []) == []
+    assert list(store.outstanding.values()) == [store.reservations[0].max_cost_nano]
 
 
 def test_nano_amounts_render_as_exact_decimals() -> None:

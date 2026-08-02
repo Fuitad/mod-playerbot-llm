@@ -422,19 +422,43 @@ class SidecarService:
             try:
                 reply, usage = await asyncio.to_thread(self._adapter.generate_reply, request, history)
             except claude.ClaudeError as error:
-                # The reservation is given back rather than left to expire. The call
-                # raised before any completion existed, so no tokens were billed, and
-                # holding the maximum for ten minutes would deny a request that the
-                # budget can in fact afford. A failure the sidecar never learns about
-                # (a crash, a cancelled deadline) still falls through to expiry.
-                await store.release(reservation=reservation)
-                _log(f"request {request.request_id}: {type(error).__name__}: {error}")
+                # Only a refusal gives the money back. An authentication or rate limit
+                # failure PROVES nothing was generated, so holding its maximum for ten
+                # minutes would deny a later request money the budget demonstrably has.
+                #
+                # Every other failure is charged at the reservation's maximum, because it
+                # may already have been billed: invalid output arrives after a completion
+                # that was, and a timeout or provider error is ambiguous with the SDK's
+                # own retry. Charging the maximum is an over-charge the day's ceiling
+                # absorbs; releasing would let real spending go unrecorded and admit
+                # further requests against money already gone.
+                if claude.billing_is_impossible(error):
+                    await store.release(reservation=reservation)
+                    outcome = "reservation released"
+                else:
+                    await store.settle(
+                        reservation=reservation,
+                        actual_cost_nano=reservation.max_cost_nano,
+                        now=self._now(),
+                    )
+                    outcome = "charged at the reserved maximum, billing could not be ruled out"
+                _log(f"request {request.request_id}: {type(error).__name__}: {error} ({outcome})")
                 return None
 
             settled_at = self._now()
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+            except ValueError as error:
+                # A completion that cannot be priced must not settle as free. Left
+                # outstanding at its maximum for the ledger's expiry to reclaim, and
+                # reported as a bounded failure rather than escaping into the connection
+                # handler, which only understands protocol and connection errors.
+                _log(f"request {request.request_id}: cannot price the completion: {error}")
+                return None
+
             await store.settle(
                 reservation=reservation,
-                actual_cost_nano=_actual_cost_nano(usage, input_prices),
+                actual_cost_nano=actual_cost_nano,
                 now=settled_at,
             )
 
@@ -589,7 +613,10 @@ def main(argv: list[str] | None = None) -> int:
             budget_state = asyncio.run(
                 _with_state(config, database, lambda store: store.budget_state(now=datetime.now(UTC)))
             )
-        except OSError as error:
+        except state.DatabaseUnavailable as error:
+            # Only the exception TYPE is logged. A driver message can carry the host,
+            # port, and user it failed to authenticate, and doctor's whole purpose is
+            # being safe to paste into a bug report.
             _log(f"cannot reach the Playerbots database: {type(error).__name__}")
             budget_state = None
         report = doctor_report(config, budget_state=budget_state)
@@ -603,9 +630,13 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.bot_guid is None:
             parser.error("profile requires --bot-guid")
         bot_guid = arguments.bot_guid
-        profile = asyncio.run(
-            _with_state(config, database, lambda store: store.get_profile(bot_guid=bot_guid))
-        )
+        try:
+            profile = asyncio.run(
+                _with_state(config, database, lambda store: store.get_profile(bot_guid=bot_guid))
+            )
+        except state.DatabaseUnavailable as error:
+            _log(f"cannot reach the Playerbots database: {type(error).__name__}")
+            return 1
         if profile is None:
             # A bot that has never spoken through the bridge has no trustworthy
             # observed profile to report.
@@ -630,7 +661,14 @@ def main(argv: list[str] | None = None) -> int:
         _log("disabled by configuration (PlayerbotClaude.Enable / BridgePort); refusing to start")
         return 1
 
-    asyncio.run(serve(config, token, database=database))
+    try:
+        asyncio.run(serve(config, token, database=database))
+    except state.DatabaseUnavailable as error:
+        # Refusing to start is the point. A sidecar that came up without its ledger would
+        # answer requests with no way to record what they cost.
+        _log(f"cannot reach the Playerbots database: {type(error).__name__}; refusing to start")
+        return 1
+
     return 0
 
 

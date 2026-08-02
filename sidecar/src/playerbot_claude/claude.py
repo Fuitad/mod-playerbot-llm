@@ -70,6 +70,30 @@ class ClaudeInvalidOutputError(ClaudeError):
     pass
 
 
+def billing_is_impossible(error: ClaudeError) -> bool:
+    """Whether this failure PROVES the provider generated nothing and billed nothing.
+
+    Only the refusals qualify. Authentication fails at 401 and rate limiting at 429, both
+    before any generation, so a reservation held for one of those is money that was never
+    going to be spent and giving it back is correct.
+
+    Everything else is treated as billable, including failures that probably were not:
+
+    - ``ClaudeInvalidOutputError`` is raised AFTER a completion came back. The tokens were
+      generated and charged; only the content was unusable.
+    - ``ClaudeTimeoutError`` and ``ClaudeProviderError`` are genuinely ambiguous. The SDK
+      is configured with ``max_retries=1``, so a request may have been received, processed,
+      and billed before the connection failed.
+
+    Being wrong in the billable direction costs an over-charge that the day's ceiling
+    absorbs. Being wrong in the other direction lets real spending go unrecorded and admits
+    further requests against money already gone, which is the failure a ceiling exists to
+    prevent. When it cannot be known, charge.
+    """
+
+    return isinstance(error, ClaudeAuthError | ClaudeRateLimitError)
+
+
 class ChatReply(BaseModel):
     """Structured output schema: the model produces only a chat message."""
 

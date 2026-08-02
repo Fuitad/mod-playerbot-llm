@@ -8,9 +8,23 @@ worldserver (C++)                     sidecar (Python)              Anthropic AP
 | world thread        |     TCP       | asyncio server     | -----> | Claude    |
 |  ClaudeChatScripts  | <-----------> |  protocol.py       | <----- | Haiku 4.5 |
 | bridge worker       |  length-      |  claude.py         |        +-----------+
-|  ClaudeChat/Bridge  |  prefixed     |  storage.py (SQLite)|
-+---------------------+  JSON frames  +--------------------+
+|  ClaudeChat/Bridge  |  prefixed     |  budget.py         |
++---------------------+  JSON frames  |  ledger.py         |
+                                      |  state.py          |
+                                      +---------+----------+
+                                                |
+                                                v
+                                      +--------------------+
+                                      | MySQL              |
+                                      |  acore_playerbots  |
+                                      +--------------------+
 ```
+
+The sidecar shares the worldserver's Playerbots database rather than keeping a private
+file. That is what makes the budget hold across a sidecar restart and across two
+sidecars pointed at one realm, and it removes a second thing to back up. Connection
+settings are read from the deployed `playerbots.conf` through `--playerbots-config`,
+never duplicated into the sidecar's own configuration.
 
 ## Worldserver side (C++)
 
@@ -49,32 +63,48 @@ All game state lives on the world thread. The bridge worker thread never touches
 
 All money is integer nano-USD (1 USD = 1,000,000,000 nano), so documented examples reproduce exactly and no float rounding can leak into the ledger.
 
-Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at the default Haiku 4.5 rates. Tested examples (see `test_documented_cost_examples_are_exact`):
+Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at the default Haiku 4.5 rates, rounded up. Tested examples:
 
 - `2,500` input plus `80` output tokens: `2,900,000` nano, rendered `0.0029` USD
 - `4,095` input plus `96` output tokens: `4,575,000` nano, rendered `0.004575` USD
 
-The reserve-then-settle cycle, one SQLite WAL transaction per step:
+The decisions and the storage are deliberately separate. `budget.py` holds every rule as a pure function of its arguments: no clock, no database, no network. `ledger.py` holds only what genuinely needs a database. A rule embedded in a transaction is a rule the tests can reach only through a transaction, and the arithmetic is the part that has to be right.
+
+The reserve-then-settle cycle, one MySQL transaction per step:
 
 1. **Count.** The exact prompt is counted via the API, with the same structured output schema the generation request sends (the schema is billed as input). Input above 4,095 tokens is rejected before any money moves.
-2. **Reserve.** The maximum possible cost (counted input plus 96 output tokens) is charged. If rolling settled actual cost plus rolling unsettled maximum cost plus this maximum would exceed `DailyBudgetUsd`, no reservation is created and no provider call happens.
-3. **Submit.** The reservation is marked submitted before the provider call.
-4. **Settle.** After a successful reply, actual usage atomically replaces the maximum charge and an append-only usage row records tokens, price snapshot, and cost.
+2. **Reserve.** The maximum possible cost (counted input plus the full 96 token output allowance, rounded up) is charged. Reading the day's totals, applying the admission policy, and inserting the reservation all happen inside one transaction holding the `budget_day` named lock, so two concurrent requests cannot both see the same remaining budget and both fit.
+3. **Settle.** After a successful reply, the reported usage replaces the maximum. If the reported cost exceeds what was reserved, the day's circuit breaker opens, the true figure is recorded, and every later request is denied.
 
-A crash or provider failure at any point leaves the reservation charged at its maximum. Every request is attributed to reservation creation time. Settled actual cost and unsettled maximum cost leave the active window exactly 24 hours later, but no ledger row is deleted. `DailyBudgetUsd` accepts values through `5`; missing, zero, negative, or larger values disable all generation. SQLite `BEGIN IMMEDIATE` transactions prevent concurrent processes from admitting reservations beyond the rolling ceiling.
+Admission is refused, in this order, for an open circuit, unknown pricing, the total ceiling, and then the human reserve. The reserve denies background work only: `HumanBudgetReserveRatio` protects a share of the ceiling for whispers, party lines, and social replies, while ambient World chatter and career selection are background. Human work is protected from background work; it is not exempt from the ceiling.
 
-The ambient rate gate uses the same transaction strategy. It stores each accepted attempt before token counting, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary.
+The ceiling is per UTC calendar day, so it rolls over at one instant regardless of server timezone or daylight saving. The configured `DailyBudgetUsd` is the only ceiling; there is no maximum above it.
+
+Failure handling depends on what can be proven:
+
+- An authentication or rate limit failure proves nothing was generated, so the reservation is released immediately.
+- Invalid output, a timeout, or a provider error may already have been billed, so the reservation is settled at its maximum. Over-charging is absorbed by the day's ceiling; under-recording admits later requests against money already gone.
+- A crash or a cancelled deadline tells the sidecar nothing at all. Those reservations stay charged at maximum until another transaction reclaims them, ten minutes after creation. A completion arriving after that reclaim is refused rather than charged twice, because `settle` only accepts a reservation still in the reserved state.
+
+The ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary.
 
 ## Storage schema
 
+All in `acore_playerbots`, created on start if absent. Nothing migrates from the removed SQLite file.
+
 | Table | Contents | Bound |
 | --- | --- | --- |
-| `profiles` | Latest observed trusted profile per bot | One row per bot |
-| `conversation_turns` | Rolling dialogue memory | 20 turns per bot, older rows deleted |
-| `reservations` | Budget reservations with state `reserved`, `submitted`, or `settled` | Append and update |
-| `usage_log` | Actual usage with price snapshots | Append only |
-| `ambient_attempts` | Accepted ambient attempt timestamps | Rolling one hour |
-| `career_decisions` | Validated opaque career response diagnostics | Latest row per bot |
+| `playerbot_claude_profile` | Latest observed trusted profile per bot | One row per bot |
+| `playerbot_claude_conversation_turn` | Rolling dialogue memory | 12 turns per bot, trimmed on write |
+| `playerbot_claude_budget_day` | Settled total and circuit breaker state | One row per UTC day |
+| `playerbot_claude_budget_reservation` | One row per attempt, with maximum and settled cost | Unique on request id and attempt |
+| `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps | Rolling one hour |
+| `playerbot_claude_career_decision` | Validated opaque career response diagnostics | Latest row per bot |
+| `playerbot_claude_lock` | Named serialization points | Bounded key set, never deleted |
+
+Conversation memory is trimmed on write rather than on read, so the table is bounded on disk and not merely in what a query returns.
+
+The worldserver's request ids come from a per-process counter that restarts at 1, so they are unique only within one worldserver run. The attempt number is derived inside the day lock as the next unused value for that request id, which is why a repeat after a restart gets its own reservation rather than colliding on the unique key.
 
 ## Failure modes
 
@@ -89,9 +119,13 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Budget exhausted | Dropped before the provider call |
 | Ambient hourly rate exhausted | Dropped before token counting |
 | No connected human or eligible World bot | No ambient request is enqueued |
-| Provider timeout, auth, rate limit, or error | Dropped; reservation stays charged at maximum |
-| Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation stays charged at maximum |
-| Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped |
+| Provider auth or rate limit refusal | Dropped; reservation released, since nothing was generated |
+| Provider timeout or error | Dropped; reservation settled at maximum, since billing cannot be ruled out |
+| Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation stays outstanding for expiry reclaim |
+| Model output invalid (empty, multiline, above 240 bytes, wrong schema) | Dropped; reservation settled at maximum, since the tokens were billed |
+| Completion cannot be priced | Dropped; reservation stays outstanding rather than settling as free |
+| Circuit breaker open | Every request denied until it is cleared |
+| Playerbots database unreachable | Sidecar refuses to start; `doctor` reports it and exits nonzero |
 | Bot despawned or deadline passed | Response discarded at delivery |
 | Last human disconnects during generation | Accepted attempt remains charged; response is discarded |
 | Career provider disabled, busy, invalid, or late | Playerbot persists its deterministic fallback |
