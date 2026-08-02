@@ -10,6 +10,7 @@
 
 #include "Bot/Social/PlayerbotSocialProvider.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -203,6 +204,14 @@ namespace ClaudeChat
     {
         uint64 socialRequestToken = 0;
         std::string payload;
+
+        /*
+         * Stamped by the worker when the answer is queued, not read when the world thread gets
+         * around to it. Whether a response beat its deadline is a fact about when it ARRIVED, and
+         * the two clocks can be a whole tick apart. Judging by drain time would discard an answer
+         * that was in time and accept one that was not, depending only on tick alignment.
+         */
+        int64 receivedAtSteadyMs = 0;
     };
 
 /*
@@ -267,6 +276,18 @@ namespace ClaudeChat
      * drifted would be the one that only the far side enforced.
      */
     [[nodiscard]] bool SocialRequestIsUsable(SocialRequest const& request, std::string const& token);
+
+    /*
+     * How long a social exchange may stay outstanding, given what the operator configured.
+     *
+     * `PlayerbotClaude.ResponseDeadlineMs` has only a floor, so nothing stops it being set above the
+     * coordinator's own provider timeout. Past that point the coordinator has already abandoned the
+     * request as timed out while this side still holds the slot, so the transport would sit at its
+     * bound refusing new work on behalf of requests nobody is waiting for. The coordinator's timeout
+     * is therefore the ceiling, and it is named here rather than inlined so it is testable without
+     * waiting out a real one.
+     */
+    [[nodiscard]] int64 SocialRequestDeadlineMs(int64 configuredDeadlineMs);
 
     std::optional<std::string> SerializeSocialRequest(SocialRequest const& request, std::string const& token);
 
@@ -589,8 +610,11 @@ namespace ClaudeChat
     class ClaudeSocialTransport
     {
     public:
+        // Capped here rather than at the call site, so the invariant stays with the class that
+        // depends on it and a later caller cannot reintroduce the mismatch.
         ClaudeSocialTransport(ClaudeBridge& bridge, std::string bridgeToken, int64 requestDeadlineMs)
-            : _bridge(bridge), _bridgeToken(std::move(bridgeToken)), _requestDeadlineMs(requestDeadlineMs)
+            : _bridge(bridge), _bridgeToken(std::move(bridgeToken)),
+              _requestDeadlineMs(SocialRequestDeadlineMs(requestDeadlineMs))
         {
         }
 

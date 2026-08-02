@@ -719,30 +719,26 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
     std::vector<Completed> completed;
 
     /*
-     * Released first, because most ways a request dies never produce a payload at all: an expired
-     * queue entry, a request that could not be serialized, an oversize frame, a sidecar that never
-     * answered, a dropped connection, and an answer that arrived to a full response queue are all
-     * silent. Without this sweep those exchanges hold their slots forever, and 512 of them is a
-     * transport that refuses every subsequent request for the rest of the uptime.
+     * Answers are read BEFORE the sweep below, and each is judged by when it ARRIVED rather than by
+     * when this drain happens to run. Sweeping first would erase an exchange whose valid answer was
+     * already sitting in the queue, purely because the world thread looked one tick late. Draining
+     * first without checking arrival would do the opposite and accept an answer that missed its
+     * deadline. The stamp the worker takes on arrival is what separates the two cases.
      */
-    int64 const nowMs = SteadyNowMs();
-    for (auto entry = _exchanges.begin(); entry != _exchanges.end();)
-    {
-        if (entry->second.expiresAtSteadyMs > nowMs)
-        {
-            ++entry;
-            continue;
-        }
-
-        completed.push_back(Completed{entry->first, SocialExchangeOutcome::Abandon, {}});
-        entry = _exchanges.erase(entry);
-    }
-
     for (SocialRawResponse const& raw : _bridge.DrainSocialResponses())
     {
         auto const outstanding = _exchanges.find(raw.socialRequestToken);
         if (outstanding == _exchanges.end())
             continue;  // Cleared while its answer was in flight. Never resurrect an exchange.
+
+        if (raw.receivedAtSteadyMs > outstanding->second.expiresAtSteadyMs)
+        {
+            // Late. The coordinator has its own timeout and may already have given up, so treating
+            // this as an answer would deliver a line for a conversation that has moved on.
+            _exchanges.erase(outstanding);
+            completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Abandon, {}});
+            continue;
+        }
 
         SocialResponse response;
         SocialExchangeOutcome const outcome = outstanding->second.exchange.Classify(raw.payload, _bridgeToken,
@@ -819,7 +815,33 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
         completed.push_back(Completed{raw.socialRequestToken, SocialExchangeOutcome::Deliver, std::move(result)});
     }
 
+    /*
+     * Whatever is left never answered at all. Most ways a request dies are silent: an expired queue
+     * entry, a request that could not be serialized, an oversize frame, a sidecar that never
+     * replied, a dropped connection, and an answer that arrived to a full response queue all
+     * produce no payload. Without this sweep those exchanges hold their slots forever, and 512 of
+     * them is a transport that refuses every subsequent request for the rest of the uptime.
+     */
+    int64 const nowMs = SteadyNowMs();
+    for (auto entry = _exchanges.begin(); entry != _exchanges.end();)
+    {
+        if (entry->second.expiresAtSteadyMs > nowMs)
+        {
+            ++entry;
+            continue;
+        }
+
+        completed.push_back(Completed{entry->first, SocialExchangeOutcome::Abandon, {}});
+        entry = _exchanges.erase(entry);
+    }
+
     return completed;
+}
+
+int64 ClaudeChat::SocialRequestDeadlineMs(int64 configuredDeadlineMs)
+{
+    return std::min<int64>(configuredDeadlineMs,
+                           static_cast<int64>(PLAYERBOT_SOCIAL_PROVIDER_TIMEOUT_SECONDS) * 1000);
 }
 
 bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
@@ -1460,7 +1482,8 @@ struct ClaudeChat::ClaudeBridge::Impl
                 {
                     // Handed back unparsed. Classifying it spends the regeneration budget, which
                     // lives with the transport on the world thread and not here.
-                    socialResponses.TryPush(SocialRawResponse{social->socialRequestToken, std::move(*answer)});
+                    socialResponses.TryPush(
+                        SocialRawResponse{social->socialRequestToken, std::move(*answer), SteadyNowMs()});
                 }
                 else if (std::optional<ChatResponse> response = ParseResponsePayload(*answer, config.token))
                 {

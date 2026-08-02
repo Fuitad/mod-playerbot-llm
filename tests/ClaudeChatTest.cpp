@@ -1651,3 +1651,101 @@ TEST(ClaudeChatSocialTransportTest, TheBoundRecoversOnceDeadRequestsExpire)
 
     EXPECT_TRUE(transport.Submit(MakeSocialRequest(ClaudeChat::MAX_OUTSTANDING_SOCIAL_REQUESTS + 1)));
 }
+
+TEST(ClaudeChatSocialTransportTest, AConfiguredDeadlineCannotOutliveTheCoordinatorsOwnTimeout)
+{
+    /*
+     * `PlayerbotClaude.ResponseDeadlineMs` has only a floor, so an operator can set it to minutes.
+     * The coordinator abandons a request it is still waiting on after its own provider timeout, and
+     * a transport that kept holding the slot past that point would sit at its bound refusing new
+     * work on behalf of requests nobody is waiting for any more.
+     */
+    int64 constexpr COORDINATOR_CEILING_MS = static_cast<int64>(PLAYERBOT_SOCIAL_PROVIDER_TIMEOUT_SECONDS) * 1000;
+
+    EXPECT_EQ(ClaudeChat::SocialRequestDeadlineMs(600000), COORDINATOR_CEILING_MS);
+    EXPECT_LT(ClaudeChat::SocialRequestDeadlineMs(600000), 600000);
+
+    // Exactly at the ceiling is allowed, and anything under it is the operator's to choose.
+    EXPECT_EQ(ClaudeChat::SocialRequestDeadlineMs(COORDINATOR_CEILING_MS), COORDINATOR_CEILING_MS);
+    EXPECT_EQ(ClaudeChat::SocialRequestDeadlineMs(5000), 5000);
+}
+
+TEST(ClaudeChatSocialTransportTest, AnAnswerThatBeatItsDeadlineIsKeptEvenWhenTheDrainIsLate)
+{
+    /*
+     * Whether an answer was in time is a fact about when it ARRIVED, not about when the world thread
+     * next happens to look. The sidecar replies here almost immediately, well inside the deadline,
+     * but nothing drains until long after that deadline has passed. Sweeping expired exchanges
+     * before reading the queue would throw this perfectly good line away purely because a tick ran
+     * late, which is a dropped conversation with no error anywhere to explain it.
+     */
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return SocialPayload(); });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    // The answer lands in single digit milliseconds over a loopback socket, so 1000 ms is a wide
+    // margin for "in time", and the 1600 ms wait puts the drain firmly outside it.
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 1000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const drained = transport.Drain();
+    bridge.Stop();
+
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].socialRequestToken, 77u);
+    EXPECT_EQ(drained[0].outcome, ClaudeChat::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
+
+TEST(ClaudeChatSocialTransportTest, ARetryIsGivenAFullDeadlineRatherThanTheOriginalsRemainder)
+{
+    /*
+     * A regeneration is a fresh question, so it gets a fresh deadline. Leaving the exchange on the
+     * original one would judge the retry's answer against a clock that started before the retry was
+     * even sent, and a sidecar that answered promptly would still be recorded as too late.
+     *
+     * The timings below are chosen so the second answer lands OUTSIDE the original deadline and
+     * INSIDE the extended one, which is the only window where the two behaviours differ:
+     *
+     *   deadline 1000 ms; first answer at ~700 ms, so the retry is sent at ~750 ms
+     *   original deadline expires at ~1000 ms; extended deadline runs to ~1750 ms
+     *   second answer arrives at ~1250 ms: 250 ms past the original, 500 ms inside the extension
+     */
+    std::atomic<uint32_t> asks{0};
+    FakeSidecarServer server([&](std::string const&) -> std::optional<std::string> {
+        if (++asks == 1)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            return SocialPayload("social", 77, 500, "", 1);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return SocialPayload();
+    });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+    bridge.Start();
+
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, 1000);
+    ASSERT_TRUE(transport.Submit(MakeSocialRequest()));
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> outcomes;
+    WaitFor([&]() {
+        std::vector<ClaudeChat::ClaudeSocialTransport::Completed> batch = transport.Drain();
+        outcomes.insert(outcomes.end(), batch.begin(), batch.end());
+        return outcomes.size() >= 2;
+    }, 8000);
+    bridge.Stop();
+
+    ASSERT_EQ(outcomes.size(), 2u);
+    EXPECT_EQ(outcomes[0].outcome, ClaudeChat::SocialExchangeOutcome::Regenerate);
+
+    // Without the extension this is an Abandon: either the sweep drops the exchange at the original
+    // deadline, or the answer is judged late when it finally arrives.
+    EXPECT_EQ(outcomes[1].outcome, ClaudeChat::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(asks.load(), 2u);
+    EXPECT_EQ(transport.OutstandingCount(), 0u);
+}
