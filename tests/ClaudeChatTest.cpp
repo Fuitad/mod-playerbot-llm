@@ -1209,3 +1209,56 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
         EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(bad, SOCIAL_TOKEN).has_value()) << name;
     }
 }
+
+TEST(ClaudeChatSocialProtocolTest, TheBridgeTokenIsBoundedLikeEveryOtherProtocolString)
+{
+    // It had a floor for entropy and a frame ceiling that bounded it only incidentally. The rule
+    // this protocol claims is that no string is bounded incidentally.
+    EXPECT_FALSE(ClaudeChat::BridgeTokenIsUsable(std::string(ClaudeChat::MIN_BRIDGE_TOKEN_BYTES - 1, 'k')));
+    EXPECT_TRUE(ClaudeChat::BridgeTokenIsUsable(std::string(ClaudeChat::MIN_BRIDGE_TOKEN_BYTES, 'k')));
+    EXPECT_TRUE(ClaudeChat::BridgeTokenIsUsable(std::string(ClaudeChat::MAX_BRIDGE_TOKEN_BYTES, 'k')));
+    EXPECT_FALSE(ClaudeChat::BridgeTokenIsUsable(std::string(ClaudeChat::MAX_BRIDGE_TOKEN_BYTES + 1, 'k')));
+}
+
+TEST(ClaudeChatSocialProtocolTest, ASubjectIsEitherFullyPresentOrFullyAbsent)
+{
+    /*
+     * A zero guid with a name still attached is an orphan: nothing can resolve it, but it still
+     * travels, and a prompt builder reading the name would describe a participant who is not there.
+     */
+    ClaudeChat::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+
+    // Fully absent is legal.
+    EXPECT_TRUE(ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
+
+    // Fully present is legal.
+    request.subject = SocialActor(900, "Deszy", true);
+    EXPECT_TRUE(ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
+
+    // Half described is not.
+    request.subject = SocialActor(0, "Deszy", false);
+    EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
+
+    request.subject = ClaudeChat::Actor{};
+    request.subject.human = true;
+    EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
+
+    EXPECT_TRUE(ClaudeChat::ActorIsAbsent(ClaudeChat::Actor{}));
+    EXPECT_FALSE(ClaudeChat::ActorIsAbsent(SocialActor(0, "Deszy", false)));
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnUnusableBridgeTokenRefusesTheRequest)
+{
+    ClaudeChat::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+
+    EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(request, "short").has_value());
+    EXPECT_FALSE(
+        ClaudeChat::SerializeSocialRequest(request, std::string(ClaudeChat::MAX_BRIDGE_TOKEN_BYTES + 1, 'k'))
+            .has_value());
+}

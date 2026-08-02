@@ -35,6 +35,7 @@ MAX_THREAD_ID_BYTES = 64
 MAX_CAREER_TOKEN_BYTES = 64
 MAX_CAREER_SUMMARY_BYTES = 160
 MIN_BRIDGE_TOKEN_BYTES = 32
+MAX_BRIDGE_TOKEN_BYTES = 256
 AMBIENT_EVENT_KIND = 4
 CAREER_EVENT_KIND = 5
 AMBIENT_EVENT_MARKER = "ambient_world"
@@ -104,7 +105,7 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[3]
-    token: str
+    token: Annotated[str, StringConstraints(min_length=MIN_BRIDGE_TOKEN_BYTES, max_length=MAX_BRIDGE_TOKEN_BYTES)]
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     channel: Literal["whisper", "party", "world", "career", "social"]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -237,7 +238,7 @@ class SocialRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[3]
-    token: str
+    token: Annotated[str, StringConstraints(min_length=MIN_BRIDGE_TOKEN_BYTES, max_length=MAX_BRIDGE_TOKEN_BYTES)]
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -249,6 +250,17 @@ class SocialRequest(BaseModel):
     speak_on_channel: Annotated[int, Field(ge=0, le=255)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
     context: str
+
+    @model_validator(mode="after")
+    def _subject_is_present_or_absent(self) -> Self:
+        # Never half described. A zero guid with a name attached is an orphan that still travels
+        # and still describes a participant who is not there.
+        absent = self.subject_guid == 0 and not self.subject_name and self.subject_human == 0
+        present = self.subject_guid != 0 and bool(self.subject_name)
+        if not absent and not present:
+            raise ValueError("subject must be either fully absent or fully identified")
+
+        return self
 
     @field_validator("bot_name", "subject_name")
     @classmethod

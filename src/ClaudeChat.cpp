@@ -574,6 +574,18 @@ std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::st
     return std::nullopt;
 }
 
+bool ClaudeChat::BridgeTokenIsUsable(std::string const& token)
+{
+    return token.size() >= MIN_BRIDGE_TOKEN_BYTES && token.size() <= MAX_BRIDGE_TOKEN_BYTES;
+}
+
+bool ClaudeChat::ActorIsAbsent(Actor const& actor)
+{
+    // Every field, not just the guid. A zero guid with a name attached is an orphan that still
+    // travels and still describes somebody who is not there.
+    return actor.guidCounter == 0 && actor.name.empty() && !actor.human;
+}
+
 bool ClaudeChat::ActorIsUsable(Actor const& actor)
 {
     // A nameless or unnamed actor cannot describe a real character, and an unbounded name is not a
@@ -643,12 +655,18 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
      * on the far side means an oversize frame is built, sent, and rejected, and the caller learns
      * nothing about which request was at fault.
      */
+    if (!BridgeTokenIsUsable(token))
+        return std::nullopt;
+
     if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot))
         return std::nullopt;
 
-    // The subject may be absent, in which case it is not described at all. If it is present it is
-    // held to the same rule as the bot.
-    if (request.subject.guidCounter != 0 && !ActorIsUsable(request.subject))
+    /*
+     * The subject is either fully absent or fully usable, never half described. Accepting a zero
+     * guid with a name still attached would serialize a participant nothing can resolve, and a
+     * prompt builder reading that name would describe somebody who is not there.
+     */
+    if (!ActorIsAbsent(request.subject) && !ActorIsUsable(request.subject))
         return std::nullopt;
 
     if (request.threadPublicId.empty() || request.threadPublicId.size() > MAX_THREAD_ID_BYTES)

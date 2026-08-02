@@ -37,6 +37,16 @@ namespace ClaudeChat
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
     inline constexpr size_t MIN_BRIDGE_TOKEN_BYTES = 32;
+    /*
+     * The token has a floor for entropy and now a ceiling for the same reason every other string
+     * here does. Equality checks and the frame ceiling bounded it only incidentally: a very long
+     * token would still be copied, compared, and serialized into every request before anything
+     * refused it, and the rule this protocol claims is that no string is bounded incidentally.
+     */
+    inline constexpr size_t MAX_BRIDGE_TOKEN_BYTES = 256;
+
+    // Whether a token is usable at all. Both bounds, checked before it is carried anywhere.
+    [[nodiscard]] bool BridgeTokenIsUsable(std::string const& token);
     inline constexpr uint32 MAX_AMBIENT_MESSAGES_PER_HOUR = 60;
     inline constexpr uint8 AMBIENT_EVENT_KIND = 4;
     inline constexpr uint8 CAREER_EVENT_KIND = 5;
@@ -86,6 +96,15 @@ namespace ClaudeChat
         std::string name;
         bool human = false;
     };
+
+    /*
+     * An actor is either fully present or fully absent, never half described.
+     *
+     * A zero guid with a name still attached is an orphaned combination: nothing can resolve it, but
+     * it still travels, and a prompt builder reading the name would describe a participant that is
+     * not there. Absence has to mean absence.
+     */
+    [[nodiscard]] bool ActorIsAbsent(Actor const& actor);
 
     inline constexpr size_t MAX_ACTOR_NAME_BYTES = 48;
 
