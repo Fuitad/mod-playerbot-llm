@@ -25,7 +25,7 @@ TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
 # Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
 CPP_REQUEST_FIXTURE = (
-    '{"schema_version":2,'
+    '{"schema_version":3,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":7,'
     '"channel":"whisper",'
@@ -47,7 +47,7 @@ CPP_REQUEST_FIXTURE = (
 
 # Byte-for-byte copy of the C++ AmbientRequestSerializesToExactContractJson fixture.
 CPP_AMBIENT_REQUEST_FIXTURE = (
-    '{"schema_version":2,'
+    '{"schema_version":3,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":8,'
     '"channel":"world",'
@@ -199,7 +199,7 @@ def test_accepts_exact_cpp_ambient_fixture() -> None:
 
 def test_rejects_invalid_utf8_payload() -> None:
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_request(b'{"schema_version":2,"bad":"\xff"}', TEST_TOKEN)
+        protocol.parse_request(b'{"schema_version":3,"bad":"\xff"}', TEST_TOKEN)
 
 
 def test_rejects_non_object_payload() -> None:
@@ -386,7 +386,7 @@ def test_response_payload_matches_cpp_accepted_shape() -> None:
     payload = protocol.encode_response(7, "I enjoy fishing.", TEST_TOKEN)
     # Byte-for-byte the shape the C++ ValidResponseRoundTrips fixture accepts.
     assert payload == (
-        b'{"schema_version":2,"token":"0123456789abcdef0123456789abcdef",'
+        b'{"schema_version":3,"token":"0123456789abcdef0123456789abcdef",'
         b'"request_id":7,"message":"I enjoy fishing."}'
     )
 
@@ -835,7 +835,7 @@ async def test_service_processes_valid_request(tmp_path) -> None:
     assert payload is not None
 
     response = json.loads(payload)
-    assert response["schema_version"] == 2
+    assert response["schema_version"] == 3
     assert response["request_id"] == 7
     assert response["message"] == "A fine day for fishing."
     assert response["token"] == TEST_TOKEN
@@ -1351,3 +1351,100 @@ def test_response_rejects_invalid_messages() -> None:
 
     # 240 bytes exactly is accepted.
     protocol.encode_response(7, "a" * protocol.MAX_RESPONSE_MESSAGE_BYTES, TEST_TOKEN)
+
+
+# Typed social protocol ------------------------------------------------------------------
+
+
+def _social_request_payload(**overrides: object) -> bytes:
+    payload = {
+        "schema_version": 3,
+        "token": TEST_TOKEN,
+        "kind": "social",
+        "social_request_token": 77,
+        "bot_guid": 500,
+        "bot_name": "Grimbold",
+        "bot_human": 0,
+        "subject_guid": 900,
+        "subject_name": "Deszy",
+        "subject_human": 1,
+        "speak_on_channel": 2,
+        "thread_id": "thr_00000000000000000000000000000001",
+        "context": "party pull",
+    }
+    payload.update(overrides)
+    return json.dumps(payload).encode("utf-8")
+
+
+def test_social_request_round_trips() -> None:
+    request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
+
+    assert request.social_request_token == 77
+    assert request.bot_guid == 500
+    assert request.bot_human == 0
+    assert request.subject_human == 1
+
+
+def test_social_request_rejects_unknown_fields_and_bad_kind() -> None:
+    # The C++ side declares the kind rather than relying on shape, so a career answer cannot
+    # be read as a social one. The same holds in reverse here.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(kind="career"), TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(extra=1), TEST_TOKEN)
+
+
+def test_social_request_rejects_an_old_schema() -> None:
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(schema_version=2), TEST_TOKEN)
+
+
+def test_social_request_bounds_the_context_in_bytes() -> None:
+    # Bounded in bytes rather than characters: a multibyte context would otherwise pass a
+    # character check and overflow the frame budget.
+    multibyte = "\u00e9" * (protocol.MAX_SOCIAL_CONTEXT_BYTES // 2 + 1)
+    assert len(multibyte) <= protocol.MAX_SOCIAL_CONTEXT_BYTES
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(context=multibyte), TEST_TOKEN)
+
+
+def test_social_request_rejects_a_mismatched_token() -> None:
+    with pytest.raises(protocol.TokenMismatchError):
+        protocol.parse_social_request(_social_request_payload(), "z" * 40)
+
+
+def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
+    encoded = json.loads(protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN))
+
+    assert encoded == {
+        "schema_version": 3,
+        "token": TEST_TOKEN,
+        "kind": "social",
+        "social_request_token": 77,
+        "bot_guid": 500,
+        "speak_on_channel": 2,
+        "message": "Aye.",
+        "regenerate": 0,
+    }
+
+
+def test_a_regeneration_carries_no_message() -> None:
+    encoded = json.loads(protocol.encode_social_response(77, 500, 2, "ignored", TEST_TOKEN, regenerate=True))
+
+    assert encoded["regenerate"] == 1
+    assert encoded["message"] == ""
+
+
+def test_a_deliverable_social_line_is_still_held_to_the_response_rules() -> None:
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 2, "", TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 2, "one\ntwo", TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(
+            77, 500, 2, "a" * (protocol.MAX_RESPONSE_MESSAGE_BYTES + 1), TEST_TOKEN
+        )

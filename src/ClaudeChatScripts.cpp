@@ -618,7 +618,12 @@ namespace
         bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& message,
                                 Player* receiver) override
         {
-            if (type == CHAT_MSG_WHISPER && language != LANG_ADDON)
+            /*
+             * Yielded to the social coordinator while it is on. Capturing here as well would produce a
+             * second, unrelated answer to the same whisper, chosen by a different rule.
+             */
+            if (type == CHAT_MSG_WHISPER && language != LANG_ADDON &&
+                LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 ClaudeChatState::Instance().CaptureWhisper(player, receiver, message);
 
             return true;
@@ -627,7 +632,8 @@ namespace
         bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& message,
                                 Group* group) override
         {
-            if (type == CHAT_MSG_PARTY && language != LANG_ADDON)
+            if (type == CHAT_MSG_PARTY && language != LANG_ADDON &&
+                LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 ClaudeChatState::Instance().CaptureParty(player, group, message);
 
             return true;
@@ -635,7 +641,7 @@ namespace
 
         void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
         {
-            if (!quest)
+            if (!quest || !LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 return;
 
             ClaudeChatState::Instance().CaptureMilestone(player, 1, quest->GetQuestId(),
@@ -644,7 +650,8 @@ namespace
 
         void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
         {
-            if (!player || player->GetLevel() <= oldLevel)
+            if (!player || player->GetLevel() <= oldLevel ||
+                !LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 return;
 
             ClaudeChatState::Instance().CaptureMilestone(player, 2, player->GetLevel(),
@@ -653,7 +660,7 @@ namespace
 
         void OnPlayerLootItem(Player* player, Item* item, uint32 /*count*/, ObjectGuid /*lootguid*/) override
         {
-            if (!item)
+            if (!item || !LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 return;
 
             ItemTemplate const* proto = item->GetTemplate();

@@ -48,7 +48,7 @@ namespace
     }
 
     std::string ValidResponsePayload(uint64 requestId, std::string const& message,
-                                     std::string const& token = TEST_TOKEN, uint32 schemaVersion = 2)
+                                     std::string const& token = TEST_TOKEN, uint32 schemaVersion = 3)
     {
         return "{\"schema_version\":" + std::to_string(schemaVersion) + ",\"token\":\"" + token +
                "\",\"request_id\":" + std::to_string(requestId) + ",\"message\":\"" + message + "\"}";
@@ -204,7 +204,7 @@ TEST(ClaudeChatProtocolTest, FrameLengthDecodeRejectsOversizedLength)
 TEST(ClaudeChatProtocolTest, RequestSerializesToExactContractJson)
 {
     std::string const expected =
-        "{\"schema_version\":2,"
+        "{\"schema_version\":3,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":7,"
         "\"channel\":\"whisper\","
@@ -254,7 +254,7 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
     request.occurrence = 9;
 
     std::string const expected =
-        "{\"schema_version\":2,"
+        "{\"schema_version\":3,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":8,"
         "\"channel\":\"world\","
@@ -898,4 +898,210 @@ TEST(ClaudeChatBridgeTest, ReconnectsAfterServerClosesConnection)
     ASSERT_EQ(responses.size(), 1u);
     EXPECT_EQ(responses[0].requestId, 22u);
     EXPECT_EQ(responses[0].message, "back again");
+}
+
+// Typed social protocol ----------------------------------------------------------------------------
+
+namespace
+{
+    std::string const SOCIAL_TOKEN(40, 'k');
+
+    ClaudeChat::Actor SocialActor(uint64 guid, std::string name, bool human)
+    {
+        ClaudeChat::Actor actor;
+        actor.guidCounter = guid;
+        actor.name = std::move(name);
+        actor.human = human;
+        return actor;
+    }
+
+    std::string SocialPayload(std::string kind = "social", uint64 requestToken = 77, uint64 botGuid = 500,
+                              std::string message = "Aye, that pack hits hard.", uint64 regenerate = 0,
+                              uint64 schema = ClaudeChat::SCHEMA_VERSION)
+    {
+        std::string out = "{\"schema_version\":" + std::to_string(schema);
+        out += ",\"token\":\"" + SOCIAL_TOKEN + "\"";
+        out += ",\"kind\":\"" + kind + "\"";
+        out += ",\"social_request_token\":" + std::to_string(requestToken);
+        out += ",\"bot_guid\":" + std::to_string(botGuid);
+        out += ",\"speak_on_channel\":2";
+        out += ",\"message\":\"" + message + "\"";
+        out += ",\"regenerate\":" + std::to_string(regenerate);
+        out += "}";
+        return out;
+    }
+}
+
+TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
+{
+    /*
+     * Definition of Done 2. Two shapes would let a prompt builder treat the two differently by
+     * accident, and the contract is explicit that a human's priority comes from being actively
+     * engaged rather than from being human, which only holds if both are described identically.
+     */
+    ClaudeChat::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.subject = SocialActor(900, "Deszy", true);
+    request.speakOnChannel = 2;
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+    request.context = "party pull";
+
+    std::string const payload = ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN);
+
+    // The same field suffixes for both, differing only in the flag.
+    EXPECT_NE(payload.find("\"bot_guid\":500"), std::string::npos);
+    EXPECT_NE(payload.find("\"bot_name\":\"Grimbold\""), std::string::npos);
+    EXPECT_NE(payload.find("\"bot_human\":0"), std::string::npos);
+    EXPECT_NE(payload.find("\"subject_guid\":900"), std::string::npos);
+    EXPECT_NE(payload.find("\"subject_name\":\"Deszy\""), std::string::npos);
+    EXPECT_NE(payload.find("\"subject_human\":1"), std::string::npos);
+    EXPECT_NE(payload.find("\"kind\":\"social\""), std::string::npos);
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialized)
+{
+    EXPECT_TRUE(ClaudeChat::ActorIsUsable(SocialActor(500, "Grimbold", false)));
+    EXPECT_FALSE(ClaudeChat::ActorIsUsable(SocialActor(0, "Grimbold", false)));
+    EXPECT_FALSE(ClaudeChat::ActorIsUsable(SocialActor(500, "", false)));
+    EXPECT_FALSE(ClaudeChat::ActorIsUsable(SocialActor(500, std::string(ClaudeChat::MAX_ACTOR_NAME_BYTES + 1, 'a'),
+                                                       false)));
+    EXPECT_FALSE(ClaudeChat::ActorIsUsable(SocialActor(500, "Grim\nbold", false)));
+}
+
+TEST(ClaudeChatSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
+{
+    std::optional<ClaudeChat::SocialResponse> const parsed =
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->socialRequestToken, 77u);
+    EXPECT_EQ(parsed->botGuidCounter, 500u);
+    EXPECT_EQ(parsed->speakOnChannel, 2u);
+    EXPECT_EQ(parsed->message, "Aye, that pack hits hard.");
+    EXPECT_FALSE(parsed->regenerate);
+}
+
+TEST(ClaudeChatSocialProtocolTest, ACareerDecisionCannotArriveAsASocialLine)
+{
+    // Definition of Done 3 and 4. Career and social answers travel the same socket, so telling them
+    // apart by shape rather than by declaration is how a crafting choice ends up spoken in a zone.
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("career"), SOCIAL_TOKEN, 77, 500).has_value());
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload("chat"), SOCIAL_TOKEN, 77, 500).has_value());
+
+    // And a near miss is not a match either.
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("Social"), SOCIAL_TOKEN, 77, 500).has_value());
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("social_draft"), SOCIAL_TOKEN, 77, 500).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnAnswerToADifferentRequestOrBotIsRefused)
+{
+    // A perfectly well formed answer is still not this answer.
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 78, 500).has_value());
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 501).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AMismatchedSchemaOrTokenIsRefused)
+{
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload("social", 77, 500, "hi", 0, 2), SOCIAL_TOKEN,
+                                                        77, 500)
+                     .has_value());
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload(), std::string(40, 'z'), 77, 500).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, UnknownFieldsAndOversizeMessagesAreRefused)
+{
+    // Definition of Done 4.
+    std::string extra = SocialPayload();
+    extra.insert(extra.size() - 1, ",\"extra\":1");
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(extra, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const oversize(ClaudeChat::MAX_RESPONSE_MESSAGE_BYTES + 1, 'a');
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("social", 77, 500, oversize), SOCIAL_TOKEN, 77, 500)
+            .has_value());
+
+    // An empty line is not a deliverable answer.
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("social", 77, 500, ""), SOCIAL_TOKEN, 77, 500)
+            .has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, ARegenerationMayCarryNoMessage)
+{
+    // The sidecar saying its own output was unusable. It has nothing to deliver, so it is not held
+    // to the deliverable line rule, and the coordinator decides whether to ask again.
+    std::optional<ClaudeChat::SocialResponse> const parsed =
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("social", 77, 500, "", 1), SOCIAL_TOKEN, 77, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->regenerate);
+    EXPECT_TRUE(parsed->message.empty());
+
+    // At most one, so a sidecar returning malformed output forever cannot be retried indefinitely.
+    EXPECT_EQ(ClaudeChat::MAX_REGENERATIONS_PER_REQUEST, 1u);
+}
+
+TEST(ClaudeChatSocialProtocolTest, ARegenerationFlagOutsideItsRangeIsRefused)
+{
+    EXPECT_FALSE(
+        ClaudeChat::ParseSocialResponsePayload(SocialPayload("social", 77, 500, "hi", 2), SOCIAL_TOKEN, 77, 500)
+            .has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, TheResponseKindEnumFailsClosed)
+{
+    // Neither -Wswitch nor -Werror is on, so a value cast in from a payload reaches a consumer
+    // unchallenged unless the predicate refuses it.
+    EXPECT_TRUE(ClaudeChat::ResponseKindIsValid(ClaudeChat::ResponseKind::Chat));
+    EXPECT_TRUE(ClaudeChat::ResponseKindIsValid(ClaudeChat::ResponseKind::Career));
+    EXPECT_TRUE(ClaudeChat::ResponseKindIsValid(ClaudeChat::ResponseKind::Social));
+    EXPECT_FALSE(ClaudeChat::ResponseKindIsValid(static_cast<ClaudeChat::ResponseKind>(77)));
+    EXPECT_STREQ(ClaudeChat::ResponseKindName(static_cast<ClaudeChat::ResponseKind>(77)), "unknown");
+
+    EXPECT_FALSE(ClaudeChat::ResponseKindFromName("").has_value());
+    EXPECT_FALSE(ClaudeChat::ResponseKindFromName("unknown").has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, TheProtocolVersionMovedSoAnOlderSidecarIsRefused)
+{
+    // Fail closed on a mismatched protocol: a sidecar speaking the previous version is rejected
+    // outright rather than partially understood.
+    EXPECT_EQ(ClaudeChat::SCHEMA_VERSION, 3u);
+}
+
+TEST(ClaudeChatSocialProtocolTest, ALegacyChatAnswerIsNotASocialAnswerAndViceVersa)
+{
+    /*
+     * The two parsers are mutually exclusive by field count as well as by kind, so neither can be
+     * fed the other's payload even if a caller mixed them up.
+     */
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
+                     "{\"schema_version\":3,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     SOCIAL_TOKEN, 77, 500)
+                     .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseResponsePayload(SocialPayload(), SOCIAL_TOKEN).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, EveryLegacyConversationalHookYieldsToTheCoordinator)
+{
+    /*
+     * Definition of Done 1. The direct whisper, explicit party, and milestone captures each select a
+     * responder and send chat on their own, so while the social feature is on they must yield rather
+     * than produce a second, unrelated answer to the same message.
+     *
+     * Kept rather than deleted: with the gate off these are still the only thing that answers a
+     * whisper, which is the compatibility requirement.
+     */
+    EXPECT_FALSE(ClaudeChat::LegacyConversationalHookAllowed(true));
+    EXPECT_TRUE(ClaudeChat::LegacyConversationalHookAllowed(false));
+
+    // The ambient World limiter already yielded, and still does.
+    EXPECT_FALSE(ClaudeChat::LegacyAmbientWorldAllowed(true, true));
+    EXPECT_TRUE(ClaudeChat::LegacyAmbientWorldAllowed(true, false));
+    EXPECT_FALSE(ClaudeChat::LegacyAmbientWorldAllowed(false, false));
 }

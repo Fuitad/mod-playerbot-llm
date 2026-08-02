@@ -24,11 +24,14 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
 MAX_RESPONSE_MESSAGE_BYTES = 240
+MAX_ACTOR_NAME_BYTES = 48
+MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024
+MAX_THREAD_ID_BYTES = 64
 MIN_BRIDGE_TOKEN_BYTES = 32
 AMBIENT_EVENT_KIND = 4
 CAREER_EVENT_KIND = 5
@@ -87,10 +90,10 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
-    channel: Literal["whisper", "party", "world", "career"]
+    channel: Literal["whisper", "party", "world", "career", "social"]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     speaker_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     bot_name: Annotated[str, StringConstraints(min_length=1, max_length=48)]
@@ -197,6 +200,110 @@ def _object_with_unique_keys(pairs: list[tuple[str, object]]) -> dict[str, objec
             raise ValueError(f"duplicate JSON field: {key}")
         result[key] = value
     return result
+
+
+class SocialRequest(BaseModel):
+    """One social generation asked for by the worldserver coordinator.
+
+    The bot and the subject carry the same field shape, differing only in their ``human``
+    flag. Two shapes would let a prompt builder treat them differently by accident, and the
+    contract is explicit that a human's priority comes from being actively engaged rather
+    than from being human.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[3]
+    token: str
+    kind: Literal["social"]
+    social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    bot_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
+    bot_human: Literal[0, 1]
+    subject_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
+    subject_name: Annotated[str, StringConstraints(max_length=MAX_ACTOR_NAME_BYTES)]
+    subject_human: Literal[0, 1]
+    speak_on_channel: Annotated[int, Field(ge=0, le=255)]
+    thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
+    context: str
+
+    @field_validator("context")
+    @classmethod
+    def _validate_context(cls, value: str) -> str:
+        # Bounded in BYTES rather than characters, because the frame budget is bytes and a
+        # multibyte context would otherwise pass a character check and overflow the frame.
+        if _byte_length(value) > MAX_SOCIAL_CONTEXT_BYTES:
+            raise ValueError(f"context must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
+
+        return value
+
+
+def parse_social_request(payload: bytes, expected_token: str) -> SocialRequest:
+    """Strict parser for a social request. Mirrors parse_request field for field."""
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProtocolError("social request payload is not valid UTF-8") from error
+
+    try:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ProtocolError("social request payload is not valid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ProtocolError("social request payload is not a JSON object")
+
+    try:
+        request = SocialRequest.model_validate(data)
+    except ValidationError as error:
+        raise ProtocolError(f"social request schema violation: {error.error_count()} error(s)") from error
+
+    if not hmac.compare_digest(request.token.encode("utf-8"), expected_token.encode("utf-8")):
+        raise TokenMismatchError("bridge token mismatch")
+
+    return request
+
+
+def encode_social_response(
+    social_request_token: int,
+    bot_guid: int,
+    speak_on_channel: int,
+    message: str,
+    token: str,
+    regenerate: bool = False,
+) -> bytes:
+    """Builds the exact payload shape the C++ social response parser accepts.
+
+    A regeneration carries no message: it is the sidecar reporting that its own output was
+    unusable, so it is not held to the deliverable line rule. Anything else is.
+    """
+
+    if not 1 <= social_request_token <= _UINT64_MAX:
+        raise ProtocolError("social_request_token out of range")
+
+    if not 1 <= bot_guid <= _UINT64_MAX:
+        raise ProtocolError("bot_guid out of range")
+
+    if not 0 <= speak_on_channel <= 255:
+        raise ProtocolError("speak_on_channel out of range")
+
+    if regenerate:
+        message = ""
+    else:
+        _validate_response_message(message)
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "token": token,
+        "kind": "social",
+        "social_request_token": social_request_token,
+        "bot_guid": bot_guid,
+        "speak_on_channel": speak_on_channel,
+        "message": message,
+        "regenerate": 1 if regenerate else 0,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def parse_request(payload: bytes, expected_token: str) -> ChatRequest:

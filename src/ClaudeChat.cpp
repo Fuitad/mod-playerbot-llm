@@ -106,6 +106,10 @@ namespace
                 return "world";
             case ClaudeChat::ChatChannel::Career:
                 return "career";
+            case ClaudeChat::ChatChannel::Social:
+                return "social";
+            default:
+                break;
         }
 
         return "";
@@ -524,6 +528,180 @@ std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::st
     return response;
 }
 
+bool ClaudeChat::ResponseKindIsValid(ResponseKind kind)
+{
+    switch (kind)
+    {
+        case ResponseKind::Chat:
+        case ResponseKind::Career:
+        case ResponseKind::Social:
+            return true;
+        default:
+            break;
+    }
+
+    return false;
+}
+
+char const* ClaudeChat::ResponseKindName(ResponseKind kind)
+{
+    switch (kind)
+    {
+        case ResponseKind::Chat:
+            return "chat";
+        case ResponseKind::Career:
+            return "career";
+        case ResponseKind::Social:
+            return "social";
+        default:
+            break;
+    }
+
+    return "unknown";
+}
+
+std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::string const& name)
+{
+    // Exact match only. A prefix or case insensitive match would let "social_draft" or "Career" be
+    // accepted as something the sender did not say.
+    if (name == "chat")
+        return ResponseKind::Chat;
+    if (name == "career")
+        return ResponseKind::Career;
+    if (name == "social")
+        return ResponseKind::Social;
+
+    return std::nullopt;
+}
+
+bool ClaudeChat::ActorIsUsable(Actor const& actor)
+{
+    // A nameless or unnamed actor cannot describe a real character, and an unbounded name is not a
+    // bounded frame. Both are refused before anything is serialized.
+    if (actor.guidCounter == 0)
+        return false;
+
+    if (actor.name.empty() || actor.name.size() > MAX_ACTOR_NAME_BYTES)
+        return false;
+
+    return IsSingleCleanLine(actor.name);
+}
+
+std::string ClaudeChat::SerializeSocialRequest(SocialRequest const& request, std::string const& token)
+{
+    /*
+     * The bot and the subject are written through the same field shape, differing only in the
+     * `human` flag. Two shapes would let a prompt builder treat them differently by accident, and
+     * the contract is explicit that a human's priority comes from being actively engaged rather than
+     * from being human.
+     */
+    std::string out;
+    out.reserve(512 + request.context.size());
+    out += '{';
+    AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
+    AppendJsonField(out, "token", token);
+    AppendJsonField(out, "kind", std::string(ResponseKindName(ResponseKind::Social)));
+    AppendJsonField(out, "social_request_token", request.socialRequestToken);
+    AppendJsonField(out, "bot_guid", request.bot.guidCounter);
+    AppendJsonField(out, "bot_name", request.bot.name);
+    AppendJsonField(out, "bot_human", request.bot.human ? uint64{1} : uint64{0});
+    AppendJsonField(out, "subject_guid", request.subject.guidCounter);
+    AppendJsonField(out, "subject_name", request.subject.name);
+    AppendJsonField(out, "subject_human", request.subject.human ? uint64{1} : uint64{0});
+    AppendJsonField(out, "speak_on_channel", static_cast<uint64>(request.speakOnChannel));
+    AppendJsonField(out, "thread_id", request.threadPublicId);
+    AppendJsonField(out, "context", request.context);
+    out += '}';
+    return out;
+}
+
+std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload(std::string const& payload,
+                                                                                 std::string const& expectedToken,
+                                                                                 uint64 expectedRequestToken,
+                                                                                 uint64 expectedBotGuidCounter)
+{
+    std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
+    if (!fields)
+        return std::nullopt;
+
+    // Exactly the contract fields. The parser already refuses duplicate keys, and an exact count
+    // refuses unknown ones, so nothing can ride along unnoticed.
+    if (fields->size() != 8)
+        return std::nullopt;
+
+    auto const schemaIt = fields->find("schema_version");
+    auto const tokenIt = fields->find("token");
+    auto const kindIt = fields->find("kind");
+    auto const requestIt = fields->find("social_request_token");
+    auto const botIt = fields->find("bot_guid");
+    auto const channelIt = fields->find("speak_on_channel");
+    auto const messageIt = fields->find("message");
+    auto const regenerateIt = fields->find("regenerate");
+
+    if (schemaIt == fields->end() || tokenIt == fields->end() || kindIt == fields->end() ||
+        requestIt == fields->end() || botIt == fields->end() || channelIt == fields->end() ||
+        messageIt == fields->end() || regenerateIt == fields->end())
+        return std::nullopt;
+
+    if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+        return std::nullopt;
+
+    /*
+     * The kind is checked before anything is read out of the payload. Career decisions and social
+     * lines travel the same socket, and telling them apart by shape rather than by declaration is
+     * how a crafting choice ends up spoken in a zone channel.
+     */
+    if (!kindIt->second.isString)
+        return std::nullopt;
+
+    std::optional<ResponseKind> const kind = ResponseKindFromName(kindIt->second.text);
+    if (!kind || *kind != ResponseKind::Social)
+        return std::nullopt;
+
+    /*
+     * Identity, before content. A perfectly well formed answer to a DIFFERENT request, or for a
+     * different bot, is refused rather than delivered to whoever is waiting now.
+     */
+    if (requestIt->second.isString || requestIt->second.number != expectedRequestToken)
+        return std::nullopt;
+
+    if (botIt->second.isString || botIt->second.number != expectedBotGuidCounter)
+        return std::nullopt;
+
+    if (channelIt->second.isString || channelIt->second.number > UINT8_MAX)
+        return std::nullopt;
+
+    if (regenerateIt->second.isString || regenerateIt->second.number > 1)
+        return std::nullopt;
+
+    if (!messageIt->second.isString)
+        return std::nullopt;
+
+    SocialResponse response;
+    response.socialRequestToken = requestIt->second.number;
+    response.botGuidCounter = botIt->second.number;
+    response.speakOnChannel = static_cast<uint8>(channelIt->second.number);
+    response.regenerate = regenerateIt->second.number == 1;
+    response.message = messageIt->second.text;
+
+    /*
+     * A regeneration request is the sidecar saying its own output was unusable, so it is allowed to
+     * carry an empty message. Anything claiming to be a deliverable line is held to the same single
+     * clean line rule as every other response.
+     */
+    if (response.regenerate)
+        return response;
+
+    if (response.message.empty() || response.message.size() > MAX_RESPONSE_MESSAGE_BYTES ||
+        !IsSingleCleanLine(response.message))
+        return std::nullopt;
+
+    return response;
+}
+
 std::string ClaudeChat::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
 {
     std::string out;
@@ -673,6 +851,13 @@ bool ClaudeChat::ShouldEnqueueAmbient(bool humanOnline,
         return candidate.botOnline && candidate.botAlive && candidate.botIsMachine && !candidate.botInCombat &&
                candidate.worldChannelAvailable;
     });
+}
+
+bool ClaudeChat::LegacyConversationalHookAllowed(bool socialGateEnabled)
+{
+    // One line, but named rather than inlined at four call sites: the rule is "the coordinator owns
+    // responder selection while it is on", and a bare `!gate.enabled` at each hook does not say so.
+    return !socialGateEnabled;
 }
 
 bool ClaudeChat::LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled)

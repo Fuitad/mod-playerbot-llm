@@ -27,7 +27,12 @@
 // bridge worker. Responses carry text only; nothing in a response can invoke gameplay.
 namespace ClaudeChat
 {
-    inline constexpr uint32 SCHEMA_VERSION = 2;
+    /*
+     * Bumped to 3 for the social protocol: a typed actor, a response kind, and a social request
+     * variant. A sidecar speaking 2 is rejected outright rather than partially understood, which is
+     * what "fail closed on a mismatched protocol" means here.
+     */
+    inline constexpr uint32 SCHEMA_VERSION = 3;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -42,8 +47,80 @@ namespace ClaudeChat
         Whisper = 0,
         Party = 1,
         World = 2,
-        Career = 3
+        Career = 3,
+        // Everything the social coordinator asks for. The channel it should be SPOKEN on travels in
+        // the social request itself, because that is the worldserver's decision and not this
+        // bridge's.
+        Social = 4
     };
+
+    /*
+     * What a response claims to be.
+     *
+     * Career and social answers travel the same socket and are told apart by this rather than by
+     * shape, so a career decision can never be handed to the social coordinator as a line to speak,
+     * and a social line can never be read as a crafting choice. Definition of Done 3 and 4.
+     */
+    enum class ResponseKind : uint8
+    {
+        Chat = 0,
+        Career,
+        Social
+    };
+
+    [[nodiscard]] bool ResponseKindIsValid(ResponseKind kind);
+    [[nodiscard]] char const* ResponseKindName(ResponseKind kind);
+    [[nodiscard]] std::optional<ResponseKind> ResponseKindFromName(std::string const& name);
+
+    /*
+     * One participant, however they are driven.
+     *
+     * Definition of Done 2: a bot speaker and a human speaker serialize through this same structure.
+     * Two shapes would let a prompt builder treat the two differently by accident, and the contract
+     * is explicit that a human's priority comes from being actively engaged rather than from being
+     * human, which only holds if both are described identically.
+     */
+    struct Actor
+    {
+        uint64 guidCounter = 0;
+        std::string name;
+        bool human = false;
+    };
+
+    inline constexpr size_t MAX_ACTOR_NAME_BYTES = 48;
+
+    // Refuses an actor that could not name a real character, so nothing unbounded or anonymous
+    // reaches the sidecar.
+    [[nodiscard]] bool ActorIsUsable(Actor const& actor);
+
+    /*
+     * A social generation, requested by the worldserver's coordinator.
+     *
+     * `socialRequestToken` is the coordinator's token, echoed back so a stale answer can be refused
+     * by identity rather than by guesswork. `speakOnChannel` is the coordinator's decision about
+     * where the line belongs and is carried so the response can be checked against it.
+     */
+    struct SocialRequest
+    {
+        uint64 socialRequestToken = 0;
+        Actor bot;
+        Actor subject;
+        uint8 speakOnChannel = 0;
+        std::string threadPublicId;
+        std::string context;
+    };
+
+    inline constexpr size_t MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024;
+    inline constexpr size_t MAX_THREAD_ID_BYTES = 64;
+
+    /*
+     * At most one regeneration for a fresh invalid response.
+     *
+     * A sidecar that keeps returning malformed output would otherwise be retried indefinitely on
+     * one request. One retry covers a transient glitch; the coordinator decides whether a second
+     * request is worth making at all.
+     */
+    inline constexpr uint32 MAX_REGENERATIONS_PER_REQUEST = 1;
 
     // Immutable snapshot captured on the world thread. expiresAtSteadyMs is a steady-clock
     // deadline used for queue expiry and is never serialized.
@@ -67,7 +144,41 @@ namespace ClaudeChat
     {
         uint64 requestId = 0;
         std::string message;
+        ResponseKind kind = ResponseKind::Chat;
     };
+
+    /*
+     * A social answer, after parsing but before the coordinator sees it.
+     *
+     * Carries the coordinator's own token and the channel the sidecar believes it is answering on,
+     * so both can be checked against the request rather than trusted. `regenerate` is the sidecar
+     * indicating its own output was unusable; it is honoured at most MAX_REGENERATIONS_PER_REQUEST
+     * times.
+     */
+    struct SocialResponse
+    {
+        uint64 socialRequestToken = 0;
+        uint64 botGuidCounter = 0;
+        uint8 speakOnChannel = 0;
+        std::string message;
+        bool regenerate = false;
+    };
+
+    // Serializes a social request. Same framing and token rules as a chat request.
+    std::string SerializeSocialRequest(SocialRequest const& request, std::string const& token);
+
+    /*
+     * Strict parser for a social answer.
+     *
+     * Checks the schema version, the token, the response kind, the coordinator's request token, and
+     * the bot identity before returning anything, so a well formed answer to a DIFFERENT request, or
+     * a career decision wearing a social shape, is refused rather than delivered. Everything else is
+     * rejected: unknown fields, duplicate keys, a mismatched kind, an oversize message.
+     */
+    std::optional<SocialResponse> ParseSocialResponsePayload(std::string const& payload,
+                                                             std::string const& expectedToken,
+                                                             uint64 expectedRequestToken,
+                                                             uint64 expectedBotGuidCounter);
 
     // Milliseconds on the steady clock; the only time source used for expiry.
     int64 SteadyNowMs();
@@ -231,6 +342,19 @@ namespace ClaudeChat
     // the interactive social feature is off. The two are competing answers to when a bot speaks
     // unprompted, so the older one yields while the newer one owns the decision.
     bool LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled);
+
+    /*
+     * True only when a legacy conversational hook may still act.
+     *
+     * The direct whisper, explicit party, and milestone captures each select a responder and send
+     * chat on their own. While the social feature is on, the worldserver's coordinator owns both of
+     * those decisions, so every one of these yields to it rather than producing a second, unrelated
+     * answer to the same message. Definition of Done 1.
+     *
+     * Kept rather than deleted, because gate off compatibility is a requirement: with the social
+     * feature disabled these are still the only thing that answers a whisper.
+     */
+    bool LegacyConversationalHookAllowed(bool socialGateEnabled);
 
     // Bounded set of recently enqueued event identifiers with FIFO eviction. Insert
     // returns false for an exact duplicate still tracked.

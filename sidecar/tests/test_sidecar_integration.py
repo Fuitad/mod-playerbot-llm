@@ -23,7 +23,7 @@ TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 def request_payload(request_id: int = 7, message: str = "What do you enjoy doing?") -> bytes:
     return json.dumps(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "token": TEST_TOKEN,
             "request_id": request_id,
             "channel": "whisper",
@@ -113,7 +113,7 @@ async def test_authenticated_request_round_trips_over_real_socket(tmp_path) -> N
     async with running_sidecar(tmp_path) as harness:
         response = await round_trip(harness.port, request_payload())
 
-        assert response["schema_version"] == 2
+        assert response["schema_version"] == 3
         assert response["request_id"] == 7
         assert response["message"] == "A fine day for fishing."
         assert response["token"] == TEST_TOKEN
