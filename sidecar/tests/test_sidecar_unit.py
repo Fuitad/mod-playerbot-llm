@@ -1494,3 +1494,25 @@ def test_bridge_token_is_bounded_in_bytes_at_both_ends() -> None:
     assert len(multibyte) <= protocol.MAX_BRIDGE_TOKEN_BYTES
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_social_request(_social_request_payload(token=multibyte), multibyte)
+
+
+def test_a_bad_request_token_is_reported_as_a_schema_violation() -> None:
+    """Through the documented path, not a different one.
+
+    A field validator must raise ValueError so pydantic collects it into the ValidationError
+    that parse_request already translates. A ProtocolError raised inside the validator would
+    escape that path and surface by a different route than every other schema violation.
+    """
+    too_long = "k" * (protocol.MAX_BRIDGE_TOKEN_BYTES + 1)
+
+    with pytest.raises(protocol.ProtocolError) as caught:
+        protocol.parse_social_request(_social_request_payload(token=too_long), too_long)
+
+    assert "schema violation" in str(caught.value)
+
+    # The encoder boundary reports the same bound as a ProtocolError directly.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 2, "Aye.", too_long)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_response(1, "Aye.", too_long)

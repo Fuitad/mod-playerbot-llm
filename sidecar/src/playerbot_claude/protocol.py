@@ -66,17 +66,30 @@ def _byte_length(text: str) -> int:
 def _validated_token(value: str) -> str:
     """Both bridge token bounds, in UTF-8 bytes. Shared by every request model and encoder.
 
-    Raises ValueError so a pydantic field validator reports it as a schema violation, which
-    parse_request and parse_social_request already translate into a ProtocolError.
+    Raises ValueError, not ProtocolError, because this runs inside a pydantic field validator:
+    pydantic collects a ValueError into the ValidationError that parse_request and
+    parse_social_request already translate, and a ProtocolError raised here would escape that
+    path and be reported by a different route than every other schema violation.
+
+    The encoders below want a ProtocolError instead, so they translate at their own boundary.
     """
 
     length = _byte_length(value)
     if length < MIN_BRIDGE_TOKEN_BYTES or length > MAX_BRIDGE_TOKEN_BYTES:
-        raise ProtocolError(
+        raise ValueError(
             f"bridge token must be {MIN_BRIDGE_TOKEN_BYTES} to {MAX_BRIDGE_TOKEN_BYTES} UTF-8 bytes"
         )
 
     return value
+
+
+def _encoder_token(value: str) -> str:
+    """The same bound at an encoder boundary, reported as a ProtocolError."""
+
+    try:
+        return _validated_token(value)
+    except ValueError as error:
+        raise ProtocolError(str(error)) from error
 
 
 class CareerCandidate(BaseModel):
@@ -368,7 +381,7 @@ def encode_social_response(
     if not 0 <= speak_on_channel <= 255:
         raise ProtocolError("speak_on_channel out of range")
 
-    token = _validated_token(token)
+    token = _encoder_token(token)
 
     if regenerate:
         message = ""
@@ -433,7 +446,7 @@ def encode_response(request_id: int, message: str, token: str) -> bytes:
     # Explicit rather than incidental. The runtime token was validated when it was read, but an
     # encoder that only ever relies on that is one refactor away from signing a frame with
     # whatever it was handed.
-    token = _validated_token(token)
+    token = _encoder_token(token)
 
     _validate_response_message(message)
 
