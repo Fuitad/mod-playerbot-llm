@@ -456,7 +456,7 @@ class SidecarService:
                 return None
 
             try:
-                reply, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
+                reply, emote_id, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
             except claude.ClaudeInvalidOutputError as error:
                 # Generated, billed, and refused by the gate. The money is settled from the
                 # usage the provider reported when it is available, exactly as a rejected
@@ -499,6 +499,7 @@ class SidecarService:
             speak_on_channel=request.speak_on_channel,
             message=reply,
             token=self._token,
+            emote_id=emote_id,
         )
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:

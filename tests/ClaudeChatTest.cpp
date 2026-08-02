@@ -917,15 +917,17 @@ namespace
 
     std::string SocialPayload(std::string kind = "social", uint64 requestToken = 77, uint64 botGuid = 500,
                               std::string message = "Aye, that pack hits hard.", uint64 regenerate = 0,
-                              uint64 schema = ClaudeChat::SCHEMA_VERSION)
+                              uint64 schema = ClaudeChat::SCHEMA_VERSION, uint64 emoteId = 0,
+                              uint64 channel = 2)
     {
         std::string out = "{\"schema_version\":" + std::to_string(schema);
         out += ",\"token\":\"" + SOCIAL_TOKEN + "\"";
         out += ",\"kind\":\"" + kind + "\"";
         out += ",\"social_request_token\":" + std::to_string(requestToken);
         out += ",\"bot_guid\":" + std::to_string(botGuid);
-        out += ",\"speak_on_channel\":2";
+        out += ",\"speak_on_channel\":" + std::to_string(channel);
         out += ",\"message\":\"" + message + "\"";
+        out += ",\"emote_id\":" + std::to_string(emoteId);
         out += ",\"regenerate\":" + std::to_string(regenerate);
         out += "}";
         return out;
@@ -1823,4 +1825,62 @@ TEST(ClaudeChatSocialTransportTest, TheWorkerStampsAnAnswerWithWhenItActuallyArr
     ASSERT_EQ(drained.size(), 1u);
     EXPECT_GE(drained[0].receivedAtSteadyMs, beforeMs);
     EXPECT_LE(drained[0].receivedAtSteadyMs, afterMs);
+}
+
+TEST(ClaudeChatSocialProtocolTest, AGestureIsCarriedAsAnEmoteRatherThanAsALine)
+{
+    /*
+     * The coordinator's result already had a kind and an emoteId from Task 7, and its rules for
+     * them are built and tested. What was missing was the field on this side of the wire, so a
+     * gesture the sidecar chose could never arrive at all.
+     */
+    std::optional<ClaudeChat::SocialResponse> const parsed = ClaudeChat::ParseSocialResponsePayload(
+        SocialPayload("social", 77, 500, "", 0, ClaudeChat::SCHEMA_VERSION, 21), SOCIAL_TOKEN, 77, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->emoteId, 21u);
+    EXPECT_TRUE(parsed->message.empty());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AGestureAndALineTogetherAreTwoAnswersToOneQuestion)
+{
+    // The coordinator drops text attached to a gesture. Refusing the whole frame is stricter and
+    // says which answer was at fault, rather than silently keeping half of one.
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
+                     SocialPayload("social", 77, 500, "Aye.", 0, ClaudeChat::SCHEMA_VERSION, 21),
+                     SOCIAL_TOKEN, 77, 500)
+                     .has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnAnswerWithNeitherALineNorAGestureIsRefused)
+{
+    // Schema 3 cannot express silence, so an empty non-regeneration is a malformed answer rather
+    // than a decision not to speak.
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
+                     SocialPayload("social", 77, 500, "", 0, ClaudeChat::SCHEMA_VERSION, 0), SOCIAL_TOKEN,
+                     77, 500)
+                     .has_value());
+}
+
+TEST(ClaudeChatSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResult)
+{
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
+
+    ClaudeBridge bridge(MakeSocialBridgeConfig(server.Port()));
+
+    int64 const submittedAtMs = ClaudeChat::SteadyNowMs();
+    ClaudeChat::ClaudeSocialTransport transport(bridge, SOCIAL_TOKEN, DETERMINISTIC_DEADLINE_MS);
+    ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
+
+    std::vector<ClaudeChat::SocialRawResponse> const answered{ClaudeChat::SocialRawResponse{
+        77, SocialPayload("social", 77, 500, "", 0, ClaudeChat::SCHEMA_VERSION, 21), submittedAtMs + 10}};
+
+    std::vector<ClaudeChat::ClaudeSocialTransport::Completed> const resolved =
+        transport.Resolve(answered, submittedAtMs + 20);
+
+    ASSERT_EQ(resolved.size(), 1u);
+    ASSERT_EQ(resolved[0].outcome, ClaudeChat::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(resolved[0].result.kind, PlayerbotSocialOutputKind::Emote);
+    EXPECT_EQ(resolved[0].result.emoteId, 21u);
+    EXPECT_TRUE(resolved[0].result.text.empty());
 }

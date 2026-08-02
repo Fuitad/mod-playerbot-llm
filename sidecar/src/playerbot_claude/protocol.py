@@ -43,6 +43,44 @@ AMBIENT_EVENT_MARKER = "ambient_world"
 VOICES = ("reserved", "pragmatic", "earnest", "wry", "boisterous")
 SPENDING_STYLES = ("none", "minimal", "progression", "completionist")
 
+# Channels where a gesture can actually be seen, mirroring the coordinator's own rule. General
+# is zone wide and its participants are nowhere near each other, and a whisper has no physical
+# presence at all, so neither can carry one.
+SOCIAL_EMOTE_CHANNELS = (1, 2)
+
+"""The closed set of gestures a bot may make, as name to WoW text emote ID.
+
+Values are `TextEmotes` from `src/server/shared/SharedDefines.h`, the family behind /wave and
+/cheer, which produces visible, optionally targeted social behaviour. The other `Emote` enum is
+animation only and cannot be aimed at anybody, so it is the wrong family for something the
+contract describes as a gesture a nearby player has to be present to see. Recorded here because
+the coordinator's `emoteId` field does not name its family, and the send path Task 10A adds has
+to agree with this choice.
+
+The model picks a NAME and never sees or emits a number, so it cannot invent one that happens to
+parse. Same reasoning as the career candidate token: proving a value's shape proves nothing about
+whether it was ever on the menu.
+"""
+SOCIAL_EMOTES = {
+    "applaud": 5,
+    "bow": 17,
+    "cheer": 21,
+    "chuckle": 23,
+    "greet": 48,
+    "grin": 49,
+    "laugh": 60,
+    "nod": 67,
+    "salute": 78,
+    "shrug": 83,
+    "sigh": 85,
+    "smile": 163,
+    "thank": 97,
+    "wave": 101,
+    "ponder": 120,
+}
+
+SOCIAL_EMOTE_IDS = frozenset(SOCIAL_EMOTES.values())
+
 _UINT64_MAX = 2**64 - 1
 _FRAME_HEADER = struct.Struct("!I")
 
@@ -400,11 +438,14 @@ def encode_social_response(
     message: str,
     token: str,
     regenerate: bool = False,
+    emote_id: int = 0,
 ) -> bytes:
     """Builds the exact payload shape the C++ social response parser accepts.
 
-    A regeneration carries no message: it is the sidecar reporting that its own output was
-    unusable, so it is not held to the deliverable line rule. Anything else is.
+    Exactly one of three answers: a line, a gesture, or a regeneration. A regeneration
+    carries no message, because it is the sidecar reporting that its own output was
+    unusable rather than offering one. A gesture carries no message either: it is one
+    answer, and a line attached to it is a second.
     """
 
     if not 1 <= social_request_token <= _UINT64_MAX:
@@ -420,6 +461,19 @@ def encode_social_response(
 
     if regenerate:
         message = ""
+        emote_id = 0
+    elif emote_id:
+        if emote_id not in SOCIAL_EMOTE_IDS:
+            raise ProtocolError("emote_id is not a supported social gesture")
+
+        # The coordinator drops text attached to a gesture rather than storing it. Refusing
+        # to build the frame at all means the caller finds out which request was at fault,
+        # instead of a line silently evaporating on the far side.
+        if message:
+            raise ProtocolError("a social emote carries no message")
+
+        if speak_on_channel not in SOCIAL_EMOTE_CHANNELS:
+            raise ProtocolError("an emote cannot be seen on this channel")
     else:
         _validate_response_message(message)
 
@@ -431,6 +485,7 @@ def encode_social_response(
         "bot_guid": bot_guid,
         "speak_on_channel": speak_on_channel,
         "message": message,
+        "emote_id": emote_id,
         "regenerate": 1 if regenerate else 0,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

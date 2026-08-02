@@ -188,6 +188,11 @@ namespace ClaudeChat
         uint64 botGuidCounter = 0;
         uint8 speakOnChannel = 0;
         std::string message;
+
+        // A WoW text emote ID, or zero for a line. Exactly one of this and `message` is set on a
+        // deliverable answer: a gesture and a line are two answers to one question, and the
+        // coordinator would drop the text anyway.
+        uint32 emoteId = 0;
         bool regenerate = false;
     };
 

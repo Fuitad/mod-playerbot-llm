@@ -908,6 +908,7 @@ class FakeAdapter(claude.ClaudeAdapter):
         # What the model "returns" for a social request, before the deterministic gate sees
         # it. Tests set this to an unsafe line to exercise rejection without a real model.
         self.social_reply = "Aye, that pull went badly."
+        self.social_emote = ""
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         return self.input_tokens
@@ -915,14 +916,17 @@ class FakeAdapter(claude.ClaudeAdapter):
     def count_social_input_tokens(self, request: protocol.SocialRequest) -> int:
         return self.input_tokens
 
-    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, claude.UsageTotals]:
+    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, int, claude.UsageTotals]:
         self.social_requests.append(request)
         if self.state is not None:
             self.generated_at_call_index = len(self.state.calls)
         usage = claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
-        # Through the real gate, so a test that stubs an unsafe line gets the real rejection
-        # rather than a fake one that happens to agree with it today.
-        return claude.validate_social_message(self.social_reply, request, usage), usage
+        # Through the real validators, so a test that stubs an unsafe line or an impossible
+        # gesture gets the real rejection rather than a fake one that agrees with it today.
+        if self.social_emote:
+            return "", claude.validate_social_emote(self.social_emote, request, usage), usage
+
+        return claude.validate_social_message(self.social_reply, request, usage), 0, usage
 
     def generate_reply(
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
@@ -1549,6 +1553,7 @@ def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
         "bot_guid": 500,
         "speak_on_channel": 2,
         "message": "Aye.",
+        "emote_id": 0,
         "regenerate": 0,
     }
 
@@ -1814,11 +1819,12 @@ def test_the_gate_allows_the_voice_the_contract_asks_for() -> None:
 def test_a_model_cannot_vouch_for_its_own_output() -> None:
     """Key Decision 6: a model supplied safety label cannot bypass deterministic rejection.
 
-    Guaranteed structurally rather than by policy. The reply schema has exactly one field,
-    so there is nowhere for the model to put a claim about itself, and the gate reads only
-    the text. This asserts the schema shape, because that is what makes the guarantee hold.
+    Guaranteed structurally rather than by policy. The reply schema carries the answer and
+    nothing else, so there is nowhere for the model to put a claim ABOUT that answer, and
+    the gate reads only the text. This asserts the schema shape, because that is what makes
+    the guarantee hold: adding a `safe` or `confidence` field here would break it silently.
     """
-    assert set(claude.SocialReply.model_fields) == {"message"}
+    assert set(claude.SocialReply.model_fields) == {"message", "emote"}
     assert claude.SocialReply.model_config["extra"] == "forbid"
 
 
@@ -1842,3 +1848,70 @@ async def test_rejected_output_asks_for_a_regeneration_rather_than_going_silent(
 
     # Generated and billed, so the money is accounted rather than released as free.
     assert store.outstanding == {}
+
+
+def test_an_emote_is_chosen_from_a_closed_vocabulary_not_invented() -> None:
+    """The model names a gesture; the sidecar owns the number.
+
+    Letting a model emit an emote ID directly is the same mistake as letting it emit a
+    career candidate token it was never offered: the value parses as an integer and means
+    nothing. The reply schema only accepts names from the vocabulary, so an invented one
+    fails as a schema violation before any mapping happens.
+    """
+    assert claude.SOCIAL_EMOTES["cheer"] == 21
+    assert claude.SOCIAL_EMOTES["wave"] == 101
+    assert claude.SOCIAL_EMOTES["shrug"] == 83
+
+    request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
+    assert claude.validate_social_emote("cheer", request) == 21
+
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        claude.validate_social_emote("selfdestruct", request)
+
+
+def test_an_emote_is_refused_where_nobody_could_see_it() -> None:
+    """Mirrors the coordinator's own rule rather than trusting it to catch this.
+
+    A bound checked only on the far side means the frame is built, sent, and rejected, and
+    the sidecar learns nothing about which request was at fault.
+    """
+    # General is zone wide, whisper has no physical presence. Neither can carry a gesture.
+    for channel in (0, 3):
+        request = protocol.parse_social_request(_social_request_payload(speak_on_channel=channel), TEST_TOKEN)
+        with pytest.raises(claude.ClaudeInvalidOutputError):
+            claude.validate_social_emote("cheer", request)
+
+    # Say and party are both nearby.
+    for channel in (1, 2):
+        request = protocol.parse_social_request(_social_request_payload(speak_on_channel=channel), TEST_TOKEN)
+        assert claude.validate_social_emote("cheer", request) == 21
+
+
+def test_the_wire_carries_an_emote_instead_of_a_line_never_both() -> None:
+    encoded = json.loads(protocol.encode_social_response(77, 500, 2, "", TEST_TOKEN, emote_id=21))
+    assert encoded["emote_id"] == 21
+    assert encoded["message"] == ""
+
+    # A gesture with a line attached is two answers to one question. The coordinator drops
+    # the text; refusing to build it at all means the caller finds out which request broke.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN, emote_id=21)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 0, "", TEST_TOKEN, emote_id=21)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_social_response(77, 500, 2, "", TEST_TOKEN, emote_id=999999)
+
+
+def test_the_reply_vocabulary_matches_the_protocol_vocabulary() -> None:
+    """Two lists of the same thing drift, and the one that drifts is the one nobody checks.
+
+    The reply schema needs literal names for the model, and the protocol needs the ID set for
+    the wire. They are derived from the same source but written in two places, so the sync is
+    asserted rather than assumed. This is the exact shape that was found six times in Task 8:
+    a rule that holds for part of what it names.
+    """
+    literal_names = {name for name in claude.SocialReply.model_fields["emote"].annotation.__args__ if name}
+    assert literal_names == set(protocol.SOCIAL_EMOTES)
+    assert protocol.SOCIAL_EMOTE_IDS == frozenset(protocol.SOCIAL_EMOTES.values())

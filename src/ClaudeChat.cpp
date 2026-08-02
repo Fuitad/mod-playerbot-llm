@@ -807,17 +807,24 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
         PlayerbotSocialProviderResult result;
         result.requestToken = raw.socialRequestToken;
         /*
-         * Always a Message, and that is a statement about schema 3 rather than a simplification.
+         * A Message or an Emote, and never a Silence.
          *
-         * A social answer that is not a regeneration must carry one clean line, so the parser has
-         * already refused an empty one: there is no payload this transport can receive that means
-         * "the bot chose not to speak". Schema 3 carries no emote either. Two of the coordinator's
-         * three output kinds are therefore unreachable from this provider, which is recorded rather
-         * than hidden behind a branch that cannot be taken. Task 10 owns the response models and is
-         * where a silence and an emote variant belong.
+         * The parser has already refused an answer carrying both and one carrying neither, so the
+         * branch below is a read of which one arrived rather than a decision. Silence stays
+         * unreachable: schema 3 has no way to say "chose not to speak", and an empty answer is
+         * refused as malformed rather than quietly becoming one. That gap belongs to the response
+         * models, not here.
          */
-        result.kind = PlayerbotSocialOutputKind::Message;
-        result.text = response.message;
+        if (response.emoteId != 0)
+        {
+            result.kind = PlayerbotSocialOutputKind::Emote;
+            result.emoteId = response.emoteId;
+        }
+        else
+        {
+            result.kind = PlayerbotSocialOutputKind::Message;
+            result.text = response.message;
+        }
         result.channel = channel;
 
         // Consumed either way: a result is delivered once or not at all, never retried into a
@@ -927,7 +934,7 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
 
     // Exactly the contract fields. The parser already refuses duplicate keys, and an exact count
     // refuses unknown ones, so nothing can ride along unnoticed.
-    if (fields->size() != 8)
+    if (fields->size() != 9)
         return std::nullopt;
 
     auto const schemaIt = fields->find("schema_version");
@@ -937,11 +944,12 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     auto const botIt = fields->find("bot_guid");
     auto const channelIt = fields->find("speak_on_channel");
     auto const messageIt = fields->find("message");
+    auto const emoteIt = fields->find("emote_id");
     auto const regenerateIt = fields->find("regenerate");
 
     if (schemaIt == fields->end() || tokenIt == fields->end() || kindIt == fields->end() ||
         requestIt == fields->end() || botIt == fields->end() || channelIt == fields->end() ||
-        messageIt == fields->end() || regenerateIt == fields->end())
+        messageIt == fields->end() || emoteIt == fields->end() || regenerateIt == fields->end())
         return std::nullopt;
 
     if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
@@ -982,6 +990,9 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     if (regenerateIt->second.isString || regenerateIt->second.number > 1)
         return std::nullopt;
 
+    if (emoteIt->second.isString || emoteIt->second.number > UINT32_MAX)
+        return std::nullopt;
+
     if (!messageIt->second.isString)
         return std::nullopt;
 
@@ -991,14 +1002,30 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     response.speakOnChannel = static_cast<uint8>(channelIt->second.number);
     response.regenerate = regenerateIt->second.number == 1;
     response.message = messageIt->second.text;
+    response.emoteId = static_cast<uint32>(emoteIt->second.number);
 
     /*
      * A regeneration request is the sidecar saying its own output was unusable, so it is allowed to
-     * carry an empty message. Anything claiming to be a deliverable line is held to the same single
-     * clean line rule as every other response.
+     * carry neither a line nor a gesture. Anything claiming to be deliverable is not.
      */
     if (response.regenerate)
         return response;
+
+    /*
+     * Exactly one answer. Both is the sidecar hedging, and choosing one here would be inventing an
+     * intention it did not express; the coordinator would drop the text anyway, so a frame carrying
+     * both is refused where the caller can still be told which request was at fault.
+     *
+     * Neither is not silence either. Schema 3 has no way to say "chose not to speak", so an empty
+     * answer is a malformed one.
+     */
+    if (response.emoteId != 0)
+    {
+        if (!response.message.empty())
+            return std::nullopt;
+
+        return response;
+    }
 
     if (response.message.empty() || response.message.size() > MAX_RESPONSE_MESSAGE_BYTES ||
         !IsSingleCleanLine(response.message))

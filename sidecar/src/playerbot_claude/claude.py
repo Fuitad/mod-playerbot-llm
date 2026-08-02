@@ -53,6 +53,11 @@ SOCIAL_CHANNEL_NAMES = ("the zone General channel", "local say", "party chat", "
 # party-only or whisper-only memory may be referenced at all.
 SOCIAL_CHANNEL_IS_PUBLIC = (True, True, False, False)
 
+# The gesture vocabulary and its channel rule are wire constraints, so they live with the
+# protocol. Named here only so the prompt and the validator read naturally.
+SOCIAL_EMOTES = protocol.SOCIAL_EMOTES
+SOCIAL_EMOTE_CHANNELS = protocol.SOCIAL_EMOTE_CHANNELS
+
 
 @dataclass(frozen=True)
 class UsageTotals:
@@ -158,16 +163,36 @@ class CareerReply(BaseModel):
 
 
 class SocialReply(BaseModel):
-    """Structured output schema for one social line.
+    """Structured output schema for one social answer: a line, or a gesture.
 
-    `message` is the only field the model fills. There is deliberately no safety or
-    confidence field for it to self-report: a label the model supplies is not evidence, and
-    Key Decision 6 requires that deterministic rejection cannot be bypassed by one.
+    There is deliberately no safety or confidence field for the model to self-report. A
+    label the model supplies is not evidence, and Key Decision 6 requires that deterministic
+    rejection cannot be bypassed by one; the cheapest guarantee is to leave nowhere to put
+    it. `emote` is a closed vocabulary rather than an integer, so an invented gesture fails
+    as a schema violation before anything maps it to a number.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    message: str
+    message: str = ""
+    emote: Literal[
+        "",
+        "applaud",
+        "bow",
+        "cheer",
+        "chuckle",
+        "greet",
+        "grin",
+        "laugh",
+        "nod",
+        "salute",
+        "shrug",
+        "sigh",
+        "smile",
+        "thank",
+        "wave",
+        "ponder",
+    ] = ""
 
 
 def build_social_system_prompt(request: protocol.SocialRequest) -> str:
@@ -186,11 +211,28 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         else "You are talking to the room rather than to one person."
     )
 
+    if request.speak_on_channel in SOCIAL_EMOTE_CHANNELS:
+        gestures = ", ".join(sorted(SOCIAL_EMOTES))
+        answer_rule = (
+            "- Answer in ONE of two ways, never both. Either `message` with exactly one short "
+            "in-character line of plain text, at most 200 characters, or `emote` with exactly one "
+            f"of these gestures: {gestures}. Leave the other field empty.\n"
+            "- Prefer a line. A gesture is for when a word would add nothing.\n"
+        )
+    else:
+        # The vocabulary is not even offered where a gesture could not be seen. Refusing one
+        # after the fact would work, but naming an option and then rejecting it wastes a
+        # generation and teaches the model nothing.
+        answer_rule = (
+            "- Reply with exactly one short in-character line of plain text, at most 200 "
+            "characters, in `message`. Leave `emote` empty.\n"
+        )
+
     return (
         f"You are {request.bot_name}, an adventurer in the world of Azeroth, speaking in "
         f"character over {channel}. {audience}\n"
         "Rules:\n"
-        "- Reply with exactly one short in-character line of plain text, at most 200 characters.\n"
+        f"{answer_rule}"
         "- You cannot perform any game action: no movement, combat, casting, trading, or item use. "
         "Never promise or announce actions; you only talk.\n"
         "- Opinions, rumors, jokes, speculation, banter, and the occasional mild curse are all in "
@@ -361,7 +403,7 @@ class ClaudeAdapter:
 
         return result.input_tokens
 
-    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, UsageTotals]:
+    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, int, UsageTotals]:
         try:
             response = self._client.messages.parse(
                 model=MODEL_ID,
@@ -395,7 +437,16 @@ class ClaudeAdapter:
         if parsed is None or not isinstance(parsed, SocialReply):
             raise ClaudeInvalidOutputError("model output did not match the social reply schema", totals)
 
-        return validate_social_message(parsed.message, request, totals), totals
+        # Exactly one answer. Both filled is the model hedging, and picking one for it would
+        # be inventing an intention it did not have; neither filled is silence, which schema 3
+        # cannot express, so it is a regeneration rather than something to deliver.
+        if parsed.emote and parsed.message.strip():
+            raise ClaudeInvalidOutputError("model answered with both a line and a gesture", totals)
+
+        if parsed.emote:
+            return "", validate_social_emote(parsed.emote, request, totals), totals
+
+        return validate_social_message(parsed.message, request, totals), 0, totals
 
     def generate_reply(
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
@@ -522,6 +573,26 @@ def validate_social_message(
         raise ClaudeInvalidOutputError("social message was formatted as a transcript", usage)
 
     return message
+
+
+def validate_social_emote(
+    name: str, request: protocol.SocialRequest, usage: UsageTotals | None = None
+) -> int:
+    """Resolves a gesture NAME to its ID, refusing one nobody could see.
+
+    The channel rule is enforced here as well as by the coordinator on purpose. A bound
+    checked only on the far side means the frame is built, sent, and rejected, and the
+    caller learns nothing about which request was at fault.
+    """
+
+    emote_id = SOCIAL_EMOTES.get(name)
+    if emote_id is None:
+        raise ClaudeInvalidOutputError(f"model chose an emote outside the vocabulary: {name!r}", usage)
+
+    if request.speak_on_channel not in SOCIAL_EMOTE_CHANNELS:
+        raise ClaudeInvalidOutputError("an emote cannot be seen on this channel", usage)
+
+    return emote_id
 
 
 def _social_messages(request: protocol.SocialRequest) -> list[MessageParam]:
