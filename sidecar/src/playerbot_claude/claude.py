@@ -53,6 +53,23 @@ class UsageTotals:
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
 
+    @property
+    def is_priceable(self) -> bool:
+        """Whether these counts can be turned into a cost at all.
+
+        The SDK's own ``Usage`` model accepts negative token counts, so a broken or
+        hostile provider response can carry them, and a negative count prices to a
+        negative cost or to nothing at all. Checked here rather than trusted, because
+        this is the boundary where provider data becomes ledger data.
+        """
+
+        return (
+            self.input_tokens >= 0
+            and self.output_tokens >= 0
+            and self.cache_creation_input_tokens >= 0
+            and self.cache_read_input_tokens >= 0
+        )
+
 
 class ClaudeError(Exception):
     """Base class for bounded adapter failures. The bot stays silent on all of them."""
@@ -277,6 +294,13 @@ class ClaudeAdapter:
             cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
             cache_read_input_tokens=usage.cache_read_input_tokens or 0,
         )
+
+        if not totals.is_priceable:
+            # Impossible counts are not a cost the caller can settle, so they are not
+            # handed on as one. Raised WITHOUT usage, which puts this in the same lane as
+            # a timeout: the reservation stays outstanding at its maximum for expiry
+            # rather than being charged a number that cannot be right or released as free.
+            raise ClaudeInvalidOutputError("provider reported impossible token counts")
 
         parsed = response.parsed_output
         if parsed is None:

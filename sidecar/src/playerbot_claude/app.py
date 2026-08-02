@@ -302,6 +302,12 @@ def _actual_cost_nano(usage: claude.UsageTotals, prices: tuple[str, str]) -> int
     leaves the reservation charged at its maximum for the ledger's expiry to reclaim.
     """
 
+    # Checked per FIELD, before they are summed. token_cost_nano refuses a negative
+    # total, but summing hides a negative component: 100 input with -1 cache tokens adds
+    # to 99, which prices cheerfully and charges for a count that cannot exist.
+    if not usage.is_priceable:
+        raise ValueError("provider reported impossible token counts")
+
     input_tokens = usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
     cost = budget.token_cost_nano(input_tokens, usage.output_tokens, *prices)
     if cost is None:
@@ -494,9 +500,18 @@ class SidecarService:
 
         usage = getattr(error, "usage", None)
         if usage is not None:
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, self._config.price_texts)
+            except ValueError:
+                # Second layer. The adapter already refuses to attach unpriceable counts,
+                # so nothing should reach here; if a future change lets something through,
+                # it must fall into the expiry lane rather than escape this except block
+                # into a connection handler that only understands protocol errors.
+                return "reservation left outstanding for expiry, the reported cost was unusable"
+
             await store.settle(
                 reservation=reservation,
-                actual_cost_nano=_actual_cost_nano(usage, self._config.price_texts),
+                actual_cost_nano=actual_cost_nano,
                 now=self._now(),
             )
             return "settled at the reported cost, the completion was billed"

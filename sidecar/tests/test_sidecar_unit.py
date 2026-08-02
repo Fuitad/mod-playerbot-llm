@@ -1219,6 +1219,55 @@ async def test_an_undeterminable_failure_is_left_for_expiry_rather_than_guessed_
         assert store.circuit_open is False
 
 
+async def test_impossible_token_counts_never_become_a_charge(tmp_path) -> None:
+    """The SDK's own Usage model accepts negative token counts.
+
+    So a broken or hostile provider response can carry them, and this is the boundary
+    where provider data becomes ledger data. Two layers keep it out: the adapter refuses
+    to attach unpriceable counts to the error, and the failure path catches an unpriceable
+    cost rather than letting it escape into a connection handler that only understands
+    protocol errors. Either way the reservation waits for expiry.
+    """
+    impossible = (
+        claude.UsageTotals(input_tokens=-1, output_tokens=10),
+        claude.UsageTotals(input_tokens=100, output_tokens=-10),
+        claude.UsageTotals(input_tokens=100, output_tokens=10, cache_creation_input_tokens=-1),
+        claude.UsageTotals(input_tokens=100, output_tokens=10, cache_read_input_tokens=-1),
+    )
+
+    for usage in impossible:
+        assert usage.is_priceable is False
+        error = claude.ClaudeInvalidOutputError("rejected content", usage)
+        service, store, _ = make_stored_service(tmp_path, adapter=RaisingAdapter(error))
+
+        # No exception escapes, and the request is simply silent.
+        assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
+        assert store.settlements == []
+        assert store.released == []
+        assert list(store.outstanding.values()) == [store.reservations[0].max_cost_nano]
+
+
+def test_the_adapter_refuses_to_report_impossible_token_counts() -> None:
+    """The first of the two layers, at the point the provider is believed.
+
+    A response whose usage cannot be priced is rejected with NO usage attached, which puts
+    it in the same lane as a timeout rather than producing a charge nobody can verify.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = messages_response("A fine day for fishing.")
+        body = json.loads(response.content)
+        body["usage"]["input_tokens"] = -5
+        return httpx.Response(200, json=body)
+
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+    with pytest.raises(claude.ClaudeInvalidOutputError) as caught:
+        adapter.generate_reply(make_request_model(), history=[])
+
+    assert caught.value.usage is None
+    assert "impossible token counts" in str(caught.value)
+
+
 def test_a_rejected_completion_carries_the_usage_that_was_billed(tmp_path) -> None:
     """The adapter must read usage BEFORE it validates content.
 
