@@ -60,6 +60,10 @@ SOCIAL_CHANNEL_IS_PUBLIC = (True, True, False, False)
 SOCIAL_EMOTES = protocol.SOCIAL_EMOTES
 SOCIAL_EMOTE_CHANNELS = protocol.SOCIAL_EMOTE_CHANNELS
 
+# The most private channel there is. An unparseable context is only carried through here,
+# because there is nothing more private for it to leak into.
+_WHISPER_CHANNEL = 3
+
 
 @dataclass(frozen=True)
 class UsageTotals:
@@ -129,6 +133,8 @@ class ModerationCategory(StrEnum):
     DOCUMENT_STRUCTURE = "document_structure"
     TRANSCRIPT = "transcript"
     FORBIDDEN_CLAIM = "forbidden_claim"
+    UNSAFE_CONTENT = "unsafe_content"
+    TARGETED_REPETITION = "targeted_repetition"
     QUOTED_THREAD = "quoted_thread"
     CARRIED_SECRET = "carried_secret"  # noqa: S105 - a category name, not a credential
     BOTH_ANSWERS = "both_answers"
@@ -289,11 +295,32 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
     )
 
 
+# Any line that looks like one of this renderer's own markers. Untrusted text containing one
+# could close its section and open a heading of its own, and everything after it would read as
+# a new labelled section instead of as data.
+_FENCE_LINE = re.compile(r"^\s*=+\s*(UNTRUSTED|TRUSTED)\b.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _neutralised(body: str) -> str:
+    """Untrusted text with anything resembling a fence marker defanged.
+
+    The line is kept rather than dropped. Removing it would silently discard content, and a
+    reader comparing what a player typed against what the bot saw would find text missing with
+    no explanation; a visibly quoted marker is honest about what happened.
+    """
+
+    return _FENCE_LINE.sub(lambda match: "[quoted marker] " + match.group(0).replace("=", "-"), body)
+
+
 def _fenced(heading: str, body: str) -> list[str]:
-    # Every section gets its own fence. One big block would let text inside an earlier section
-    # claim to end the fence and open a heading of its own; a reader that always expects the
-    # next heading to be one it printed itself does not have that ambiguity.
-    return [f"=== UNTRUSTED {heading} BEGINS ===", body, f"=== UNTRUSTED {heading} ENDS ===", ""]
+    # Every section gets its own fence, and its body cannot write one. The labelling is for
+    # clarity; the neutralising above is what makes it a boundary.
+    return [
+        f"=== UNTRUSTED {heading} BEGINS ===",
+        _neutralised(body),
+        f"=== UNTRUSTED {heading} ENDS ===",
+        "",
+    ]
 
 
 def build_social_user_message(request: protocol.SocialRequest) -> str:
@@ -308,10 +335,16 @@ def build_social_user_message(request: protocol.SocialRequest) -> str:
 
     context = protocol.parse_social_context(request.context)
     if context is None:
-        # Either empty, or not the agreed shape. Both are carried as opaque text rather than
-        # refused: nothing populates this field yet, and a bot going silent because a producer
-        # changed shape would be an outage with no error anywhere.
-        lines += _fenced("CONTEXT", request.context or "(nothing was supplied)")
+        """Empty, or not the agreed shape.
+
+        A context that did not parse has NOT been through `memories_within`, so nothing in it
+        is known to be safe for this channel. On a public channel it is dropped: the cost is a
+        blander line, and the alternative is a bot repeating a whisper to a zone because a
+        producer changed shape. A whisper has nothing more private to leak into, so it still
+        gets the text.
+        """
+        opaque = request.context if request.speak_on_channel == _WHISPER_CHANNEL else ""
+        lines += _fenced("CONTEXT", opaque or "(nothing was supplied)")
         return "\n".join(lines).rstrip()
 
     if context.persona:
@@ -650,6 +683,19 @@ def validate_social_message(
                 ModerationCategory.DOCUMENT_STRUCTURE,
             )
 
+    reason = _unsafe_content_reason(message)
+    if reason is not None:
+        raise ClaudeInvalidOutputError(
+            f"social message carried unsafe content ({reason})", usage, ModerationCategory.UNSAFE_CONTENT
+        )
+
+    if _is_targeted_repetition(message):
+        raise ClaudeInvalidOutputError(
+            "social message was repetition rather than a line",
+            usage,
+            ModerationCategory.TARGETED_REPETITION,
+        )
+
     # The bot answering as somebody else is the tell that a "you are now X" injection landed.
     # Checked against the name the COORDINATOR gave, not against anything in the context.
     speaker_prefix = f"{request.bot_name.casefold()}:"
@@ -767,16 +813,97 @@ much: a memory is replayed into a later prompt as context, so a stored line read
 order is a delayed injection that arrives already inside the fence.
 """
 _MEMORY_FORBIDDEN_PATTERNS = (
+    # Ways to reach or identify a real person.
     r"\b[\w.+-]+@[\w-]+\.[\w.]+\b",
+    r"\bhttps?://\S+",
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    # A long run of digits, however it is grouped. Written without an inner word boundary,
+    # because there is no boundary between the digits of "4111" and requiring one meant this
+    # matched nothing at all.
+    r"\b\d(?:[ -]?\d){12,18}\b",
+    r"\b\d{3}[ .-]?\d{3,4}[ .-]?\d{4}\b",
+    r"\b\d+\s+\w+(\s+\w+)?\s+(lane|street|road|avenue|way)\b",
+    # Credentials.
     r"\bpassword\b",
     r"\bpasscode\b",
     r"\bapi[ _-]?key\b",
-    r"\b\d+\s+\w+(\s+\w+)?\s+(lane|street|road|avenue|way)\b",
+    # Instruction-like content. A memory is replayed into a later prompt as context, so a
+    # stored order is a delayed injection that arrives already inside the fence.
     r"\bignore (all )?(previous|prior|above)\b",
     r"\bsystem prompt\b",
     r"\bdisregard\b.*\binstructions?\b",
     r"\byou are now\b",
 )
+
+
+"""Slurs, as whole words.
+
+Deliberately short and deliberately not exhaustive: no word list is, and treating one as a
+complete safety boundary is how a gate stops being read critically. It catches the common
+cases cheaply and fails closed on them; the real defence is the prompt plus the provider's
+own training, and this is the deterministic floor under both.
+
+Kept as a rot13 encoded tuple so that the source file, the diff, and any log or traceback that
+quotes it do not contain the words themselves.
+"""
+_SLUR_TERMS_ROT13 = ("avttre", "snttbg", "ergneq", "gunaal", "fcvp", "puvax", "xvxr", "genaal")
+
+SLUR_TERMS = tuple(
+    "".join(
+        chr((ord(character) - base + 13) % 26 + base)
+        if (base := 97 if "a" <= character <= "z" else 0)
+        else character
+        for character in term
+    )
+    for term in _SLUR_TERMS_ROT13
+)
+
+"""Content that is unsafe regardless of how in-character it sounds.
+
+The distinction every one of these draws is a REAL PERSON as the target. Warcraft is a violent
+setting and its characters are rude to each other, so "I'll gut that murloc" and "you fight
+like a drunk gnome" have to keep working; a gate that removes those has removed the game.
+"""
+_UNSAFE_CONTENT_PATTERNS = (
+    # Violence aimed out of the fiction: a family, a home, a real person.
+    r"\bkill (your|ur)self\b",
+    r"\bkys\b",
+    r"\bkill your (family|mother|father|kids|children)\b",
+    r"\b(find|come to) (you|your house|your home)\b",
+    r"\bi know where you (live|work)\b",
+    r"\byour (real|actual) (name|address|face)\b",
+    # Sexual content directed at a participant.
+    r"\bdescribe (her|his|your) body\b",
+    r"\b(send|show) (me )?(nudes|pics of yourself)\b",
+    r"\brape\b",
+)
+
+
+def _unsafe_content_reason(text: str) -> str | None:
+    lowered = text.casefold()
+    for term in SLUR_TERMS:
+        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lowered):
+            return "slur"
+
+    for pattern in _UNSAFE_CONTENT_PATTERNS:
+        if re.search(pattern, lowered):
+            return "directed harm"
+
+    return None
+
+
+def _is_targeted_repetition(text: str) -> bool:
+    """Whether a line is the same thing over and over rather than a sentence.
+
+    Repetition is how a bot becomes harassment without ever saying anything individually
+    objectionable. Two shapes: one word repeated, and one character held down.
+    """
+
+    words = re.findall(r"\w+", text.casefold())
+    if len(words) >= 4 and len(set(words)) == 1:
+        return True
+
+    return bool(re.search(r"(\w)\1{9,}", text))
 
 
 def _contains_forbidden_claim(text: str) -> str | None:
@@ -876,6 +1003,16 @@ def validate_memory_reply(
                     usage,
                     ModerationCategory.CARRIED_SECRET,
                 )
+
+        # A stored slur outlives the conversation and is replayed as context later, which is
+        # worse than saying it once.
+        reason = _unsafe_content_reason(text)
+        if reason is not None:
+            raise ClaudeInvalidOutputError(
+                f"memory candidate carries unsafe content ({reason})",
+                usage,
+                ModerationCategory.UNSAFE_CONTENT,
+            )
 
         # A paraphrase that reproduces a line verbatim is a transcript, and storing it turns
         # the memory table into a chat log with a longer retention period.

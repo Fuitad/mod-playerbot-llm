@@ -182,6 +182,20 @@ namespace ClaudeChat
      * indicating its own output was unusable; it is honoured at most MAX_REGENERATIONS_PER_REQUEST
      * times.
      */
+    /*
+     * The gestures a social answer may carry, as WoW `TextEmotes` values.
+     *
+     * The sidecar restricts the model to these by name, but that is a rule on the side that can be
+     * forged, replaced, or simply wrong, and the coordinator only refuses zero. Enforced here as
+     * well, where the value is READ, so an arbitrary emote cannot be delivered by a response that
+     * merely claims one. Must stay in step with SOCIAL_EMOTES in the sidecar's protocol.py; a test
+     * asserts the two sets match.
+     */
+    inline constexpr std::array<uint32, 15> SOCIAL_EMOTE_IDS = {5,  17, 21, 23, 48,  49,  60, 67,
+                                                                78, 83, 85, 97, 101, 120, 163};
+
+    [[nodiscard]] bool SocialEmoteIsSupported(uint32 emoteId);
+
     struct SocialResponse
     {
         uint64 socialRequestToken = 0;

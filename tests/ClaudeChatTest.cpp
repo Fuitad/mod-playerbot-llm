@@ -1884,3 +1884,27 @@ TEST(ClaudeChatSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResult
     EXPECT_EQ(resolved[0].result.emoteId, 21u);
     EXPECT_TRUE(resolved[0].result.text.empty());
 }
+
+TEST(ClaudeChatSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
+{
+    /*
+     * The sidecar restricts the model to a closed set of gesture names, but that is a rule on the
+     * side that could be forged, replaced, or simply wrong. The coordinator only refuses zero, so
+     * without this check any TextEmotes value in the enum could be delivered by a response that
+     * claimed it. The allowlist is enforced where the value is read, not only where it is chosen.
+     */
+    EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
+                     SocialPayload("social", 77, 500, "", 0, ClaudeChat::SCHEMA_VERSION, 4242),
+                     SOCIAL_TOKEN, 77, 500)
+                     .has_value());
+
+    // Every value the sidecar can legitimately choose still parses.
+    for (uint32 emoteId : ClaudeChat::SOCIAL_EMOTE_IDS)
+    {
+        EXPECT_TRUE(ClaudeChat::ParseSocialResponsePayload(
+                        SocialPayload("social", 77, 500, "", 0, ClaudeChat::SCHEMA_VERSION, emoteId),
+                        SOCIAL_TOKEN, 77, 500)
+                        .has_value())
+            << "emote " << emoteId << " should be accepted";
+    }
+}

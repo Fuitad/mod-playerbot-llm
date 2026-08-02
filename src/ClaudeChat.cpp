@@ -855,6 +855,11 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
     return completed;
 }
 
+bool ClaudeChat::SocialEmoteIsSupported(uint32 emoteId)
+{
+    return std::find(SOCIAL_EMOTE_IDS.begin(), SOCIAL_EMOTE_IDS.end(), emoteId) != SOCIAL_EMOTE_IDS.end();
+}
+
 int64 ClaudeChat::SocialRequestDeadlineMs(int64 configuredDeadlineMs)
 {
     return std::min<int64>(configuredDeadlineMs,
@@ -1022,6 +1027,10 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     if (response.emoteId != 0)
     {
         if (!response.message.empty())
+            return std::nullopt;
+
+        // The allowlist, enforced where the value is read rather than only where it was chosen.
+        if (!SocialEmoteIsSupported(response.emoteId))
             return std::nullopt;
 
         return response;

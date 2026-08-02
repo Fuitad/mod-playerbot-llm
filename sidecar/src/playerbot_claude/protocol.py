@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
 import struct
 from typing import Annotated, Literal, Self
 
@@ -80,6 +81,23 @@ SOCIAL_EMOTES = {
 }
 
 SOCIAL_EMOTE_IDS = frozenset(SOCIAL_EMOTES.values())
+
+"""What a character name is allowed to look like.
+
+A participant name reaches the TRUSTED system prompt, because the bot has to be told who it
+is and who it is speaking to. Bounding it by length alone made it 48 bytes of arbitrary text
+sitting inside the instructions, which is an injection vector regardless of how narrow the
+worldserver's own naming rules happen to be. This side cannot assume those rules, so it
+states them.
+
+Letters, marks, spaces, apostrophes, and hyphens. No punctuation that could end a sentence,
+open a heading, or introduce a delimiter, and no control characters or newlines.
+"""
+SOCIAL_ACTOR_NAME_PATTERN = re.compile(r"^[^\W\d_][\w' \-]*$", re.UNICODE)
+
+# Valid values of PlayerbotSocialChannel. Bounded to the enum rather than to a byte, because
+# every consumer indexes a four-entry table with it.
+SOCIAL_CHANNEL_COUNT = 4
 
 """Privacy scopes a remembered fact can carry, least to most private.
 
@@ -365,6 +383,24 @@ class SocialRequest(BaseModel):
         # declared max_length stays as a cheap first cut; this is the one that actually holds.
         if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
             raise ValueError(f"actor name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        # Shape, not just size. This value is interpolated into the TRUSTED system prompt, so a
+        # name bounded only by length is 48 bytes of arbitrary text sitting inside the
+        # instructions. An absent subject is the empty string and is allowed through here; the
+        # model validator below is what decides absence is coherent.
+        if value and not SOCIAL_ACTOR_NAME_PATTERN.match(value):
+            raise ValueError("actor name is not a usable character name")
+
+        return value
+
+    @field_validator("speak_on_channel")
+    @classmethod
+    def _validate_channel(cls, value: int) -> int:
+        # Bounded to the enum rather than to a byte. Every consumer indexes a four entry table
+        # with this, so 0 to 255 was an IndexError waiting on an authenticated request, raised
+        # outside the ProtocolError the connection handler knows how to answer.
+        if value >= SOCIAL_CHANNEL_COUNT:
+            raise ValueError("speak_on_channel is not a known social channel")
 
         return value
 
