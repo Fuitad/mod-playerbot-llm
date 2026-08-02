@@ -727,3 +727,46 @@ async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
     # or how many days were touched.
     assert int(row[0]) <= 1 + ledger.CONVERSATION_LOCK_BUCKETS
     assert int(row[0]) < CONVERSATION_LOCK_SAMPLE
+
+
+async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(clean_ledger) -> None:
+    """Not run automatically, because a rolling restart makes that unsafe.
+
+    An older sidecar still running against this database uses the per day and per bot
+    keys as its live locks, so removing them mid flight strips its mutual exclusion.
+    Leaving them is bounded anyway: nothing creates either shape any more.
+    """
+    book, connection = clean_ledger
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("DELETE FROM playerbot_claude_lock")
+        await cursor.executemany(
+            "INSERT INTO playerbot_claude_lock (lock_key) VALUES (%s)",
+            [
+                ("budget_day:2026-08-01",),
+                ("budget_day:2026-08-02",),
+                ("conversation:9000",),
+                ("conversation:5",),
+                ("budget_day",),
+                ("ambient",),
+            ],
+        )
+    await connection.commit()
+
+    # ensure_schema must NOT remove them on its own.
+    await book.ensure_schema(connection)
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_lock")
+        row = await cursor.fetchone()
+    assert int(row[0]) == 6
+
+    removed = await book.retire_superseded_locks(connection)
+    assert removed == 3  # two dated budget keys and the out of range conversation key
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT lock_key FROM playerbot_claude_lock ORDER BY lock_key")
+        rows = await cursor.fetchall()
+
+    # The live keys survive, and so does the low numbered conversation key, which is
+    # indistinguishable from a valid bucket.
+    assert [r[0] for r in rows] == ["ambient", "budget_day", "conversation:5"]

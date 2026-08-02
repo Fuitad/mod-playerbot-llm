@@ -199,27 +199,54 @@ class BudgetLedger:
             for statement in SCHEMA_STATEMENTS:
                 await cursor.execute(statement)
 
-            # One time cleanup of the key shapes this module used before the set was
-            # bounded: `budget_day:<date>` and `conversation:<bot_guid>`. Deleting a lock
-            # row is normally forbidden, because removing one while a transaction may
-            # still take that key reintroduces the missing row race. These are safe
-            # precisely because no code path produces them any more: they are retired,
-            # not merely unused right now. Without this an upgraded database keeps an
-            # already unbounded table forever.
-            # No parameters here, so the % in the LIKE pattern is a literal rather than
-            # a placeholder pymysql would try to interpolate.
-            await cursor.execute("DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'budget_day:%'")
-            # A conversation key with a bucket at or above the bound cannot have come
-            # from the current code, so it is retired. One BELOW the bound is
-            # indistinguishable from a live bucket key and is left alone: it is a valid
-            # key now regardless of what produced it. The %% is escaped because this
-            # statement does take a parameter.
-            await cursor.execute(
-                "DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'conversation:%%' "
-                "AND CAST(SUBSTRING(lock_key, 14) AS UNSIGNED) >= %s",
-                (CONVERSATION_LOCK_BUCKETS,),
-            )
+            # The retired key shapes are deliberately NOT deleted here.
+            #
+            # An earlier version cleaned them up automatically, which is unsafe during a
+            # restart: an old sidecar still running against this database is using
+            # `budget_day:<date>` and `conversation:<bot_guid>` as its live locks, and
+            # removing them mid-flight strips its mutual exclusion and reintroduces the
+            # missing row race for it. A cosmetic tidy is not worth that.
+            #
+            # Leaving them is safe and still bounded: after the upgrade nothing creates
+            # a key of either shape, so the residue is a fixed historical set rather
+            # than a table that keeps growing. `retire_superseded_locks` below removes
+            # it when an operator knows no old process remains.
         await connection.commit()
+
+    async def retire_superseded_locks(self, connection) -> int:
+        """Removes lock rows from the retired per day and per bot key shapes.
+
+        NOT called automatically, and that is the point. Deleting a lock row is only
+        safe once nothing can still take that key, and during a rolling restart an older
+        sidecar is still using these as its live locks. Run this from a maintenance step
+        when no old process remains; skipping it costs a fixed residue of rows, not
+        growth.
+
+        Returns how many rows were removed.
+        """
+
+        try:
+            await connection.begin()
+            async with connection.cursor() as cursor:
+                # No parameters, so the % is a literal rather than a placeholder.
+                await cursor.execute("DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'budget_day:%'")
+                removed = cursor.rowcount
+
+                # A conversation key at or above the bucket bound cannot have come from
+                # the current code. One BELOW it is indistinguishable from a live bucket
+                # key and is left alone.
+                await cursor.execute(
+                    "DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'conversation:%%' "
+                    "AND CAST(SUBSTRING(lock_key, 14) AS UNSIGNED) >= %s",
+                    (CONVERSATION_LOCK_BUCKETS,),
+                )
+                removed += cursor.rowcount
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+
+        return removed
 
     async def _lock_day(self, cursor, day: date) -> tuple[int, bool]:
         """Serializes on the day, then reads its settled total and circuit state.
