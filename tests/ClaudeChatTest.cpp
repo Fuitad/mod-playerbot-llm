@@ -947,7 +947,9 @@ TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     request.threadPublicId = "thr_00000000000000000000000000000001";
     request.context = "party pull";
 
-    std::string const payload = ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN);
+    std::optional<std::string> const serialized = ClaudeChat::SerializeSocialRequest(request, SOCIAL_TOKEN);
+    ASSERT_TRUE(serialized.has_value());
+    std::string const& payload = *serialized;
 
     // The same field suffixes for both, differing only in the flag.
     EXPECT_NE(payload.find("\"bot_guid\":500"), std::string::npos);
@@ -1168,4 +1170,42 @@ TEST(ClaudeChatSocialProtocolTest, ALegacyResponseInFlightIsDroppedIfTheGateTake
      */
     EXPECT_FALSE(ClaudeChat::LegacyConversationalHookAllowed(true));
     EXPECT_TRUE(ClaudeChat::LegacyConversationalHookAllowed(false));
+}
+
+TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameIsBuilt)
+{
+    /*
+     * The sidecar enforces these bounds too, but a bound checked only on the far side means an
+     * oversize frame is built, sent, and rejected, and the caller learns nothing about which request
+     * was at fault. std::string::size() is a byte count in C++, so these are the same bounds rather
+     * than a looser character version.
+     */
+    ClaudeChat::SocialRequest good;
+    good.socialRequestToken = 77;
+    good.bot = SocialActor(500, "Grimbold", false);
+    good.subject = SocialActor(900, "Deszy", true);
+    good.threadPublicId = "thr_00000000000000000000000000000001";
+    good.context = "party pull";
+    ASSERT_TRUE(ClaudeChat::SerializeSocialRequest(good, SOCIAL_TOKEN).has_value());
+
+    // An absent subject is allowed: not every social opportunity is about somebody.
+    ClaudeChat::SocialRequest noSubject = good;
+    noSubject.subject = ClaudeChat::Actor{};
+    EXPECT_TRUE(ClaudeChat::SerializeSocialRequest(noSubject, SOCIAL_TOKEN).has_value());
+
+    for (auto const& [name, mutate] :
+         std::initializer_list<std::pair<char const*, void (*)(ClaudeChat::SocialRequest&)>>{
+             {"no token", [](ClaudeChat::SocialRequest& r) { r.socialRequestToken = 0; }},
+             {"unusable bot", [](ClaudeChat::SocialRequest& r) { r.bot.guidCounter = 0; }},
+             {"unusable subject", [](ClaudeChat::SocialRequest& r) { r.subject.name = std::string(200, 'a'); }},
+             {"empty thread", [](ClaudeChat::SocialRequest& r) { r.threadPublicId.clear(); }},
+             {"long thread",
+              [](ClaudeChat::SocialRequest& r) { r.threadPublicId = std::string(ClaudeChat::MAX_THREAD_ID_BYTES + 1, 'a'); }},
+             {"long context",
+              [](ClaudeChat::SocialRequest& r) { r.context = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES + 1, 'a'); }}})
+    {
+        ClaudeChat::SocialRequest bad = good;
+        mutate(bad);
+        EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(bad, SOCIAL_TOKEN).has_value()) << name;
+    }
 }

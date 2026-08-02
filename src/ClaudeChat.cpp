@@ -635,8 +635,28 @@ ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::stri
     return SocialExchangeOutcome::Deliver;
 }
 
-std::string ClaudeChat::SerializeSocialRequest(SocialRequest const& request, std::string const& token)
+std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest const& request,
+                                                               std::string const& token)
 {
+    /*
+     * Refused before anything is written. The sidecar enforces these too, but a bound checked only
+     * on the far side means an oversize frame is built, sent, and rejected, and the caller learns
+     * nothing about which request was at fault.
+     */
+    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot))
+        return std::nullopt;
+
+    // The subject may be absent, in which case it is not described at all. If it is present it is
+    // held to the same rule as the bot.
+    if (request.subject.guidCounter != 0 && !ActorIsUsable(request.subject))
+        return std::nullopt;
+
+    if (request.threadPublicId.empty() || request.threadPublicId.size() > MAX_THREAD_ID_BYTES)
+        return std::nullopt;
+
+    if (request.context.size() > MAX_SOCIAL_CONTEXT_BYTES)
+        return std::nullopt;
+
     /*
      * The bot and the subject are written through the same field shape, differing only in the
      * `human` flag. Two shapes would let a prompt builder treat them differently by accident, and

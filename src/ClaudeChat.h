@@ -208,8 +208,16 @@ namespace ClaudeChat
         uint32 _regenerations = 0;
     };
 
-    // Serializes a social request. Same framing and token rules as a chat request.
-    std::string SerializeSocialRequest(SocialRequest const& request, std::string const& token);
+    /*
+     * Serializes a social request, or refuses it.
+     *
+     * Validates before it writes: both actors usable, and the thread identity and context inside
+     * their byte budgets. std::string::size() is already a byte count in C++, so these are the same
+     * bounds the sidecar enforces rather than a looser character version of them. A refusal returns
+     * nullopt rather than an oversize frame the far side would reject anyway, so the failure happens
+     * here where the caller can see which request caused it.
+     */
+    std::optional<std::string> SerializeSocialRequest(SocialRequest const& request, std::string const& token);
 
     /*
      * Strict parser for a social answer.

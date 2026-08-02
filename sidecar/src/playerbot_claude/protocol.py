@@ -32,6 +32,8 @@ MAX_RESPONSE_MESSAGE_BYTES = 240
 MAX_ACTOR_NAME_BYTES = 48
 MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024
 MAX_THREAD_ID_BYTES = 64
+MAX_CAREER_TOKEN_BYTES = 64
+MAX_CAREER_SUMMARY_BYTES = 160
 MIN_BRIDGE_TOKEN_BYTES = 32
 AMBIENT_EVENT_KIND = 4
 CAREER_EVENT_KIND = 5
@@ -68,6 +70,17 @@ class CareerCandidate(BaseModel):
     maximum_spending_style: Literal["none", "minimal", "progression", "completionist"]
     market_eligible: Literal[0, 1]
     engagement: Annotated[int, Field(ge=0, le=100)]
+
+    @field_validator("summary")
+    @classmethod
+    def _validate_summary(cls, value: str) -> str:
+        # StringConstraints counts characters. The budget is bytes, and a summary is free text
+        # a model wrote, so it is the field most likely to be multibyte. The token is safe from
+        # this by its own ASCII pattern rather than by luck.
+        if _byte_length(value) > MAX_CAREER_SUMMARY_BYTES:
+            raise ValueError(f"summary must be at most {MAX_CAREER_SUMMARY_BYTES} UTF-8 bytes")
+
+        return value
 
 
 class CareerRequestContent(BaseModel):
@@ -108,6 +121,16 @@ class ChatRequest(BaseModel):
     subject_id: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     occurrence: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     message: str
+
+    @field_validator("bot_name", "speaker_name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        # Same character versus byte trap as the social actors. Every bound in this protocol is a
+        # byte budget, and StringConstraints counts characters.
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        return value
 
     @field_validator("message")
     @classmethod
