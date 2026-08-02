@@ -648,6 +648,19 @@ namespace ClaudeChat
         // World thread: classifies everything that came back since the previous drain.
         std::vector<Completed> Drain();
 
+        /*
+         * The decision half of `Drain`, with its two inputs handed in rather than read from the
+         * world: the answers to consider, and the instant to judge them at. `Drain` is the thin
+         * wrapper that supplies the real ones.
+         *
+         * Split out for the same reason the rest of this task's rules are pure functions. Every rule
+         * here is about time, and driving real time from a test means real sleeps, which buy a
+         * multi second suite that still only makes a race unlikely rather than impossible. One clock
+         * reading per call is also more correct than three: a sweep, an arrival comparison, and a
+         * retry deadline computed from three separate readings can disagree with each other.
+         */
+        std::vector<Completed> Resolve(std::vector<SocialRawResponse> const& responses, int64 nowMs);
+
         [[nodiscard]] std::size_t OutstandingCount() const { return _exchanges.size(); }
 
         // Drops every outstanding exchange. Shutdown, and provider deregistration, both need this:

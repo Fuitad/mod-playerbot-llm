@@ -716,6 +716,12 @@ bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
 
 std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Drain()
 {
+    return Resolve(_bridge.DrainSocialResponses(), SteadyNowMs());
+}
+
+std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Resolve(
+    std::vector<SocialRawResponse> const& responses, int64 nowMs)
+{
     std::vector<Completed> completed;
 
     /*
@@ -725,7 +731,7 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
      * first without checking arrival would do the opposite and accept an answer that missed its
      * deadline. The stamp the worker takes on arrival is what separates the two cases.
      */
-    for (SocialRawResponse const& raw : _bridge.DrainSocialResponses())
+    for (SocialRawResponse const& raw : responses)
     {
         auto const outstanding = _exchanges.find(raw.socialRequestToken);
         if (outstanding == _exchanges.end())
@@ -754,7 +760,7 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
              * A regeneration the bridge will not take is the end of this exchange: the budget has
              * already been spent, so there is no second retry to fall back on.
              */
-            int64 const retryExpiresAtSteadyMs = SteadyNowMs() + _requestDeadlineMs;
+            int64 const retryExpiresAtSteadyMs = nowMs + _requestDeadlineMs;
             if (_bridge.TryEnqueueSocial(outstanding->second.request, retryExpiresAtSteadyMs))
             {
                 // The exchange's own deadline moves with the retry. Leaving it on the original would
@@ -822,7 +828,6 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
      * produce no payload. Without this sweep those exchanges hold their slots forever, and 512 of
      * them is a transport that refuses every subsequent request for the rest of the uptime.
      */
-    int64 const nowMs = SteadyNowMs();
     for (auto entry = _exchanges.begin(); entry != _exchanges.end();)
     {
         if (entry->second.expiresAtSteadyMs > nowMs)
