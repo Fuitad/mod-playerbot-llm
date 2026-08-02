@@ -1560,3 +1560,71 @@ def test_a_bad_request_token_is_reported_as_a_schema_violation() -> None:
 
     with pytest.raises(protocol.ProtocolError):
         protocol.encode_response(1, "Aye.", too_long)
+
+
+# The deployed Playerbots database settings ----------------------------------------
+
+
+def test_playerbots_database_info_is_parsed_from_the_deployed_value() -> None:
+    settings = app.PlayerbotsDatabaseSettings.parse_info('"127.0.0.1;3306;acore;s3cr3t;acore_playerbots"')
+
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 3306
+    assert settings.user == "acore"
+    assert settings.password == "s3cr3t"
+    assert settings.database == "acore_playerbots"
+
+
+def test_the_password_never_appears_in_a_representation() -> None:
+    """Definition of Done 5.
+
+    A dataclass prints every field, and this is exactly the object most likely to reach
+    a log line or a traceback. Both repr and str are overridden, because a format string
+    reaches for str and logging reaches for repr.
+    """
+    settings = app.PlayerbotsDatabaseSettings.parse_info("127.0.0.1;3306;acore;hunter2;acore_playerbots")
+
+    assert "hunter2" not in repr(settings)
+    assert "hunter2" not in str(settings)
+    assert "hunter2" not in f"{settings}"
+    assert "<redacted>" in repr(settings)
+    # And the value itself is still usable, since redaction is for display only.
+    assert settings.password == "hunter2"
+
+
+def test_a_malformed_database_info_is_refused_rather_than_guessed_at() -> None:
+    for bad in (
+        "127.0.0.1;3306;acore;pw",  # too few fields
+        "127.0.0.1;3306;acore;pw;db;extra",  # a semicolon in the password shifts everything
+        ";3306;acore;pw;db",  # no host
+        "127.0.0.1;3306;;pw;db",  # no user
+        "127.0.0.1;3306;acore;pw;",  # no database
+        "127.0.0.1;notaport;acore;pw;db",
+        "127.0.0.1;0;acore;pw;db",
+        "127.0.0.1;70000;acore;pw;db",
+    ):
+        with pytest.raises(ValueError):
+            app.PlayerbotsDatabaseSettings.parse_info(bad)
+
+
+def test_database_info_is_found_in_a_realistic_config_file(tmp_path) -> None:
+    # These files carry duplicate keys and section free preambles, which is why the
+    # reader is line based rather than a strict parser.
+    path = tmp_path / "playerbots.conf"
+    path.write_text(
+        "########################################\n"
+        "# Some preamble with no section header\n"
+        "AiPlayerbot.Enabled = 1\n"
+        "#PlayerbotsDatabaseInfo = commented out and must be ignored\n"
+        'PlayerbotsDatabaseInfo = "127.0.0.1;3306;acore;pw;acore_playerbots"\n'
+        "AiPlayerbot.Enabled = 1\n",
+        encoding="utf-8",
+    )
+
+    settings = app.PlayerbotsDatabaseSettings.load(str(path))
+    assert settings.database == "acore_playerbots"
+
+    missing = tmp_path / "empty.conf"
+    missing.write_text("AiPlayerbot.Enabled = 1\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        app.PlayerbotsDatabaseSettings.load(str(missing))

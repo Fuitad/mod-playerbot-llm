@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Loopback Claude sidecar for the mod-playerbot-claude AzerothCore module"
 requires-python = ">=3.12"
 dependencies = [
+    "aiomysql>=0.3.2",
     "anthropic==0.120.2",
     "pydantic>=2.7,<3",
 ]

@@ -32,6 +32,87 @@ API_KEY_ENV_VAR = claude.API_KEY_ENV_VAR
 
 
 @dataclass(frozen=True)
+class PlayerbotsDatabaseSettings:
+    """Connection settings read from the deployed worldserver configuration.
+
+    Read rather than duplicated on purpose. A second copy of the credentials in the
+    sidecar's own config is a second thing to rotate, and the one that gets missed is
+    the one that keeps working with the old password until it does not.
+
+    ``__repr__`` is overridden because a dataclass prints every field, and this one is
+    exactly the object most likely to end up in a log line or a traceback.
+    """
+
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+
+    def __repr__(self) -> str:
+        return (
+            f"PlayerbotsDatabaseSettings(host={self.host!r}, port={self.port!r}, "
+            f"user={self.user!r}, password=<redacted>, database={self.database!r})"
+        )
+
+    def __str__(self) -> str:
+        return repr(self)
+
+    @classmethod
+    def parse_info(cls, raw: str) -> PlayerbotsDatabaseSettings:
+        """Parses one AzerothCore ``host;port;user;password;database`` value.
+
+        The password is the only field that may legitimately contain almost anything,
+        and it sits in the middle, so the split is bounded to five parts rather than
+        greedy: a password containing a semicolon would otherwise shift the database
+        name out of position and connect somewhere nobody named.
+        """
+
+        value = raw.strip()
+        if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+
+        parts = value.split(";")
+        if len(parts) != 5:
+            raise ValueError("PlayerbotsDatabaseInfo must have exactly five semicolon separated fields")
+
+        host, port_text, user, password, database = parts
+        if not host or not user or not database:
+            raise ValueError("PlayerbotsDatabaseInfo host, user, and database must all be present")
+
+        try:
+            port = int(port_text)
+        except ValueError as error:
+            raise ValueError("PlayerbotsDatabaseInfo port must be an integer") from error
+
+        if not 1 <= port <= 65535:
+            raise ValueError("PlayerbotsDatabaseInfo port must be a usable TCP port")
+
+        return cls(host=host, port=port, user=user, password=password, database=database)
+
+    @classmethod
+    def load(cls, path: str) -> PlayerbotsDatabaseSettings:
+        """Finds PlayerbotsDatabaseInfo in a deployed worldserver or module config.
+
+        The file is read line by line rather than through configparser, because these
+        files carry duplicate keys and section-free preambles that a strict parser
+        rejects, and this only needs one setting out of a thousand.
+        """
+
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped.startswith("#") or "=" not in stripped:
+                    continue
+
+                key, _, value = stripped.partition("=")
+                if key.strip() == "PlayerbotsDatabaseInfo":
+                    return cls.parse_info(value)
+
+        raise ValueError(f"no PlayerbotsDatabaseInfo setting found in {path}")
+
+
+@dataclass(frozen=True)
 class SidecarConfig:
     enable: bool = False
     bridge_port: int = 0
