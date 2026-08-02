@@ -359,6 +359,18 @@ class SidecarService:
         unauthenticated payloads; the connection handler closes that connection.
         """
 
+        # The declared kind is read before a request model is chosen. A social frame carries
+        # fields ChatRequest forbids, so parsing optimistically and falling back would report
+        # a social frame as twenty three chat schema errors, and the connection handler would
+        # close a healthy bridge over it.
+        kind = protocol.declared_kind(payload)
+        if kind == "social":
+            return await self._process_social_payload(payload)
+        if kind is not None:
+            # Fail closed. A kind nobody here recognizes is a newer worldserver talking to an
+            # older sidecar, and guessing which handler it meant is how the wrong one runs.
+            raise protocol.ProtocolError(f"unrecognized request kind {kind!r}")
+
         request = protocol.parse_request(payload, self._token)
 
         if not self._config.generation_allowed:
@@ -378,6 +390,116 @@ class SidecarService:
         except TimeoutError:
             _log(f"request {request.request_id}: response deadline exceeded, staying silent")
             return None
+
+    async def _process_social_payload(self, payload: bytes) -> bytes | None:
+        """One social line, from a coordinator that is waiting for it.
+
+        Silence and a regeneration are different answers and both are useful, so this
+        returns None only when there is genuinely nothing to say back. An output the
+        deterministic gate rejected returns a REGENERATION instead: the coordinator's
+        transport owns the retry budget and spends at most one, which is where Definition
+        of Done 2's "at most one" is actually enforced.
+        """
+
+        request = protocol.parse_social_request(payload, self._token)
+        token = request.social_request_token
+
+        if not self._config.generation_allowed:
+            _log(f"social {token}: no budget configured, staying silent")
+            return None
+
+        try:
+            async with asyncio.timeout(self._config.response_deadline_ms / 1000):
+                return await self._process_social_within_deadline(request)
+        except TimeoutError:
+            _log(f"social {token}: response deadline exceeded, staying silent")
+            return None
+
+    async def _process_social_within_deadline(self, request: protocol.SocialRequest) -> bytes | None:
+        token = request.social_request_token
+        if self._store is None:
+            _log(f"social {token}: no durable state is open, staying silent")
+            return None
+
+        store = self._store
+        input_prices = self._config.price_texts
+
+        async with self._generation_lock:
+            now = self._now()
+
+            try:
+                input_tokens = await asyncio.to_thread(self._adapter.count_social_input_tokens, request)
+            except claude.ClaudeError as error:
+                _log(f"social {token}: {type(error).__name__}: {error}")
+                return None
+
+            if input_tokens > claude.MAX_INPUT_TOKENS:
+                _log(
+                    f"social {token}: prompt is {input_tokens} tokens "
+                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                )
+                return None
+
+            max_cost_nano = budget.conservative_max_cost_nano(
+                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+            )
+            # A social line always has somebody waiting on it, which is the reserve's whole
+            # purpose. The coordinator already decided this conversation was worth having.
+            decision, reservation = await store.reserve(
+                request_id=token,
+                max_cost_nano=max_cost_nano,
+                priority=RequestPriority.IMMEDIATE_HUMAN,
+                now=now,
+            )
+            if decision is not AdmissionDecision.ADMITTED or reservation is None:
+                _log(f"social {token}: {decision.value}, staying silent")
+                return None
+
+            try:
+                reply, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
+            except claude.ClaudeInvalidOutputError as error:
+                # Generated, billed, and refused by the gate. The money is settled from the
+                # usage the provider reported when it is available, exactly as a rejected
+                # chat completion is, and the coordinator is asked for one more attempt.
+                outcome = await self._account_for_failure(store, reservation, error)
+                _log(f"social {token}: rejected output: {error} ({outcome}), asking for a regeneration")
+                return protocol.encode_social_response(
+                    social_request_token=token,
+                    bot_guid=request.bot_guid,
+                    speak_on_channel=request.speak_on_channel,
+                    message="",
+                    token=self._token,
+                    regenerate=True,
+                )
+            except claude.ClaudeError as error:
+                outcome = await self._account_for_failure(store, reservation, error)
+                _log(f"social {token}: {type(error).__name__}: {error} ({outcome})")
+                return None
+
+            settled_at = self._now()
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+            except ValueError as error:
+                _log(f"social {token}: cannot price the completion: {error}")
+                return None
+
+            if not await store.settle(
+                reservation=reservation,
+                actual_cost_nano=actual_cost_nano,
+                now=settled_at,
+            ):
+                # Expiry already reclaimed it, so the ledger declined to charge this line.
+                # Speaking it anyway would spend outside the ceiling.
+                _log(f"social {token}: settlement refused, the reservation had already expired")
+                return None
+
+        return protocol.encode_social_response(
+            social_request_token=token,
+            bot_guid=request.bot_guid,
+            speak_on_channel=request.speak_on_channel,
+            message=reply,
+            token=self._token,
+        )
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:
         if self._store is None:

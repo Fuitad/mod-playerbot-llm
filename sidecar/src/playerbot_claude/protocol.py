@@ -331,6 +331,41 @@ class SocialRequest(BaseModel):
         return value
 
 
+def declared_kind(payload: bytes) -> str | None:
+    """The `kind` a payload declares, or None when it declares none.
+
+    Read BEFORE a request model is chosen. Choosing a model first and falling back to the
+    other one when it fails would let a malformed social frame be re-read as a chat frame,
+    and the caller would then be told about the wrong 23 schema errors. It also means an
+    unrecognized kind can be refused as unrecognized rather than mis-parsed.
+
+    A chat request declares nothing, which is why None is a value rather than an error: it
+    is what every request looked like before schema 3 added the social variant.
+    """
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProtocolError("request payload is not valid UTF-8") from error
+
+    try:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ProtocolError("request payload is not valid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ProtocolError("request payload is not a JSON object")
+
+    kind = data.get("kind")
+    if kind is None:
+        return None
+
+    if not isinstance(kind, str):
+        raise ProtocolError("request kind must be a string")
+
+    return kind
+
+
 def parse_social_request(payload: bytes, expected_token: str) -> SocialRequest:
     """Strict parser for a social request. Mirrors parse_request field for field."""
 
