@@ -1908,3 +1908,26 @@ TEST(ClaudeChatSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
             << "emote " << emoteId << " should be accepted";
     }
 }
+
+TEST(ClaudeChatSocialProtocolTest, AnOverlongNameNeverReachesTheWire)
+{
+    /*
+     * The same bound on both sides, which is the rule this protocol has had to relearn
+     * repeatedly: a bound enforced only on the far side means the frame is built and sent
+     * before anybody refuses it, and the caller is told nothing about which request was at
+     * fault. MAX_PLAYER_NAME is twelve, and the byte budget is not a substitute for it: 48
+     * bytes is twelve characters only in a four byte script, so on its own it admits 48
+     * Latin letters, which is enough to spell an instruction without any spaces.
+     */
+    ClaudeChat::Actor overlong;
+    overlong.guidCounter = 500;
+    overlong.name = "Ignoreallpreviousrules";
+    overlong.human = false;
+    EXPECT_FALSE(ClaudeChat::ActorIsUsable(overlong));
+
+    ClaudeChat::Actor atTheLimit;
+    atTheLimit.guidCounter = 500;
+    atTheLimit.name = "Grimboldsson";  // exactly twelve
+    atTheLimit.human = false;
+    EXPECT_TRUE(ClaudeChat::ActorIsUsable(atTheLimit));
+}

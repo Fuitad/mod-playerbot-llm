@@ -116,6 +116,17 @@ namespace ClaudeChat
 
     inline constexpr size_t MAX_ACTOR_NAME_BYTES = 48;
 
+    /*
+     * `MAX_PLAYER_NAME` from ObjectMgr.h, the client's own limit on a character name.
+     *
+     * A separate bound from the byte budget above, and neither replaces the other. 48 bytes is
+     * what the frame can carry, and it equals twelve characters only in the worst case of a four
+     * byte script, so on its own it admits 48 Latin letters. That is enough to spell an
+     * instruction with no spaces in it, and the name is interpolated into the sidecar's trusted
+     * prompt, so the character count is a security bound rather than a formatting one.
+     */
+    inline constexpr size_t MAX_ACTOR_NAME_CHARACTERS = 12;
+
     // Refuses an actor that could not name a real character, so nothing unbounded or anonymous
     // reaches the sidecar.
     [[nodiscard]] bool ActorIsUsable(Actor const& actor);

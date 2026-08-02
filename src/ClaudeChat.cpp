@@ -629,6 +629,11 @@ bool ClaudeChat::ActorIsUsable(Actor const& actor)
     if (actor.name.empty() || actor.name.size() > MAX_ACTOR_NAME_BYTES)
         return false;
 
+    // Characters as well as bytes. Counted as UTF-8 code points rather than as bytes, because
+    // twelve characters of a multibyte script is a legitimate name that a byte count would refuse.
+    if (utf8::distance(actor.name.begin(), actor.name.end()) > MAX_ACTOR_NAME_CHARACTERS)
+        return false;
+
     return IsSingleCleanLine(actor.name);
 }
 

@@ -83,6 +83,14 @@ SOCIAL_EMOTES = {
 SOCIAL_EMOTE_IDS = frozenset(SOCIAL_EMOTES.values())
 
 
+# `MAX_PLAYER_NAME` in `src/server/game/Globals/ObjectMgr.h`, the client's own limit.
+#
+# Not the same bound as MAX_ACTOR_NAME_BYTES, and neither replaces the other. 48 bytes is what
+# a frame can carry, and it equals twelve characters only in the worst case of a four byte
+# script, so on its own it admits 48 Latin letters. Twelve is what a name can actually be.
+MAX_PLAYER_NAME_CHARACTERS = 12
+
+
 def actor_name_is_usable(value: str) -> bool:
     """Whether a string can be a character name.
 
@@ -101,7 +109,7 @@ def actor_name_is_usable(value: str) -> bool:
     underscore, and excludes the combining marks that legitimately appear in names.
     """
 
-    if not value:
+    if not value or len(value) > MAX_PLAYER_NAME_CHARACTERS:
         return False
 
     if unicodedata.category(value[0])[0] != "L":
