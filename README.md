@@ -140,8 +140,12 @@ How one request spends:
 
 1. It is priced at its **maximum** possible cost, the counted input tokens plus the full 96 token output allowance, rounded up. An estimate that is ever low is a ceiling that can be crossed.
 2. That maximum is reserved inside a transaction holding the day's row lock, so two concurrent requests cannot both see the same remaining budget and both fit.
-3. On success the reservation settles at the real cost the provider reported. On a provider failure it is released immediately, because nothing was billed.
-4. A sidecar that dies mid-request leaves its reservation charged at maximum until a later transaction reclaims it, ten minutes after it was created. A completion arriving after that reclaim is refused rather than charged twice.
+3. On success the reservation settles at the real cost the provider reported.
+4. On a failure, what happens depends on what can be proven:
+   - An authentication or rate limit refusal was rejected before generation, so the reservation is released immediately.
+   - A reply that came back and was rejected for its content was still generated and billed, so it settles at the exact cost the provider reported. The adapter reads the usage before it validates the content, so that figure is always available.
+   - A timeout or a provider error carries no usage and nothing can be concluded, so the reservation is left alone.
+5. Anything left outstanding, including from a sidecar that died mid-request, stays charged at its maximum until a later transaction reclaims it, ten minutes after it was created. A completion arriving after that reclaim is refused rather than charged twice.
 
 `PlayerbotClaude.HumanBudgetReserveRatio` protects a share of the ceiling for work somebody is waiting on: whispers, party lines, and social replies. Ambient World chatter and career selection are background work and are denied once the remainder reaches the reserve, while a human request may still use it. Human work is protected from background work; it is not exempt from the ceiling itself. `0` disables the protection and `1` stops background generation entirely.
 
