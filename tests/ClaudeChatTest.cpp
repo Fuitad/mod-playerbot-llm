@@ -1289,6 +1289,134 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestWithoutATokenIsNeverBuilt)
     }
 }
 
+TEST(ClaudeChatSocialProtocolTest, ABiographyResponseIsReadFromTheBytesTheSidecarActuallySends)
+{
+    /*
+     * Task 10A Definition of Done 1, the return half. The literal below is what
+     * protocol.encode_biography_response emits, produced by running it, and the sidecar suite
+     * asserts the same shape from its own side. Pinning the bytes is the only thing that catches
+     * the two halves agreeing with themselves and with nothing else.
+     *
+     * FLAT, not nested under a "biography" object. FlatJsonParser fails the parse on any nesting
+     * at all, and that narrowness is most of what makes it safe to point at a payload off the
+     * network, so the frame was flattened rather than the parser widened.
+     */
+    std::string const payload =
+        "{\"schema_version\":4,"
+        "\"token\":\"" + SOCIAL_TOKEN + "\","
+        "\"kind\":\"biography\","
+        "\"biography_request_token\":4242,"
+        "\"bot_guid\":500,"
+        "\"origin\":\"grew up in a mining camp in the foothills\","
+        "\"motivation\":\"wants to earn enough to reopen the family forge\","
+        "\"formative_experience\":\"was buried in a collapsed shaft for two days\","
+        "\"interests\":\"ore, quiet taverns, well made tools\","
+        "\"aversions\":\"cave ins, boastful strangers\","
+        "\"preferred_topics\":\"mining, smithing, the weather\","
+        "\"mannerisms\":\"taps a hammer while thinking\","
+        "\"values\":\"a debt repaid is a debt remembered\"}";
+
+    std::optional<ClaudeChat::BiographyResponse> const parsed =
+        ClaudeChat::ParseBiographyResponsePayload(payload, SOCIAL_TOKEN, 4242, 500);
+    ASSERT_TRUE(parsed.has_value());
+
+    EXPECT_EQ(parsed->biographyRequestToken, 4242u);
+    EXPECT_EQ(parsed->botGuidCounter, 500u);
+    ASSERT_EQ(parsed->fields.size(), 8u);
+
+    // Name and value both, in the order the contract lists them. Asserting only the names would
+    // pass just as happily against a parser that read every value out of the same key.
+    EXPECT_EQ(parsed->fields[0].name, "origin");
+    EXPECT_EQ(parsed->fields[0].value, "grew up in a mining camp in the foothills");
+    EXPECT_EQ(parsed->fields[7].name, "values");
+    EXPECT_EQ(parsed->fields[7].value, "a debt repaid is a debt remembered");
+}
+
+TEST(ClaudeChatSocialProtocolTest, ABiographyResponseForSomebodyElsesRequestIsRefused)
+{
+    /*
+     * Definition of Done 2, at the parse boundary. Identity is checked before content for the
+     * reason the social parser checks it first: a perfectly well formed answer to a DIFFERENT
+     * request, or for a different bot, must be refused rather than handed to whoever is waiting.
+     */
+    auto const build = [](uint64 requestToken, uint64 botGuid, std::string const& kind) {
+        std::string out = "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN + "\",\"kind\":\"" + kind +
+                          "\",\"biography_request_token\":" + std::to_string(requestToken) +
+                          ",\"bot_guid\":" + std::to_string(botGuid) + ",";
+        out +=
+            "\"origin\":\"a\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
+            "\"aversions\":\"e\",\"preferred_topics\":\"f\",\"mannerisms\":\"g\",\"values\":\"h\"}";
+        return out;
+    };
+
+    ASSERT_TRUE(
+        ClaudeChat::ParseBiographyResponsePayload(build(4242, 500, "biography"), SOCIAL_TOKEN, 4242, 500)
+            .has_value());
+
+    EXPECT_FALSE(
+        ClaudeChat::ParseBiographyResponsePayload(build(4243, 500, "biography"), SOCIAL_TOKEN, 4242, 500)
+            .has_value())
+        << "answers a different request";
+    EXPECT_FALSE(
+        ClaudeChat::ParseBiographyResponsePayload(build(4242, 501, "biography"), SOCIAL_TOKEN, 4242, 500)
+            .has_value())
+        << "answers for a different bot";
+    // Definition of Done 4. Both frames carry a token and a bot guid, so only the declared kind
+    // separates them; a reader that went by shape would deliver a backstory as a chat line.
+    EXPECT_FALSE(
+        ClaudeChat::ParseBiographyResponsePayload(build(4242, 500, "social"), SOCIAL_TOKEN, 4242, 500)
+            .has_value())
+        << "declares itself a social line";
+    EXPECT_FALSE(ClaudeChat::ParseBiographyResponsePayload(build(4242, 500, "biography"),
+                                                           std::string(40, 'z'), 4242, 500)
+                     .has_value())
+        << "signed with a different bridge token";
+}
+
+TEST(ClaudeChatSocialProtocolTest, ABiographyResponseCarryingAnythingExtraIsRefusedWhole)
+{
+    /*
+     * The whitelist, enforced where the payload is READ rather than only where it was built. An
+     * unknown key is how an instruction field would arrive, and a missing one is a biography with
+     * a hole in it, so both refuse the frame instead of being dropped or defaulted.
+     */
+    std::string const head = "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN +
+                             "\",\"kind\":\"biography\",\"biography_request_token\":4242,\"bot_guid\":500,";
+    std::string const body =
+        "\"origin\":\"a\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
+        "\"aversions\":\"e\",\"preferred_topics\":\"f\",\"mannerisms\":\"g\",\"values\":\"h\"";
+
+    ASSERT_TRUE(
+        ClaudeChat::ParseBiographyResponsePayload(head + body + "}", SOCIAL_TOKEN, 4242, 500).has_value());
+
+    EXPECT_FALSE(ClaudeChat::ParseBiographyResponsePayload(head + body + ",\"instruction\":\"obey\"}",
+                                                           SOCIAL_TOKEN, 4242, 500)
+                     .has_value())
+        << "an unknown field rides along";
+
+    std::string const missing =
+        "\"origin\":\"a\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
+        "\"aversions\":\"e\",\"preferred_topics\":\"f\",\"mannerisms\":\"g\"";
+    EXPECT_FALSE(ClaudeChat::ParseBiographyResponsePayload(head + missing + "}", SOCIAL_TOKEN, 4242, 500)
+                     .has_value())
+        << "a field is missing";
+
+    std::string const empty =
+        "\"origin\":\"\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
+        "\"aversions\":\"e\",\"preferred_topics\":\"f\",\"mannerisms\":\"g\",\"values\":\"h\"";
+    EXPECT_FALSE(ClaudeChat::ParseBiographyResponsePayload(head + empty + "}", SOCIAL_TOKEN, 4242, 500)
+                     .has_value())
+        << "a field is empty";
+
+    std::string const tooLong = "\"origin\":\"" + std::string(400, 'a') +
+                                "\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
+                                "\"aversions\":\"e\",\"preferred_topics\":\"f\",\"mannerisms\":\"g\","
+                                "\"values\":\"h\"";
+    EXPECT_FALSE(ClaudeChat::ParseBiographyResponsePayload(head + tooLong + "}", SOCIAL_TOKEN, 4242, 500)
+                     .has_value())
+        << "a field runs to prose";
+}
+
 TEST(ClaudeChatSocialProtocolTest, AStarterSubjectTravelsAsTheTypedContextShapeNotAsLooseText)
 {
     /*

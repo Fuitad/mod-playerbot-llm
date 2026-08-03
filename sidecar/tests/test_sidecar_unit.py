@@ -2733,7 +2733,9 @@ def test_a_biography_response_echoes_the_token_it_answers() -> None:
     assert encoded["kind"] == "biography"
     assert encoded["biography_request_token"] == 4242
     assert encoded["bot_guid"] == 500
-    assert encoded["biography"] == fields
+    # Flat rather than nested under a "biography" key: the worldserver's reader fails the parse
+    # on any nesting, and that narrowness is most of what makes it safe.
+    assert {name: encoded[name] for name in fields} == fields
 
 
 def test_a_biography_response_is_never_confused_with_a_social_line() -> None:
@@ -2748,7 +2750,7 @@ def test_a_biography_response_is_never_confused_with_a_social_line() -> None:
 
     assert biography["kind"] != social["kind"]
     assert "message" not in biography
-    assert "biography" not in social
+    assert "origin" not in social
 
 
 def test_a_biography_response_refuses_a_payload_that_is_not_the_generated_shape() -> None:
@@ -2790,7 +2792,7 @@ async def test_a_biography_request_reaches_the_biography_handler(tmp_path) -> No
     response = json.loads(payload)
     assert response["kind"] == "biography"
     assert response["biography_request_token"] == 4242
-    assert set(response["biography"]) == set(claude.BiographyReply.model_fields)
+    assert set(claude.BiographyReply.model_fields) <= set(response)
 
 
 async def test_a_biography_is_never_generated_without_a_budget(tmp_path) -> None:

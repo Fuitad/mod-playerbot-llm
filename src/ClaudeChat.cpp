@@ -1063,6 +1063,83 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
     return out;
 }
 
+std::optional<ClaudeChat::BiographyResponse> ClaudeChat::ParseBiographyResponsePayload(
+    std::string const& payload, std::string const& expectedToken, uint64 expectedRequestToken,
+    uint64 expectedBotGuidCounter)
+{
+    std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
+    if (!fields)
+        return std::nullopt;
+
+    /*
+     * Five protocol keys plus the eight generated ones. The parser already refuses duplicates, and
+     * an exact count refuses unknown keys, so nothing rides along unnoticed. That is what makes an
+     * instruction field impossible rather than merely ignored.
+     */
+    if (fields->size() != 5 + BIOGRAPHY_FIELD_NAMES.size())
+        return std::nullopt;
+
+    auto const schemaIt = fields->find("schema_version");
+    auto const tokenIt = fields->find("token");
+    auto const kindIt = fields->find("kind");
+    auto const requestIt = fields->find("biography_request_token");
+    auto const botIt = fields->find("bot_guid");
+
+    if (schemaIt == fields->end() || tokenIt == fields->end() || kindIt == fields->end() ||
+        requestIt == fields->end() || botIt == fields->end())
+        return std::nullopt;
+
+    if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
+        return std::nullopt;
+
+    if (!BridgeTokenIsUsable(expectedToken))
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !BridgeTokenIsUsable(tokenIt->second.text) ||
+        !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+        return std::nullopt;
+
+    if (!kindIt->second.isString)
+        return std::nullopt;
+
+    std::optional<ResponseKind> const kind = ResponseKindFromName(kindIt->second.text);
+    if (!kind || *kind != ResponseKind::Biography)
+        return std::nullopt;
+
+    if (requestIt->second.isString || requestIt->second.number != expectedRequestToken)
+        return std::nullopt;
+
+    if (botIt->second.isString || botIt->second.number != expectedBotGuidCounter)
+        return std::nullopt;
+
+    BiographyResponse response;
+    response.biographyRequestToken = requestIt->second.number;
+    response.botGuidCounter = botIt->second.number;
+    response.fields.reserve(BIOGRAPHY_FIELD_NAMES.size());
+
+    // Walked in the contract's order rather than the map's, so the result is ordered by the
+    // agreement between the two sides instead of by however the keys happened to sort.
+    for (char const* name : BIOGRAPHY_FIELD_NAMES)
+    {
+        auto const field = fields->find(name);
+        if (field == fields->end() || !field->second.isString)
+            return std::nullopt;
+
+        /*
+         * Refused whole rather than per field. A biography with one bad field is not a biography
+         * with seven good ones: the assembler on the other side would reject it anyway, and
+         * dropping the field here would hand it a hole to fill with a default.
+         */
+        if (field->second.text.empty() || field->second.text.size() > MAX_BIOGRAPHY_FIELD_BYTES ||
+            !IsSingleCleanLine(field->second.text))
+            return std::nullopt;
+
+        response.fields.push_back(BiographyResponseField{name, field->second.text});
+    }
+
+    return response;
+}
+
 std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload(std::string const& payload,
                                                                                  std::string const& expectedToken,
                                                                                  uint64 expectedRequestToken,

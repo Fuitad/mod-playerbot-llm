@@ -778,14 +778,20 @@ def encode_biography_response(
         if any(ord(character) < 0x20 for character in value):
             raise ProtocolError(f"biography field {name} must be a single line without control characters")
 
-    payload = {
+    # Flat, not nested under a "biography" object. The worldserver's reader is a strict parser for
+    # ONE flat object and fails the parse on any nesting at all, deliberately: that narrowness is
+    # most of what makes it safe to point at a payload from the network. Sending a nested document
+    # would mean widening it for this one frame, which is a worse trade than eight more keys.
+    # The generated names cannot collide with the protocol ones, and the exact-field check above is
+    # what keeps that true.
+    payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "token": token,
         "kind": "biography",
         "biography_request_token": biography_request_token,
         "bot_guid": bot_guid,
-        "biography": biography,
     }
+    payload.update(biography)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 

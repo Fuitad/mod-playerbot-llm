@@ -373,6 +373,56 @@ namespace ClaudeChat
                                                          std::string const& token);
 
     /*
+     * The generated field names a biography response may carry, and the only ones.
+     *
+     * Must stay in step with BIOGRAPHY_FIELD_NAMES in the sidecar's protocol.py, which asserts its
+     * own reply model against that tuple at import. Identity names are deliberately absent: the
+     * worldserver stamps name, race, class and gender from its own character tables, so a payload
+     * offering one is refused here rather than trusted.
+     */
+    inline constexpr std::array<char const*, 8> BIOGRAPHY_FIELD_NAMES = {
+        "origin",   "motivation",       "formative_experience", "interests",
+        "aversions", "preferred_topics", "mannerisms",           "values"};
+
+    // Matches PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH in mod-playerbots and
+    // MAX_BIOGRAPHY_FIELD_BYTES in the sidecar. Anything longer is prose where a field was asked
+    // for, and is refused at the boundary rather than truncated into the profile.
+    inline constexpr std::size_t MAX_BIOGRAPHY_FIELD_BYTES = 240;
+
+    // One generated field, as it arrived. Deliberately name and value rather than a typed
+    // biography: this module transports, and the assembler in mod-playerbots is what decides
+    // which names are legal and fills the identity. Duplicating that decision here would be a
+    // second whitelist to keep in step.
+    struct BiographyResponseField
+    {
+        std::string name;
+        std::string value;
+    };
+
+    struct BiographyResponse
+    {
+        uint64 biographyRequestToken = 0;
+        uint64 botGuidCounter = 0;
+
+        // In the contract's own order, not the parser's map order, so a consumer that cares can
+        // rely on it and a test can pin position as well as content.
+        std::vector<BiographyResponseField> fields;
+    };
+
+    /*
+     * Reads one biography answer off the wire.
+     *
+     * Identity before content, as the social parser does: a well formed answer to a DIFFERENT
+     * request, or for a different bot, is refused rather than handed to whoever is waiting. The
+     * declared kind is checked before anything is read out, because a biography and a social line
+     * share a token and a bot guid, and telling them apart by shape is how a backstory gets spoken.
+     */
+    std::optional<BiographyResponse> ParseBiographyResponsePayload(std::string const& payload,
+                                                                   std::string const& expectedToken,
+                                                                   uint64 expectedRequestToken,
+                                                                   uint64 expectedBotGuidCounter);
+
+    /*
      * Strict parser for a social answer.
      *
      * Checks the schema version, the token, the response kind, the coordinator's request token, and
