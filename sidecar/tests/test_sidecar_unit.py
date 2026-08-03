@@ -2417,7 +2417,12 @@ def test_a_memory_response_carries_only_what_survived_validation() -> None:
 
     assert payload["kind"] == "memory"
     assert payload["memory_request_token"] == 91
-    assert payload["candidates"][0]["about_guid"] == 900
+    assert payload["memory_count"] == 1
+    assert payload["memory_0_about_guid"] == 900
+    assert payload["memory_0_scope"] == "party"
+    # Flat, because the worldserver's reader is a strict parser for one flat object. A nested
+    # array would not merely be a different shape, it would fail to parse at all.
+    assert not any(isinstance(value, (list, dict)) for value in payload.values())
 
     # Nothing found is a normal, encodable answer. Most conversations are not worth remembering,
     # and the coordinator still needs the reply so it can close out the request.
@@ -2430,7 +2435,8 @@ def test_a_memory_response_carries_only_what_survived_validation() -> None:
             token=TEST_TOKEN,
         )
     )
-    assert empty["candidates"] == []
+    assert empty["memory_count"] == 0
+    assert not any(key.startswith("memory_0_") for key in empty)
 
 
 def test_the_memory_prompt_keeps_the_conversation_on_the_untrusted_side() -> None:
@@ -3051,7 +3057,7 @@ async def test_a_memory_request_reaches_the_memory_handler(tmp_path) -> None:
     response = json.loads(payload)
     assert response["kind"] == "memory"
     assert response["thread_id"] == "thr_00000000000000000000000000000001"
-    assert response["candidates"][0]["about_guid"] == 900
+    assert response["memory_0_about_guid"] == 900
 
 
 async def test_a_conversation_worth_nothing_still_gets_an_answer(tmp_path) -> None:
@@ -3067,7 +3073,7 @@ async def test_a_conversation_worth_nothing_still_gets_an_answer(tmp_path) -> No
     payload = await service.process_payload(_memory_request_payload())
 
     assert payload is not None
-    assert json.loads(payload)["candidates"] == []
+    assert json.loads(payload)["memory_count"] == 0
 
 
 async def test_a_memory_is_never_extracted_without_a_budget(tmp_path) -> None:

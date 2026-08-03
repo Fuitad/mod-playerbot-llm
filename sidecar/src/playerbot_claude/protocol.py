@@ -137,6 +137,12 @@ SOCIAL_MEMORY_SCOPES = ("public", "party", "whisper")
 SOCIAL_CHANNEL_MEMORY_SCOPE = (0, 0, 1, 2)
 
 MAX_SOCIAL_CONTEXT_ENTRIES = 12
+
+# The most memories one finished conversation may yield. Matches
+# PLAYERBOT_SOCIAL_MAX_EXTRACTED_MEMORIES on the worldserver. A dozen turns among a few people
+# does not contain five things worth remembering, so a reply past this is a model producing
+# volume rather than substance, and every extra one is a durable row replayed into later prompts.
+MAX_EXTRACTED_MEMORIES = 4
 MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512
 
 """The wire shape of a generated biography.
@@ -960,8 +966,8 @@ def encode_memory_response(
     if not thread_id or _byte_length(thread_id) > MAX_THREAD_ID_BYTES:
         raise ProtocolError("thread_id out of range")
 
-    if len(candidates) > MAX_SOCIAL_CONTEXT_ENTRIES:
-        raise ProtocolError("memory reply carries more candidates than a thread could support")
+    if len(candidates) > MAX_EXTRACTED_MEMORIES:
+        raise ProtocolError("memory reply carries more memories than one conversation supports")
 
     token = _encoder_token(token)
 
@@ -984,15 +990,24 @@ def encode_memory_response(
         if candidate.get("scope") not in SOCIAL_MEMORY_SCOPES:
             raise ProtocolError("memory candidate carries an unknown scope")
 
-    payload = {
+    # Flat, not a nested "candidates" array, for the reason encode_biography_response gives: the
+    # worldserver's reader is a strict parser for ONE flat object and fails the parse on any
+    # nesting at all. That narrowness is most of what makes it safe to point at a payload from the
+    # network, and widening it for this one frame is a worse trade than three keys per memory.
+    payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "token": token,
         "kind": "memory",
         "memory_request_token": memory_request_token,
         "bot_guid": bot_guid,
         "thread_id": thread_id,
-        "candidates": candidates,
+        "memory_count": len(candidates),
     }
+    for index, candidate in enumerate(candidates):
+        payload[f"memory_{index}_paraphrase"] = candidate["paraphrase"]
+        payload[f"memory_{index}_about_guid"] = candidate["about_guid"]
+        payload[f"memory_{index}_scope"] = candidate["scope"]
+
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
