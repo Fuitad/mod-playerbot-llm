@@ -1533,7 +1533,8 @@ struct ClaudeChat::ClaudeBridge::Impl
 {
     explicit Impl(BridgeConfig bridgeConfig)
         : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity),
-          socialResponses(config.queueCapacity), biographyResponses(config.queueCapacity)
+          socialResponses(config.queueCapacity), biographyResponses(config.queueCapacity),
+          memoryResponses(config.queueCapacity)
     {
     }
 
@@ -1547,7 +1548,7 @@ struct ClaudeChat::ClaudeBridge::Impl
      */
     struct QueuedRequest
     {
-        std::variant<ChatRequest, SocialRequest, BiographyRequest> payload;
+        std::variant<ChatRequest, SocialRequest, BiographyRequest, MemoryRequest> payload;
         int64 expiresAtSteadyMs = 0;
     };
 
@@ -1566,6 +1567,7 @@ struct ClaudeChat::ClaudeBridge::Impl
      * actually belong to the request it sent.
      */
     BoundedQueue<BiographyResponse> biographyResponses;
+    BoundedQueue<MemoryResponse> memoryResponses;
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
 
@@ -1710,6 +1712,7 @@ struct ClaudeChat::ClaudeBridge::Impl
 
             SocialRequest const* const social = std::get_if<SocialRequest>(&request.payload);
             BiographyRequest const* const biography = std::get_if<BiographyRequest>(&request.payload);
+            MemoryRequest const* const memory = std::get_if<MemoryRequest>(&request.payload);
 
             // A request that cannot be serialized within its budgets is discarded here rather than
             // sent for the far side to reject. Same fail closed posture as an expired one above.
@@ -1718,6 +1721,8 @@ struct ClaudeChat::ClaudeBridge::Impl
                 payload = SerializeSocialRequest(*social, config.token);
             else if (biography)
                 payload = SerializeBiographyRequest(*biography, config.token);
+            else if (memory)
+                payload = SerializeMemoryRequest(*memory, config.token);
             else
                 payload = SerializeRequest(std::get<ChatRequest>(request.payload), config.token);
 
@@ -1776,6 +1781,22 @@ struct ClaudeChat::ClaudeBridge::Impl
                             *answer, config.token, biography->biographyRequestToken,
                             biography->botGuidCounter))
                         biographyResponses.TryPush(std::move(*parsed));
+                }
+                else if (memory)
+                {
+                    /*
+                     * Parsed here for the reason a biography is: the token and the bot this very
+                     * request named are both in scope, so an answer to a different request never
+                     * reaches the world thread at all.
+                     *
+                     * No lateness check either, and here that matters more than it does for a
+                     * backstory: the conversation this describes is already over and its buffer is
+                     * already cleared, so a slow answer is still the only answer. The coordinator's
+                     * own token fence is what refuses one whose thread has since been pruned.
+                     */
+                    if (std::optional<MemoryResponse> parsed = ParseMemoryResponsePayload(
+                            *answer, config.token, memory->memoryRequestToken, memory->botGuidCounter))
+                        memoryResponses.TryPush(std::move(*parsed));
                 }
                 else if (std::optional<ChatResponse> response = ParseResponsePayload(*answer, config.token))
                 {
@@ -1873,6 +1894,27 @@ std::vector<ClaudeChat::BiographyResponse> ClaudeChat::ClaudeBridge::DrainBiogra
     std::vector<BiographyResponse> drained;
     BiographyResponse response;
     while (_impl->biographyResponses.TryPop(response))
+        drained.push_back(std::move(response));
+
+    return drained;
+}
+
+bool ClaudeChat::ClaudeBridge::TryEnqueueMemory(MemoryRequest request, int64 expiresAtSteadyMs)
+{
+    if (_impl->stopped.load())
+        return false;
+
+    if (SteadyNowMs() > expiresAtSteadyMs)
+        return false;
+
+    return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
+}
+
+std::vector<ClaudeChat::MemoryResponse> ClaudeChat::ClaudeBridge::DrainMemoryResponses()
+{
+    std::vector<MemoryResponse> drained;
+    MemoryResponse response;
+    while (_impl->memoryResponses.TryPop(response))
         drained.push_back(std::move(response));
 
     return drained;

@@ -343,6 +343,85 @@ namespace
             return _bridge->TryEnqueueBiography(std::move(request), SteadyNowMs() + _responseDeadlineMs);
         }
 
+        /*
+         * The conversation is already over, so there is no character to check the way a biography
+         * checks the bot it is about: the request describes a thread, not a person, and the bot is
+         * only who will hold the memory. A bot that logged out between the sweep and here still has
+         * durable rows the answer belongs to, so the request is worth sending.
+         */
+        bool SubmitMemory(uint64 memoryRequestToken, uint64 botGuidCounter,
+                          std::string const& threadPublicId, PlayerbotSocialPrivacyScope scope,
+                          std::vector<uint64> const& subjectGuidCounters,
+                          std::vector<PlayerbotSocialMemoryLine> const& thread) override
+        {
+            if (!_bridge)
+                return false;
+
+            ClaudeChat::MemoryRequest request;
+            request.memoryRequestToken = memoryRequestToken;
+            request.botGuidCounter = botGuidCounter;
+            request.threadPublicId = threadPublicId;
+            request.scope = scope;
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(botGuidCounter));
+            if (!bot)
+                return false;
+
+            // Names are resolved HERE, because turning a guid into one means touching a live
+            // character and the coordinator may not. They reach the trusted half of the prompt, so
+            // they are read from the character rather than carried through anyone's state.
+            request.botName = bot->GetName();
+
+            request.subjects.reserve(subjectGuidCounters.size());
+            for (uint64 const subjectGuidCounter : subjectGuidCounters)
+            {
+                std::string const name = NameOfCharacter(subjectGuidCounter);
+
+                /*
+                 * A subject whose name cannot be resolved is dropped rather than sent by guid. A
+                 * memory attributed to "character 4712" is one nobody can read, and the name is
+                 * going into the trusted instructions. Their lines still travel as context below.
+                 */
+                if (!name.empty())
+                    request.subjects.push_back({subjectGuidCounter, name});
+            }
+
+            // Nobody left to be about. Refused here rather than sent for the far side to reject,
+            // which is the same fail closed posture every other request shape takes.
+            if (request.subjects.empty())
+                return false;
+
+            request.thread.reserve(thread.size());
+            for (PlayerbotSocialMemoryLine const& line : thread)
+            {
+                std::string speaker = NameOfCharacter(line.speakerGuidCounter);
+
+                /*
+                 * A speaker who has gone is rendered by guid rather than dropped. Removing their
+                 * turn would leave the others answering nobody, which changes what the conversation
+                 * says; an unresolvable identifier reads as an unknown participant, which is what
+                 * they now are.
+                 */
+                if (speaker.empty())
+                    speaker = "character " + std::to_string(line.speakerGuidCounter);
+
+                request.thread.push_back(speaker + ": " + line.text);
+            }
+
+            if (!ClaudeChat::MemoryRequestIsUsable(request, _bridgeToken))
+                return false;
+
+            return _bridge->TryEnqueueMemory(std::move(request), SteadyNowMs() + _responseDeadlineMs);
+        }
+
+        // A character's display name, or empty when it cannot be resolved. Online characters only:
+        // an offline lookup is a database round trip, and this runs inside a world tick.
+        static std::string NameOfCharacter(uint64 guidCounter)
+        {
+            Player* character = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidCounter));
+            return character ? character->GetName() : std::string();
+        }
+
         bool TrySubmit(PlayerbotCareerPlanRequest const& careerRequest) override
         {
             if (!_bridge)

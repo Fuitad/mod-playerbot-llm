@@ -809,6 +809,9 @@ namespace ClaudeChat
         std::vector<SocialRawResponse> DrainSocialResponses();
         std::vector<BiographyResponse> DrainBiographyResponses();
 
+        bool TryEnqueueMemory(MemoryRequest request, int64 expiresAtSteadyMs);
+        std::vector<MemoryResponse> DrainMemoryResponses();
+
     private:
         struct Impl;
         std::unique_ptr<Impl> _impl;
