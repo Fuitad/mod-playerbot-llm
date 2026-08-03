@@ -410,6 +410,86 @@ namespace ClaudeChat
     };
 
     /*
+     * One finished conversation, offered for whatever is worth remembering about it.
+     *
+     * The bounds below are the ones the worldserver's extraction buffer already applies, restated
+     * at the wire. A request past either did not come from a buffer enforcing them, so sending it
+     * would let one producer bug become an unbounded prompt on a request that costs money.
+     */
+    inline constexpr std::size_t MAX_MEMORY_THREAD_LINES = 12;
+    inline constexpr std::size_t MAX_MEMORY_LINE_BYTES = 512;
+    inline constexpr std::size_t MAX_MEMORY_SUBJECTS = 12;
+
+    // The most memories one conversation may yield. Matches MAX_EXTRACTED_MEMORIES in the sidecar
+    // and PLAYERBOT_SOCIAL_MAX_EXTRACTED_MEMORIES on the coordinator.
+    inline constexpr std::size_t MAX_EXTRACTED_MEMORIES = 4;
+
+    // One character a memory from this thread may be about. Sent explicitly rather than recovered
+    // from the thread lines, because the coordinator already filtered these for consent and
+    // presence, while a name read out of a line is a value a PLAYER chose.
+    struct MemorySubject
+    {
+        uint64 guidCounter = 0;
+        std::string name;
+    };
+
+    struct MemoryRequest
+    {
+        uint64 memoryRequestToken = 0;
+        uint64 botGuidCounter = 0;
+        std::string botName;
+        std::string threadPublicId;
+
+        // Public or party, never whisper. Whisper text is never buffered, so a whisper scoped
+        // extraction cannot legitimately exist, and one reaching here means the producer stopped
+        // honouring that.
+        PlayerbotSocialPrivacyScope scope = PlayerbotSocialPrivacyScope::Public;
+
+        std::vector<MemorySubject> subjects;
+        std::vector<std::string> thread;
+    };
+
+    [[nodiscard]] bool MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token);
+
+    std::optional<std::string> SerializeMemoryRequest(MemoryRequest const& request, std::string const& token);
+
+    // One extracted memory as it arrived. Values only; the coordinator decides whether it may be
+    // stored, because it is the only thing that knows the consent and the actor rows.
+    struct MemoryResponseCandidate
+    {
+        std::string paraphrase;
+        uint64 aboutGuidCounter = 0;
+        PlayerbotSocialPrivacyScope scope = PlayerbotSocialPrivacyScope::Public;
+    };
+
+    struct MemoryResponse
+    {
+        uint64 memoryRequestToken = 0;
+        uint64 botGuidCounter = 0;
+        std::string threadPublicId;
+
+        // Empty is a normal answer. Most conversations support nothing, and the coordinator needs
+        // the reply to close the request rather than waiting out its own timeout.
+        std::vector<MemoryResponseCandidate> memories;
+    };
+
+    /*
+     * Reads one extraction answer off the wire.
+     *
+     * Flat, like the biography reply and for the same reason: this parser handles ONE flat object
+     * and fails on any nesting, and that narrowness is most of what makes it safe to point at a
+     * payload from the network. The memories arrive as `memory_count` plus three keys per slot.
+     *
+     * Identity before content, and the declared count is part of identity here: a payload whose
+     * keys disagree with its own count is one where the reader and the writer disagree about the
+     * frame, and it is refused whole rather than read up to the count.
+     */
+    std::optional<MemoryResponse> ParseMemoryResponsePayload(std::string const& payload,
+                                                             std::string const& expectedToken,
+                                                             uint64 expectedRequestToken,
+                                                             uint64 expectedBotGuidCounter);
+
+    /*
      * Reads one biography answer off the wire.
      *
      * Identity before content, as the social parser does: a well formed answer to a DIFFERENT

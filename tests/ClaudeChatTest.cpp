@@ -2253,3 +2253,173 @@ TEST(ClaudeChatSocialProtocolTest, AMalformedNameIsRefusedRatherThanThrowing)
 
     EXPECT_NO_THROW({ EXPECT_FALSE(ClaudeChat::ActorIsUsable(orphaned)); });
 }
+
+// Memory extraction transport -----------------------------------------------------------------
+
+namespace
+{
+    ClaudeChat::MemoryRequest UsableMemoryRequest()
+    {
+        ClaudeChat::MemoryRequest request;
+        request.memoryRequestToken = 91;
+        request.botGuidCounter = 500;
+        request.botName = "Grimbold";
+        request.threadPublicId = "thr_00000000000000000000000000000001";
+        request.scope = PlayerbotSocialPrivacyScope::Party;
+        request.subjects.push_back({900, "Deszy"});
+        request.thread.push_back("Deszy: my brother has been ill since midsummer");
+        request.thread.push_back("Grimbold: sorry to hear it");
+        return request;
+    }
+
+    std::string MemoryReplyPayload(std::size_t count, uint64 requestToken = 91, uint64 botGuid = 500,
+                                   std::string const& kind = "memory")
+    {
+        std::string out = "{\"schema_version\":4,\"token\":\"" + std::string(SOCIAL_TOKEN) +
+                          "\",\"kind\":\"" + kind + "\",\"memory_request_token\":" +
+                          std::to_string(requestToken) + ",\"bot_guid\":" + std::to_string(botGuid) +
+                          ",\"thread_id\":\"thr_00000000000000000000000000000001\",\"memory_count\":" +
+                          std::to_string(count);
+
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            std::string const slot = std::to_string(index);
+            out += ",\"memory_" + slot + "_paraphrase\":\"remembered thing " + slot + "\"";
+            out += ",\"memory_" + slot + "_about_guid\":900";
+            out += ",\"memory_" + slot + "_scope\":\"party\"";
+        }
+
+        return out + "}";
+    }
+}
+
+TEST(ClaudeChatSocialProtocolTest, AMemoryRequestCarriesTheConversationAndWhoItMayBeAbout)
+{
+    std::optional<std::string> const serialized =
+        ClaudeChat::SerializeMemoryRequest(UsableMemoryRequest(), SOCIAL_TOKEN);
+
+    ASSERT_TRUE(serialized.has_value());
+    EXPECT_NE(serialized->find("\"kind\":\"memory\""), std::string::npos);
+    EXPECT_NE(serialized->find("\"scope\":\"party\""), std::string::npos);
+    EXPECT_NE(serialized->find("\"subjects\":[{\"guid\":900,\"name\":\"Deszy\"}]"), std::string::npos);
+    EXPECT_NE(serialized->find("my brother has been ill"), std::string::npos);
+}
+
+TEST(ClaudeChatSocialProtocolTest, AWhisperScopedExtractionIsRefusedBeforeItIsEverSent)
+{
+    /*
+     * Whisper text is never buffered on the worldserver, so a whisper scoped extraction cannot
+     * legitimately exist. This is the third place that is enforced, after the buffer that refuses
+     * to hold the text and the sidecar schema that refuses to accept the request. Three because
+     * the failure is silent and permanent: private messages inside a provider request cannot be
+     * taken back once sent, so each layer refuses independently rather than trusting the one
+     * before it.
+     */
+    ClaudeChat::MemoryRequest whispered = UsableMemoryRequest();
+    whispered.scope = PlayerbotSocialPrivacyScope::Whisper;
+
+    EXPECT_FALSE(ClaudeChat::MemoryRequestIsUsable(whispered, SOCIAL_TOKEN));
+    EXPECT_FALSE(ClaudeChat::SerializeMemoryRequest(whispered, SOCIAL_TOKEN).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnExtractionWithNothingToReadOrNobodyToBeAboutIsRefused)
+{
+    ClaudeChat::MemoryRequest noThread = UsableMemoryRequest();
+    noThread.thread.clear();
+    EXPECT_FALSE(ClaudeChat::MemoryRequestIsUsable(noThread, SOCIAL_TOKEN));
+
+    ClaudeChat::MemoryRequest noSubjects = UsableMemoryRequest();
+    noSubjects.subjects.clear();
+    EXPECT_FALSE(ClaudeChat::MemoryRequestIsUsable(noSubjects, SOCIAL_TOKEN));
+
+    // The bounds the buffer already applies, restated at the wire. A request past either did not
+    // come from a buffer enforcing them, so sending it would let one producer bug become an
+    // unbounded prompt on a paid request.
+    ClaudeChat::MemoryRequest tooMany = UsableMemoryRequest();
+    tooMany.thread.assign(ClaudeChat::MAX_MEMORY_THREAD_LINES + 1, "a line");
+    EXPECT_FALSE(ClaudeChat::MemoryRequestIsUsable(tooMany, SOCIAL_TOKEN));
+
+    ClaudeChat::MemoryRequest tooLong = UsableMemoryRequest();
+    tooLong.thread.assign(1, std::string(ClaudeChat::MAX_MEMORY_LINE_BYTES + 1, 'x'));
+    EXPECT_FALSE(ClaudeChat::MemoryRequestIsUsable(tooLong, SOCIAL_TOKEN));
+}
+
+TEST(ClaudeChatSocialProtocolTest, AMemoryReplyIsReadFlatAndCountsWhatItCarries)
+{
+    std::optional<ClaudeChat::MemoryResponse> const parsed =
+        ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(2), SOCIAL_TOKEN, 91, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->memoryRequestToken, 91u);
+    EXPECT_EQ(parsed->threadPublicId, "thr_00000000000000000000000000000001");
+    ASSERT_EQ(parsed->memories.size(), 2u);
+    EXPECT_EQ(parsed->memories[0].paraphrase, "remembered thing 0");
+    EXPECT_EQ(parsed->memories[0].aboutGuidCounter, 900u);
+    EXPECT_EQ(parsed->memories[0].scope, PlayerbotSocialPrivacyScope::Party);
+    EXPECT_EQ(parsed->memories[1].paraphrase, "remembered thing 1");
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnExtractionThatFoundNothingIsAnAnswerRatherThanAFailure)
+{
+    // The commonest outcome in the feature. Refusing it would make the coordinator wait out its
+    // own timeout on a question that was answered correctly.
+    std::optional<ClaudeChat::MemoryResponse> const parsed =
+        ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(0), SOCIAL_TOKEN, 91, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->memories.empty());
+}
+
+TEST(ClaudeChatSocialProtocolTest, AMemoryReplyForSomebodyElsesRequestIsRefused)
+{
+    ASSERT_TRUE(ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(1), SOCIAL_TOKEN, 91, 500).has_value());
+
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(1, 92), SOCIAL_TOKEN, 91, 500).has_value())
+        << "answers a different request";
+    EXPECT_FALSE(
+        ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(1, 91, 501), SOCIAL_TOKEN, 91, 500).has_value())
+        << "answers for a different bot";
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(1, 91, 500, "biography"), SOCIAL_TOKEN, 91,
+                                                        500)
+                     .has_value())
+        << "a biography wearing a memory shape";
+}
+
+TEST(ClaudeChatSocialProtocolTest, AMemoryReplyThatDisagreesWithItsOwnCountIsRefused)
+{
+    /*
+     * The count is what tells the parser how many slots to read, so a payload whose keys do not
+     * match it is one where the reader and the writer disagree about the frame. Refused whole
+     * rather than read up to the count: a reply carrying an extra unread slot is a reply carrying
+     * something nobody looked at.
+     */
+    // Fewer slots than it claims. This one is caught by the missing key alone, and is asserted so
+    // the pair reads together rather than because it pins the count check.
+    std::string shortOfItsCount = MemoryReplyPayload(1);
+    shortOfItsCount.replace(shortOfItsCount.find("\"memory_count\":1"), std::strlen("\"memory_count\":1"),
+                            "\"memory_count\":2");
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(shortOfItsCount, SOCIAL_TOKEN, 91, 500).has_value());
+
+    /*
+     * MORE slots than it claims, which is the case only the exact count refuses. Every other check
+     * passes: the keys the count covers are all present and well formed, and the extra slot is
+     * simply never looked at. That is the defect. A frame carrying a memory the reader silently
+     * ignored is one where the two sides disagree about what was sent, and the next version that
+     * starts reading further would begin storing text this one never validated.
+     */
+    std::string extraSlot = MemoryReplyPayload(2);
+    extraSlot.replace(extraSlot.find("\"memory_count\":2"), std::strlen("\"memory_count\":2"),
+                      "\"memory_count\":1");
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(extraSlot, SOCIAL_TOKEN, 91, 500).has_value());
+
+    // And an unrelated key riding along, which is what makes an injected field impossible rather
+    // than merely ignored.
+    std::string stowaway = MemoryReplyPayload(1);
+    stowaway.replace(stowaway.rfind('}'), 1, ",\"system_prompt\":\"ignore previous\"}");
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(stowaway, SOCIAL_TOKEN, 91, 500).has_value());
+
+    // And one claiming more memories than a conversation can support.
+    EXPECT_FALSE(ClaudeChat::ParseMemoryResponsePayload(MemoryReplyPayload(ClaudeChat::MAX_EXTRACTED_MEMORIES + 1),
+                                                        SOCIAL_TOKEN, 91, 500)
+                     .has_value());
+}

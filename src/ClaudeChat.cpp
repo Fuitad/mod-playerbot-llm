@@ -1887,3 +1887,216 @@ std::vector<ClaudeChat::SocialRawResponse> ClaudeChat::ClaudeBridge::DrainSocial
 
     return drained;
 }
+
+bool ClaudeChat::MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token)
+{
+    if (!BridgeTokenIsUsable(token))
+        return false;
+
+    // Without a token the reply cannot be matched to the request that asked for it, and every
+    // completion for this bot becomes indistinguishable from every other.
+    if (request.memoryRequestToken == 0 || request.botGuidCounter == 0)
+        return false;
+
+    if (request.botName.empty() || request.botName.size() > MAX_ACTOR_NAME_BYTES)
+        return false;
+
+    if (request.threadPublicId.empty() || request.threadPublicId.size() > MAX_THREAD_ID_BYTES)
+        return false;
+
+    /*
+     * Whisper is refused here as well as by the buffer that will not hold the text and the sidecar
+     * schema that will not accept the request. Three independent refusals, because sending a
+     * private message to a provider cannot be undone once it has happened.
+     */
+    if (request.scope != PlayerbotSocialPrivacyScope::Public && request.scope != PlayerbotSocialPrivacyScope::Party)
+        return false;
+
+    if (request.subjects.empty() || request.subjects.size() > MAX_MEMORY_SUBJECTS)
+        return false;
+
+    for (MemorySubject const& subject : request.subjects)
+    {
+        // The name reaches the TRUSTED half of the prompt so a memory can be attributed, which
+        // makes its bound a security property rather than a formatting preference.
+        if (subject.guidCounter == 0 || subject.name.empty() || subject.name.size() > MAX_ACTOR_NAME_BYTES)
+            return false;
+    }
+
+    if (request.thread.empty() || request.thread.size() > MAX_MEMORY_THREAD_LINES)
+        return false;
+
+    for (std::string const& line : request.thread)
+    {
+        if (line.empty() || line.size() > MAX_MEMORY_LINE_BYTES)
+            return false;
+    }
+
+    return true;
+}
+
+std::optional<std::string> ClaudeChat::SerializeMemoryRequest(MemoryRequest const& request,
+                                                              std::string const& token)
+{
+    if (!MemoryRequestIsUsable(request, token))
+        return std::nullopt;
+
+    // Nested here, unlike the reply. This direction is only WRITTEN by the worldserver and read by
+    // a schema-validating parser on the far side, so the flat-object constraint that shapes the
+    // reply does not apply.
+    std::string out;
+    out.reserve(512 + request.thread.size() * 64);
+    out += '{';
+    AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
+    AppendJsonField(out, "token", token);
+    AppendJsonField(out, "kind", std::string(ResponseKindName(ResponseKind::Memory)));
+    AppendJsonField(out, "memory_request_token", request.memoryRequestToken);
+    AppendJsonField(out, "bot_guid", request.botGuidCounter);
+    AppendJsonField(out, "bot_name", request.botName);
+    AppendJsonField(out, "thread_id", request.threadPublicId);
+    // Spelled here rather than borrowed from the repository's name helper, which lives behind a
+    // header this module does not otherwise need. These three strings are a WIRE contract shared
+    // with the sidecar's Literal, so they belong beside the frame that carries them.
+    AppendJsonField(out, "scope",
+                    std::string(request.scope == PlayerbotSocialPrivacyScope::Party ? "party" : "public"));
+
+    out += ",\"subjects\":[";
+    for (std::size_t index = 0; index < request.subjects.size(); ++index)
+    {
+        if (index != 0)
+            out += ',';
+
+        out += "{\"guid\":";
+        out += std::to_string(request.subjects[index].guidCounter);
+        out += ",\"name\":";
+        AppendEscapedJsonString(out, request.subjects[index].name);
+        out += '}';
+    }
+    out += ']';
+
+    out += ",\"thread\":[";
+    for (std::size_t index = 0; index < request.thread.size(); ++index)
+    {
+        if (index != 0)
+            out += ',';
+
+        AppendEscapedJsonString(out, request.thread[index]);
+    }
+    out += "]}";
+
+    return out;
+}
+
+std::optional<ClaudeChat::MemoryResponse> ClaudeChat::ParseMemoryResponsePayload(
+    std::string const& payload, std::string const& expectedToken, uint64 expectedRequestToken,
+    uint64 expectedBotGuidCounter)
+{
+    std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
+    if (!fields)
+        return std::nullopt;
+
+    auto const schemaIt = fields->find("schema_version");
+    auto const tokenIt = fields->find("token");
+    auto const kindIt = fields->find("kind");
+    auto const requestIt = fields->find("memory_request_token");
+    auto const botIt = fields->find("bot_guid");
+    auto const threadIt = fields->find("thread_id");
+    auto const countIt = fields->find("memory_count");
+
+    if (schemaIt == fields->end() || tokenIt == fields->end() || kindIt == fields->end() ||
+        requestIt == fields->end() || botIt == fields->end() || threadIt == fields->end() ||
+        countIt == fields->end())
+        return std::nullopt;
+
+    if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
+        return std::nullopt;
+
+    if (!BridgeTokenIsUsable(expectedToken))
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !BridgeTokenIsUsable(tokenIt->second.text) ||
+        !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+        return std::nullopt;
+
+    // The declared kind is checked before anything is read out. A memory reply and a biography
+    // reply share a token and a bot guid, and telling them apart by shape is how the wrong reader
+    // gets handed the wrong frame.
+    if (!kindIt->second.isString)
+        return std::nullopt;
+
+    std::optional<ResponseKind> const kind = ResponseKindFromName(kindIt->second.text);
+    if (!kind || *kind != ResponseKind::Memory)
+        return std::nullopt;
+
+    // Identity before content: a well formed answer to a DIFFERENT request, or for a different
+    // bot, is refused rather than handed to whoever is waiting.
+    if (requestIt->second.isString || requestIt->second.number != expectedRequestToken)
+        return std::nullopt;
+
+    if (botIt->second.isString || botIt->second.number != expectedBotGuidCounter)
+        return std::nullopt;
+
+    if (!threadIt->second.isString || threadIt->second.text.empty() ||
+        threadIt->second.text.size() > MAX_THREAD_ID_BYTES)
+        return std::nullopt;
+
+    if (countIt->second.isString || countIt->second.number > MAX_EXTRACTED_MEMORIES)
+        return std::nullopt;
+
+    std::size_t const count = static_cast<std::size_t>(countIt->second.number);
+
+    /*
+     * Seven protocol keys plus three per memory, counted exactly. The parser already refuses
+     * duplicates, so an exact count is what refuses an unknown key, and here it also refuses a
+     * payload whose slots disagree with its own declared count. Both are the same defect: the
+     * reader and the writer do not agree about the frame, and reading it up to the count would
+     * accept one carrying something nobody looked at.
+     */
+    if (fields->size() != 7 + count * 3)
+        return std::nullopt;
+
+    MemoryResponse response;
+    response.memoryRequestToken = expectedRequestToken;
+    response.botGuidCounter = expectedBotGuidCounter;
+    response.threadPublicId = threadIt->second.text;
+    response.memories.reserve(count);
+
+    for (std::size_t index = 0; index < count; ++index)
+    {
+        std::string const slot = "memory_" + std::to_string(index) + "_";
+
+        auto const paraphraseIt = fields->find(slot + "paraphrase");
+        auto const aboutIt = fields->find(slot + "about_guid");
+        auto const scopeIt = fields->find(slot + "scope");
+
+        if (paraphraseIt == fields->end() || aboutIt == fields->end() || scopeIt == fields->end())
+            return std::nullopt;
+
+        if (!paraphraseIt->second.isString || paraphraseIt->second.text.empty() ||
+            paraphraseIt->second.text.size() > MAX_SOCIAL_CONTEXT_ENTRY_BYTES)
+            return std::nullopt;
+
+        if (aboutIt->second.isString || aboutIt->second.number == 0)
+            return std::nullopt;
+
+        if (!scopeIt->second.isString)
+            return std::nullopt;
+
+        MemoryResponseCandidate candidate;
+        candidate.paraphrase = paraphraseIt->second.text;
+        candidate.aboutGuidCounter = aboutIt->second.number;
+
+        if (scopeIt->second.text == "public")
+            candidate.scope = PlayerbotSocialPrivacyScope::Public;
+        else if (scopeIt->second.text == "party")
+            candidate.scope = PlayerbotSocialPrivacyScope::Party;
+        else if (scopeIt->second.text == "whisper")
+            candidate.scope = PlayerbotSocialPrivacyScope::Whisper;
+        else
+            return std::nullopt;
+
+        response.memories.push_back(std::move(candidate));
+    }
+
+    return response;
+}
