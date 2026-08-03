@@ -1533,20 +1533,21 @@ struct ClaudeChat::ClaudeBridge::Impl
 {
     explicit Impl(BridgeConfig bridgeConfig)
         : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity),
-          socialResponses(config.queueCapacity)
+          socialResponses(config.queueCapacity), biographyResponses(config.queueCapacity)
     {
     }
 
     /*
-     * One queued request, in exactly one of the two shapes this bridge carries.
+     * One queued request, in exactly one of the three shapes this bridge carries.
      *
-     * A variant rather than a chat request with social fields hanging off it. The two share nothing
-     * but a deadline, and a struct where half the fields are meaningless depending on a channel
-     * enum is precisely the half described shape this protocol refuses everywhere else.
+     * A variant rather than a chat request with social and biography fields hanging off it. The
+     * three share nothing but a deadline, and a struct where most of the fields are meaningless
+     * depending on a channel enum is precisely the half described shape this protocol refuses
+     * everywhere else.
      */
     struct QueuedRequest
     {
-        std::variant<ChatRequest, SocialRequest> payload;
+        std::variant<ChatRequest, SocialRequest, BiographyRequest> payload;
         int64 expiresAtSteadyMs = 0;
     };
 
@@ -1554,6 +1555,17 @@ struct ClaudeChat::ClaudeBridge::Impl
     BoundedQueue<QueuedRequest> requests;
     BoundedQueue<ChatResponse> responses;
     BoundedQueue<SocialRawResponse> socialResponses;
+
+    /*
+     * Parsed in the worker rather than handed back raw, unlike the social lane.
+     *
+     * The social lane defers parsing because classifying a payload spends the request's
+     * regeneration budget, which lives on the world thread. A biography has no regeneration budget
+     * and no conversation to fall out of, and the worker already holds the token and bot this
+     * request named, so it can do the identity check itself and hand back only answers that
+     * actually belong to the request it sent.
+     */
+    BoundedQueue<BiographyResponse> biographyResponses;
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
 
@@ -1697,12 +1709,18 @@ struct ClaudeChat::ClaudeBridge::Impl
                 continue;  // expired in queue: discard, fail closed
 
             SocialRequest const* const social = std::get_if<SocialRequest>(&request.payload);
+            BiographyRequest const* const biography = std::get_if<BiographyRequest>(&request.payload);
 
             // A request that cannot be serialized within its budgets is discarded here rather than
             // sent for the far side to reject. Same fail closed posture as an expired one above.
-            std::optional<std::string> const payload =
-                social ? SerializeSocialRequest(*social, config.token)
-                       : SerializeRequest(std::get<ChatRequest>(request.payload), config.token);
+            std::optional<std::string> payload;
+            if (social)
+                payload = SerializeSocialRequest(*social, config.token);
+            else if (biography)
+                payload = SerializeBiographyRequest(*biography, config.token);
+            else
+                payload = SerializeRequest(std::get<ChatRequest>(request.payload), config.token);
+
             if (!payload)
                 continue;
 
@@ -1742,6 +1760,22 @@ struct ClaudeChat::ClaudeBridge::Impl
                     // lives with the transport on the world thread and not here.
                     socialResponses.TryPush(
                         SocialRawResponse{social->socialRequestToken, std::move(*answer), SteadyNowMs()});
+                }
+                else if (biography)
+                {
+                    /*
+                     * Parsed here, because everything needed to judge it is here: the token and the
+                     * bot this very request named. An answer for a different request or a different
+                     * bot is dropped rather than queued, so the world thread never sees one.
+                     *
+                     * There is no lateness check. A biography is generated once and kept, so a slow
+                     * answer is still the right answer; the coordinator's own token fence is what
+                     * refuses one that a fresh request has already superseded.
+                     */
+                    if (std::optional<BiographyResponse> parsed = ParseBiographyResponsePayload(
+                            *answer, config.token, biography->biographyRequestToken,
+                            biography->botGuidCounter))
+                        biographyResponses.TryPush(std::move(*parsed));
                 }
                 else if (std::optional<ChatResponse> response = ParseResponsePayload(*answer, config.token))
                 {
@@ -1818,6 +1852,27 @@ std::vector<ClaudeChat::ChatResponse> ClaudeChat::ClaudeBridge::DrainResponses()
     std::vector<ChatResponse> drained;
     ChatResponse response;
     while (_impl->responses.TryPop(response))
+        drained.push_back(std::move(response));
+
+    return drained;
+}
+
+bool ClaudeChat::ClaudeBridge::TryEnqueueBiography(BiographyRequest request, int64 expiresAtSteadyMs)
+{
+    if (_impl->stopped.load())
+        return false;
+
+    if (SteadyNowMs() > expiresAtSteadyMs)
+        return false;
+
+    return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
+}
+
+std::vector<ClaudeChat::BiographyResponse> ClaudeChat::ClaudeBridge::DrainBiographyResponses()
+{
+    std::vector<BiographyResponse> drained;
+    BiographyResponse response;
+    while (_impl->biographyResponses.TryPop(response))
         drained.push_back(std::move(response));
 
     return drained;

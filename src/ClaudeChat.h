@@ -715,9 +715,19 @@ namespace ClaudeChat
          */
         bool TryEnqueueSocial(SocialRequest request, int64 expiresAtSteadyMs);
 
+        /*
+         * World thread: the biography lane, on the same socket and worker for the same reason.
+         *
+         * Nothing is waiting on a biography, so this lane has no regeneration budget and no
+         * conversation to fall out of. The worker therefore parses the answer itself and drops one
+         * that does not belong to the request it sent.
+         */
+        bool TryEnqueueBiography(BiographyRequest request, int64 expiresAtSteadyMs);
+
         // World thread: returns every completed response since the previous drain.
         std::vector<ChatResponse> DrainResponses();
         std::vector<SocialRawResponse> DrainSocialResponses();
+        std::vector<BiographyResponse> DrainBiographyResponses();
 
     private:
         struct Impl;

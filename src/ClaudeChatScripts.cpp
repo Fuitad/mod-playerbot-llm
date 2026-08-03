@@ -181,6 +181,10 @@ namespace
 
             std::string const bridgeToken = config.token;
 
+            // Retained because the biography lane validates its own request before enqueueing, and
+            // it has no transport object of its own holding the token the way the social lane does.
+            _bridgeToken = bridgeToken;
+
             _bridge = std::make_unique<ClaudeBridge>(std::move(config));
             _bridge->Start();
             if (!PlayerbotCareer::RegisterProvider(this))
@@ -303,6 +307,40 @@ namespace
              * Upgrade trigger: Task 10's prompt assembly landing.
              */
             return _socialTransport->Submit(request);
+        }
+
+        /*
+         * The biography seam. World thread, same posture as Submit above: resolve, hand over, decide
+         * nothing.
+         *
+         * The identity arrives already resolved by the coordinator rather than being read here. It
+         * is still checked against the live character, because the coordinator resolved it on an
+         * earlier line of the same tick and this is the last point before it is sent: refusing a
+         * request whose character has gone is cheaper than one the far side will answer for nobody.
+         */
+        bool SubmitBiography(uint64 biographyRequestToken, uint64 botGuidCounter,
+                             std::string const& characterName, uint8 raceId, uint8 classId,
+                             uint8 genderId) override
+        {
+            if (!_bridge)
+                return false;
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(botGuidCounter));
+            if (!bot || !bot->IsInWorld())
+                return false;
+
+            ClaudeChat::BiographyRequest request;
+            request.biographyRequestToken = biographyRequestToken;
+            request.botGuidCounter = botGuidCounter;
+            request.characterName = characterName;
+            request.raceId = raceId;
+            request.classId = classId;
+            request.genderId = genderId;
+
+            if (!ClaudeChat::BiographyRequestIsUsable(request, _bridgeToken))
+                return false;
+
+            return _bridge->TryEnqueueBiography(std::move(request), SteadyNowMs() + _responseDeadlineMs);
         }
 
         bool TrySubmit(PlayerbotCareerPlanRequest const& careerRequest) override
@@ -479,6 +517,7 @@ namespace
                 return;
 
             DrainSocial();
+            DrainBiographies();
 
             for (ChatResponse const& response : _bridge->DrainResponses())
             {
@@ -772,6 +811,62 @@ namespace
             }
         }
 
+        /*
+         * Hands each generated backstory to the coordinator, which owns the profile and decides
+         * whether the answer may be applied.
+         *
+         * Nothing is stored here. The worker already refused an answer for the wrong request or the
+         * wrong bot; what is left is the coordinator's own fence, the field whitelist and the
+         * identity check, and all three live on the side that owns the profile.
+         */
+        void DrainBiographies()
+        {
+            if (!_bridge)
+                return;
+
+            uint64 const nowUnixSeconds = static_cast<uint64>(GameTime::GetGameTime().count());
+
+            for (ClaudeChat::BiographyResponse const& response : _bridge->DrainBiographyResponses())
+            {
+                /*
+                 * Identity is re-resolved from the live character rather than remembered from the
+                 * request. The request may have been issued a minute ago, and a biography is
+                 * validated against who the character IS, so a stale copy is the wrong thing to
+                 * validate against even when it is almost always identical.
+                 */
+                Player* const bot = ObjectAccessor::FindPlayer(
+                    ObjectGuid::Create<HighGuid::Player>(response.botGuidCounter));
+                if (!bot || !bot->IsInWorld())
+                {
+                    // Dropped rather than applied against a remembered identity. The coordinator
+                    // times the request out and the bot gets another one later.
+                    continue;
+                }
+
+                PlayerbotSocialBiographyCandidate authoritative;
+                authoritative.botGuidCounter = response.botGuidCounter;
+                authoritative.characterName = bot->GetName();
+                authoritative.raceId = bot->getRace();
+                authoritative.classId = bot->getClass();
+                authoritative.genderId = bot->getGender();
+
+                std::vector<PlayerbotBiographyFieldValue> fields;
+                fields.reserve(response.fields.size());
+                for (ClaudeChat::BiographyResponseField const& field : response.fields)
+                    fields.push_back(PlayerbotBiographyFieldValue{field.name, field.value});
+
+                PlayerbotBiographyCompletionRejection const rejection = sPlayerbotSocialMgr.AcceptBiographyResult(
+                    response.biographyRequestToken, response.botGuidCounter, fields, authoritative,
+                    nowUnixSeconds);
+
+                if (rejection != PlayerbotBiographyCompletionRejection::None)
+                    LOG_DEBUG("playerbot.claude",
+                              "mod-playerbot-claude: biography for request {} refused ({})",
+                              response.biographyRequestToken,
+                              PlayerbotBiographyCompletionRejectionName(rejection));
+            }
+        }
+
         void Enqueue(ChatRequest request, Player* bot, Player* speaker, ChatChannel channel)
         {
             PendingDelivery delivery;
@@ -800,6 +895,7 @@ namespace
         GroupCooldownTracker _groupCooldowns;
         std::optional<AmbientCadence> _ambientCadence;
         uint64 _nextRequestId = 1;
+        std::string _bridgeToken;
         uint64 _ambientOccurrence = 0;
         int64 _responseDeadlineMs = 10000;
         int64 _groupCooldownMs = 120000;
