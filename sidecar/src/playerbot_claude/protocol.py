@@ -139,6 +139,28 @@ SOCIAL_CHANNEL_MEMORY_SCOPE = (0, 0, 1, 2)
 MAX_SOCIAL_CONTEXT_ENTRIES = 12
 MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512
 
+"""The wire shape of a generated biography.
+
+Here rather than beside the model that produces it, because this is what the worldserver's
+assembler accepts: it is a protocol fact, and the generator is one of its two users. `claude`
+asserts its own reply model against this tuple at import, so the two cannot drift apart quietly.
+
+The bound matches PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH on the C++ side. A field the
+worldserver would refuse as FieldTooLong is refused here instead, where the request is still
+identifiable.
+"""
+BIOGRAPHY_FIELD_NAMES = (
+    "origin",
+    "motivation",
+    "formative_experience",
+    "interests",
+    "aversions",
+    "preferred_topics",
+    "mannerisms",
+    "values",
+)
+MAX_BIOGRAPHY_FIELD_BYTES = 240
+
 _UINT64_MAX = 2**64 - 1
 _FRAME_HEADER = struct.Struct("!I")
 
@@ -710,6 +732,59 @@ def encode_social_response(
         "message": message,
         "emote_id": emote_id,
         "regenerate": 1 if regenerate else 0,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def encode_biography_response(
+    biography_request_token: int,
+    bot_guid: int,
+    biography: dict[str, str],
+    token: str,
+) -> bytes:
+    """Builds the exact payload shape the C++ biography response parser accepts.
+
+    Carries only the generated fields. Identity is stamped on the worldserver from its own
+    character tables, and a payload offering one would be refused by the assembler's whitelist,
+    so the encoder never builds one.
+
+    There is no failure variant. A generation that produces nothing returns silence, and the
+    coordinator's own request timeout is what opens the retry: a failure frame would be a second
+    way to reach the same transition, reachable by anything that can address the bridge.
+    """
+
+    if not 1 <= biography_request_token <= _UINT64_MAX:
+        raise ProtocolError("biography_request_token out of range")
+
+    if not 1 <= bot_guid <= _UINT64_MAX:
+        raise ProtocolError("bot_guid out of range")
+
+    token = _encoder_token(token)
+
+    expected = set(BIOGRAPHY_FIELD_NAMES)
+    if set(biography) != expected:
+        # Named rather than tolerated in either direction. A missing field reaches the
+        # worldserver as MissingRequiredField and burns a retry; an extra one is refused by the
+        # whitelist. Both are cheaper to catch on this side, where the request id is still known.
+        raise ProtocolError("biography must carry exactly the generated fields")
+
+    for name, value in biography.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ProtocolError(f"biography field {name} is empty")
+
+        if _byte_length(value) > MAX_BIOGRAPHY_FIELD_BYTES:
+            raise ProtocolError(f"biography field {name} exceeds {MAX_BIOGRAPHY_FIELD_BYTES} UTF-8 bytes")
+
+        if any(ord(character) < 0x20 for character in value):
+            raise ProtocolError(f"biography field {name} must be a single line without control characters")
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "token": token,
+        "kind": "biography",
+        "biography_request_token": biography_request_token,
+        "bot_guid": bot_guid,
+        "biography": biography,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 

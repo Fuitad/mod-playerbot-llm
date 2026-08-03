@@ -571,6 +571,58 @@ class ClaudeAdapter:
 
         return validate_social_message(parsed.message, request, totals), 0, totals
 
+    def count_biography_input_tokens(self, request: protocol.BiographyRequest) -> int:
+        try:
+            # Must match generate_biography exactly, for the same reason the other two counts
+            # do: the structured output schema is billed as input and priced from here.
+            result = self._client.messages.count_tokens(
+                model=MODEL_ID,
+                system=build_biography_system_prompt(request),
+                messages=_biography_messages(request),
+                output_format=BiographyReply,
+            )
+        except anthropic.APIError as error:
+            raise _map_api_error(error) from error
+        except httpx.TimeoutException as error:
+            raise ClaudeTimeoutError(str(error)) from error
+
+        return result.input_tokens
+
+    def generate_biography(self, request: protocol.BiographyRequest) -> tuple[dict[str, str], UsageTotals]:
+        try:
+            response = self._client.messages.parse(
+                model=MODEL_ID,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                system=build_biography_system_prompt(request),
+                messages=_biography_messages(request),
+                output_format=BiographyReply,
+            )
+        except anthropic.APIError as error:
+            raise _map_api_error(error) from error
+        except httpx.TimeoutException as error:
+            raise ClaudeTimeoutError(str(error)) from error
+        except ValidationError as error:
+            raise ClaudeInvalidOutputError("model output did not match the biography schema") from error
+
+        # Read BEFORE validating, for the reason the other two generators give: everything below
+        # rejects a completion that was already generated and billed.
+        usage = response.usage
+        totals = UsageTotals(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
+            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+        )
+
+        if not totals.is_priceable:
+            raise ClaudeInvalidOutputError("provider reported impossible token counts")
+
+        parsed = response.parsed_output
+        if parsed is None or not isinstance(parsed, BiographyReply):
+            raise ClaudeInvalidOutputError("model output did not match the biography schema", totals)
+
+        return biography_fields_for_transport(parsed, request, totals), totals
+
     def generate_reply(
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
     ) -> tuple[str, UsageTotals]:
@@ -823,8 +875,9 @@ FORBIDDEN_CLAIM_TERMS = (
 )
 
 # Matches the worldserver's PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH. Anything longer is a
-# sign the model wrote prose where a field was asked for.
-MAX_BIOGRAPHY_FIELD_LENGTH = 240
+# sign the model wrote prose where a field was asked for. Taken from the protocol rather than
+# restated, because the encoder enforces the same bound and two copies of a number drift.
+MAX_BIOGRAPHY_FIELD_LENGTH = protocol.MAX_BIOGRAPHY_FIELD_BYTES
 
 """Shapes that mean a remembered fact is carrying something it should not.
 
@@ -953,6 +1006,123 @@ class BiographyReply(BaseModel):
     preferred_topics: str
     mannerisms: str
     values: str
+
+
+# The wire contract and the model that fills it, checked against each other at import. Adding a
+# field to one and not the other would otherwise surface as a runtime encoder refusal on a
+# biography that had already been generated and paid for.
+assert tuple(BiographyReply.model_fields) == protocol.BIOGRAPHY_FIELD_NAMES
+
+
+"""Identity vocabulary for the biography prompt.
+
+Transcribed from the worldserver's own `src/server/shared/SharedDefines.h`, which is the
+authority for these ids. They travel as numbers rather than names because the worldserver has
+them as numbers and translating there would put a display concern in the request builder.
+
+Deliberately not exhaustive over the 0..255 the wire permits: the gaps in the game's own
+enumerations are gaps here too, and an id outside these tables is refused rather than guessed.
+"""
+RACE_NAMES: dict[int, str] = {
+    1: "Human",
+    2: "Orc",
+    3: "Dwarf",
+    4: "Night Elf",
+    5: "Undead",
+    6: "Tauren",
+    7: "Gnome",
+    8: "Troll",
+    10: "Blood Elf",
+    11: "Draenei",
+}
+
+CLASS_NAMES: dict[int, str] = {
+    1: "Warrior",
+    2: "Paladin",
+    3: "Hunter",
+    4: "Rogue",
+    5: "Priest",
+    6: "Death Knight",
+    7: "Shaman",
+    8: "Mage",
+    9: "Warlock",
+    11: "Druid",
+}
+
+GENDER_NAMES: dict[int, str] = {0: "male", 1: "female"}
+
+
+def build_biography_system_prompt(request: protocol.BiographyRequest) -> str:
+    """Trusted instructions only, and the whole prompt for a biography.
+
+    Nothing untrusted exists here to separate out: a biography is generated from authoritative
+    character data alone, with no chat, no memory, and no player-authored text of any kind. That
+    is what makes it the one prompt in this file with no UNTRUSTED section.
+
+    Raises ClaudeInvalidOutputError when the identity cannot be named. Refusing is the honest
+    answer: a race id this build does not know means a worldserver newer than the sidecar or a
+    corrupt row, and the alternatives are a backstory written about a character whose race the
+    prompt guessed, or one silently written about nobody in particular.
+    """
+
+    race = RACE_NAMES.get(request.race_id)
+    character_class = CLASS_NAMES.get(request.class_id)
+    gender = GENDER_NAMES.get(request.gender_id)
+    if race is None or character_class is None or gender is None:
+        raise ClaudeInvalidOutputError(
+            f"unknown identity for biography request {request.biography_request_token}: "
+            f"race {request.race_id}, class {request.class_id}, gender {request.gender_id}"
+        )
+
+    return (
+        f"Write a compact backstory for {request.character_name}, a {gender} {race} "
+        f"{character_class} in the world of Azeroth.\n"
+        "Rules:\n"
+        "- Fill every field with one short phrase or sentence, at most 240 bytes. These are notes "
+        "about a character, not prose.\n"
+        "- Keep it ordinary. This is one adventurer among thousands, not a hero of the Alliance or "
+        "the Horde.\n"
+        "- Never claim kinship, friendship, rivalry, or any shared history with a named figure from "
+        "Warcraft lore, and never claim a title, rank, or deed that would make this character "
+        "notable.\n"
+        "- Warcraft geography, professions, factions, and everyday history are all fair material.\n"
+        "- Do not restate the name, race, class, or gender in any field. They are already known.\n"
+        "- No markdown, no emoji, no newlines, no out-of-character commentary."
+    )
+
+
+def _biography_messages(request: protocol.BiographyRequest) -> list[MessageParam]:
+    # No history and no untrusted section, for the reason build_biography_system_prompt gives:
+    # there is no player-authored input to a biography at all.
+    return [
+        cast(
+            MessageParam,
+            {"role": "user", "content": f"Write the backstory for {request.character_name}."},
+        )
+    ]
+
+
+def biography_fields_for_transport(
+    reply: BiographyReply, request: protocol.BiographyRequest, usage: UsageTotals | None = None
+) -> dict[str, str]:
+    """Validates a generated backstory and returns exactly the fields that may cross the bridge.
+
+    The identity is stamped here and then dropped, which reads like waste and is not. Stamping is
+    what makes `build_biography` a complete record and keeps the model's output and the request's
+    identity in one object where the validators can see both. Dropping it is what the worldserver
+    requires: its assembler refuses any field name outside the generated set, identity names
+    included, because identity is filled from the character tables and never accepted from a
+    payload. Sending it back would be refused by that whitelist, which is the whitelist working.
+    """
+
+    identity: dict[str, object] = {
+        "character_name": request.character_name,
+        "race_id": request.race_id,
+        "class_id": request.class_id,
+        "gender_id": request.gender_id,
+    }
+    built = build_biography(reply, identity, usage)
+    return {name: str(built[name]) for name in BiographyReply.model_fields}
 
 
 def build_biography(

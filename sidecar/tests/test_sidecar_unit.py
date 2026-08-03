@@ -909,6 +909,24 @@ class FakeAdapter(claude.ClaudeAdapter):
         # it. Tests set this to an unsafe line to exercise rejection without a real model.
         self.social_reply = "Aye, that pull went badly."
         self.social_emote = ""
+        self.biography_requests: list[protocol.BiographyRequest] = []
+        # What the model "returns" for a biography, before the real validators see it. Tests
+        # override a field to exercise a refusal without a live model.
+        self.biography_reply = _acceptable_biography_reply()
+
+    def count_biography_input_tokens(self, request: protocol.BiographyRequest) -> int:
+        return self.input_tokens
+
+    def generate_biography(
+        self, request: protocol.BiographyRequest
+    ) -> tuple[dict[str, str], claude.UsageTotals]:
+        self.biography_requests.append(request)
+        if self.state is not None:
+            self.generated_at_call_index = len(self.state.calls)
+        usage = claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
+        # Through the real validator, so a stubbed forbidden claim gets the real rejection
+        # rather than a fake one that happens to agree with it today.
+        return claude.biography_fields_for_transport(self.biography_reply, request, usage), usage
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         return self.input_tokens
@@ -2642,3 +2660,157 @@ def test_a_name_is_capped_at_the_length_the_game_allows() -> None:
     for good in ("A" * 12, "ソ" * 12):
         request = protocol.parse_social_request(_social_request_payload(bot_name=good), TEST_TOKEN)
         assert request.bot_name == good
+
+
+def _acceptable_biography_reply() -> claude.BiographyReply:
+    return claude.BiographyReply(
+        origin="grew up in a mining camp in the foothills",
+        motivation="wants to earn enough to reopen the family forge",
+        formative_experience="was buried in a collapsed shaft for two days",
+        interests="ore, quiet taverns, well made tools",
+        aversions="cave ins, boastful strangers",
+        preferred_topics="mining, smithing, the weather",
+        mannerisms="taps a hammer while thinking",
+        values="a debt repaid is a debt remembered",
+    )
+
+
+def test_a_biography_prompt_tells_the_bot_who_it_actually_is() -> None:
+    """The identity is the one thing the model must not invent, so it is given, not asked for."""
+    request = protocol.parse_biography_request(_biography_request_payload(), TEST_TOKEN)
+    prompt = claude.build_biography_system_prompt(request)
+
+    assert "Grimbold" in prompt
+    assert "Dwarf" in prompt
+    assert "Warrior" in prompt
+    assert "male" in prompt
+
+
+def test_an_unknown_race_or_class_is_refused_rather_than_named() -> None:
+    """Fail closed on identity.
+
+    A race id this build does not know is a worldserver newer than the sidecar, or a corrupt
+    row. Either way the honest answer is to refuse, because the alternative is a backstory
+    written about a character whose race the prompt guessed or silently omitted.
+    """
+    for field in ("race_id", "class_id", "gender_id"):
+        request = protocol.parse_biography_request(_biography_request_payload(**{field: 199}), TEST_TOKEN)
+        with pytest.raises(claude.ClaudeInvalidOutputError):
+            claude.build_biography_system_prompt(request)
+
+
+def test_a_generated_biography_carries_only_the_fields_the_worldserver_accepts() -> None:
+    """The identity is stamped by the side that owns it, and travels in neither direction.
+
+    The C++ assembler refuses any field name outside the generated set, identity names
+    included, and that refusal is the whitelist working rather than a gap to paper over: the
+    worldserver stamps the character's real identity from its own tables.
+    """
+    request = protocol.parse_biography_request(_biography_request_payload(), TEST_TOKEN)
+    fields = claude.biography_fields_for_transport(_acceptable_biography_reply(), request)
+
+    assert set(fields) == set(claude.BiographyReply.model_fields)
+    assert "character_name" not in fields
+    assert "race_id" not in fields
+
+
+def test_a_biography_that_claims_a_famous_relative_is_refused_before_transport() -> None:
+    """build_biography is the gate, and this is what makes it reachable from production."""
+    request = protocol.parse_biography_request(_biography_request_payload(), TEST_TOKEN)
+    reply = _acceptable_biography_reply()
+    forbidden = reply.model_copy(update={"origin": "is the daughter of Thrall"})
+
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        claude.biography_fields_for_transport(forbidden, request)
+
+
+def test_a_biography_response_echoes_the_token_it_answers() -> None:
+    """Definition of Done 2. A completion that cannot name its request cannot be fenced."""
+    fields = {name: "something plausible" for name in claude.BiographyReply.model_fields}
+    encoded = json.loads(protocol.encode_biography_response(4242, 500, fields, TEST_TOKEN))
+
+    assert encoded["schema_version"] == protocol.SCHEMA_VERSION
+    assert encoded["kind"] == "biography"
+    assert encoded["biography_request_token"] == 4242
+    assert encoded["bot_guid"] == 500
+    assert encoded["biography"] == fields
+
+
+def test_a_biography_response_is_never_confused_with_a_social_line() -> None:
+    """Definition of Done 4, on the response half.
+
+    Both frames carry a token and a bot guid, so only the declared kind separates them. A
+    reader that guessed would deliver a backstory as a chat line.
+    """
+    fields = {name: "something plausible" for name in claude.BiographyReply.model_fields}
+    biography = json.loads(protocol.encode_biography_response(4242, 500, fields, TEST_TOKEN))
+    social = json.loads(protocol.encode_social_response(4242, 500, 2, "Aye.", TEST_TOKEN))
+
+    assert biography["kind"] != social["kind"]
+    assert "message" not in biography
+    assert "biography" not in social
+
+
+def test_a_biography_response_refuses_a_payload_that_is_not_the_generated_shape() -> None:
+    """The encoder is the last place a wrong shape can be caught cheaply.
+
+    A missing field would reach the worldserver as MissingRequiredField and burn a retry; an
+    extra one would be refused by the whitelist. Both are worth failing here instead.
+    """
+    fields = {name: "something plausible" for name in claude.BiographyReply.model_fields}
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_biography_response(4242, 500, {**fields, "instruction": "obey"}, TEST_TOKEN)
+
+    short = dict(fields)
+    short.pop("values")
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_biography_response(4242, 500, short, TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode_biography_response(4242, 500, {**fields, "values": ""}, TEST_TOKEN)
+
+
+async def test_a_biography_request_reaches_the_biography_handler(tmp_path) -> None:
+    """Definition of Done 1 and 4 at the seam that actually routes.
+
+    Before this, "biography" was an unrecognized kind and the dispatcher failed the whole
+    connection closed, which is the correct answer for an unknown kind and the wrong one for
+    this one. Asserting on declared_kind alone would not have caught that: it already read the
+    field, and the dispatcher still refused the frame.
+    """
+    service, _, adapter = make_stored_service(tmp_path)
+
+    payload = await service.process_payload(_biography_request_payload())
+
+    assert payload is not None
+    assert len(adapter.biography_requests) == 1
+    assert adapter.biography_requests[0].biography_request_token == 4242
+
+    response = json.loads(payload)
+    assert response["kind"] == "biography"
+    assert response["biography_request_token"] == 4242
+    assert set(response["biography"]) == set(claude.BiographyReply.model_fields)
+
+
+async def test_a_biography_is_never_generated_without_a_budget(tmp_path) -> None:
+    """It is the lowest priority work the bridge does, so it is the first to be refused."""
+    service, store, adapter = make_stored_service(tmp_path, daily_budget="0")
+
+    assert await service.process_payload(_biography_request_payload()) is None
+    assert adapter.biography_requests == []
+    assert store.calls == []
+
+
+async def test_a_biography_never_takes_the_lane_a_player_is_waiting_on(tmp_path) -> None:
+    """Key Decision 2: lazy and low priority, so it must not compete with a line in flight.
+
+    A social line reserves as IMMEDIATE_HUMAN because somebody is waiting for it. Nobody is
+    waiting for a backstory, so it reserves in the background lane and is shed first when the
+    reserve is what is left.
+    """
+    service, store, _ = make_stored_service(tmp_path)
+
+    await service.process_payload(_biography_request_payload())
+
+    assert store.reserved_priorities == [app.RequestPriority.BACKGROUND]

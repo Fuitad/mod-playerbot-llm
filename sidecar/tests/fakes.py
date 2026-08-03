@@ -40,6 +40,10 @@ class FakeState:
         # reserved BEFORE the provider was called rather than merely that both happened.
         self.calls: list[str] = []
         self.reservations: list[ledger.Reservation] = []
+        # Which lane each reserve() was admitted under, in call order. The reservation object
+        # itself does not carry the lane, so without this a test can only assert that money was
+        # reserved, never that a background job stayed out of the slice held for a waiting player.
+        self.reserved_priorities: list[budget.RequestPriority] = []
         self.released: list[ledger.Reservation] = []
         self.settlements: list[tuple[ledger.Reservation, int]] = []
         self._next_id = 1
@@ -94,6 +98,7 @@ class FakeState:
 
     async def reserve(self, *, request_id, max_cost_nano, priority, now):
         self.calls.append("reserve")
+        self.reserved_priorities.append(priority)
         decision = budget.admit(
             ceiling_nano=self.ceiling_nano,
             state=self._budget_state(),

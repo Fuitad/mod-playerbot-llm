@@ -366,6 +366,8 @@ class SidecarService:
         kind = protocol.declared_kind(payload)
         if kind == "social":
             return await self._process_social_payload(payload)
+        if kind == "biography":
+            return await self._process_biography_payload(payload)
         if kind is not None:
             # Fail closed. A kind nobody here recognizes is a newer worldserver talking to an
             # older sidecar, and guessing which handler it meant is how the wrong one runs.
@@ -414,6 +416,102 @@ class SidecarService:
         except TimeoutError:
             _log(f"social {token}: response deadline exceeded, staying silent")
             return None
+
+    async def _process_biography_payload(self, payload: bytes) -> bytes | None:
+        """One bot's backstory, which nobody is waiting on.
+
+        Silence is the only failure answer. A biography is generated once and kept, so there is
+        nothing to regenerate against and no conversation to fall out of; the coordinator's own
+        request timeout opens the retry, and it is the only thing that does.
+        """
+
+        request = protocol.parse_biography_request(payload, self._token)
+        token = request.biography_request_token
+
+        if not self._config.generation_allowed:
+            _log(f"biography {token}: no budget configured, staying silent")
+            return None
+
+        try:
+            async with asyncio.timeout(self._config.response_deadline_ms / 1000):
+                return await self._process_biography_within_deadline(request)
+        except TimeoutError:
+            _log(f"biography {token}: response deadline exceeded, staying silent")
+            return None
+
+    async def _process_biography_within_deadline(self, request: protocol.BiographyRequest) -> bytes | None:
+        token = request.biography_request_token
+        if self._store is None:
+            _log(f"biography {token}: no durable state is open, staying silent")
+            return None
+
+        store = self._store
+        input_prices = self._config.price_texts
+
+        async with self._generation_lock:
+            now = self._now()
+
+            try:
+                input_tokens = await asyncio.to_thread(self._adapter.count_biography_input_tokens, request)
+            except claude.ClaudeError as error:
+                _log(f"biography {token}: {type(error).__name__}: {error}")
+                return None
+
+            if input_tokens > claude.MAX_INPUT_TOKENS:
+                _log(
+                    f"biography {token}: prompt is {input_tokens} tokens "
+                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                )
+                return None
+
+            max_cost_nano = budget.conservative_max_cost_nano(
+                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+            )
+            # The background lane, deliberately. Nobody is waiting on a backstory, so it must
+            # never spend the slice held for a player who just said something and is watching
+            # for an answer. This is Key Decision 2 expressed where it is actually enforced.
+            decision, reservation = await store.reserve(
+                request_id=token,
+                max_cost_nano=max_cost_nano,
+                priority=RequestPriority.BACKGROUND,
+                now=now,
+            )
+            if decision is not AdmissionDecision.ADMITTED or reservation is None:
+                _log(f"biography {token}: {decision.value}, staying silent")
+                return None
+
+            try:
+                fields, usage = await asyncio.to_thread(self._adapter.generate_biography, request)
+            except claude.ClaudeError as error:
+                # Covers a refused backstory as well as a provider failure. Both were billed if
+                # the model ran, both are settled, and both leave the coordinator to time the
+                # request out rather than being told to try again immediately: a bot that just
+                # produced a forbidden claim is not more likely to behave on the next attempt.
+                outcome = await self._account_for_failure(store, reservation, error)
+                _log(f"biography {token}: {type(error).__name__}: {error} ({outcome})")
+                return None
+
+            settled_at = self._now()
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+            except ValueError as error:
+                _log(f"biography {token}: cannot price the completion: {error}")
+                return None
+
+            if not await store.settle(
+                reservation=reservation,
+                actual_cost_nano=actual_cost_nano,
+                now=settled_at,
+            ):
+                _log(f"biography {token}: settlement refused, the reservation had already expired")
+                return None
+
+        return protocol.encode_biography_response(
+            biography_request_token=token,
+            bot_guid=request.bot_guid,
+            biography=fields,
+            token=self._token,
+        )
 
     async def _process_social_within_deadline(self, request: protocol.SocialRequest) -> bytes | None:
         token = request.social_request_token
