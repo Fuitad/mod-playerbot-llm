@@ -597,6 +597,8 @@ namespace
 
             DrainSocial();
             DrainBiographies();
+            DrainMemories();
+            SweepIdleThreadsForMemories();
 
             for (ChatResponse const& response : _bridge->DrainResponses())
             {
@@ -898,6 +900,49 @@ namespace
          * wrong bot; what is left is the coordinator's own fence, the field whitelist and the
          * identity check, and all three live on the side that owns the profile.
          */
+        /*
+         * Asks the coordinator to read whatever conversations have gone quiet, and releases the
+         * tokens of any request the bridge never answered.
+         *
+         * Every decision about what may be read, by whom, and about whom is the coordinator's; this
+         * is the tick that makes it happen. The sweep is bounded per call, so a realm where
+         * everything falls silent at once produces a few requests per tick rather than hundreds.
+         */
+        void SweepIdleThreadsForMemories()
+        {
+            uint64 const nowUnixSeconds = static_cast<uint64>(GameTime::GetGameTime().count());
+
+            sPlayerbotSocialMgr.AbandonStaleMemoryRequests(nowUnixSeconds);
+            sPlayerbotSocialMgr.RequestIdleExtractions(nowUnixSeconds);
+        }
+
+        /*
+         * Hands each extraction answer back to the coordinator.
+         *
+         * Nothing is stored here and nothing is checked here. The worker already refused an answer
+         * for the wrong request or the wrong bot; what remains is the coordinator's own token
+         * fence, its subject and scope recheck, and the consent and actor gates inside
+         * PersistMemory, all of which live on the side that owns the durable state.
+         */
+        void DrainMemories()
+        {
+            if (!_bridge)
+                return;
+
+            for (ClaudeChat::MemoryResponse const& response : _bridge->DrainMemoryResponses())
+            {
+                std::vector<PlayerbotSocialExtractedMemory> extracted;
+                extracted.reserve(response.memories.size());
+
+                for (ClaudeChat::MemoryResponseCandidate const& candidate : response.memories)
+                    extracted.push_back({candidate.paraphrase, candidate.aboutGuidCounter, candidate.scope});
+
+                sPlayerbotSocialMgr.ApplyExtractedMemories(response.memoryRequestToken,
+                                                            response.botGuidCounter, response.threadPublicId,
+                                                            extracted);
+            }
+        }
+
         void DrainBiographies()
         {
             if (!_bridge)
