@@ -1224,6 +1224,71 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
     }
 }
 
+TEST(ClaudeChatSocialProtocolTest, ABiographyRequestSerializesToExactContractJson)
+{
+    /*
+     * Task 10A Definition of Done 1. Pinned byte for byte rather than field by field, and mirrored
+     * by _biography_request_payload in the sidecar's test suite: two sides that each assert a shape
+     * they build for themselves agree with themselves and with nothing else, which is exactly how
+     * Task 9B shipped a field that crossed the seam and was read by nobody.
+     *
+     * The identity travels OUT here. BiographyReply has no identity fields at all, so name, race,
+     * class and gender are stamped back on from this request afterwards and a generated value can
+     * never become an identity.
+     */
+    ClaudeChat::BiographyRequest request;
+    request.biographyRequestToken = 4242;
+    request.botGuidCounter = 500;
+    request.characterName = "Grimbold";
+    request.raceId = 3;
+    request.classId = 1;
+    request.genderId = 0;
+
+    std::string const expected =
+        "{\"schema_version\":4,"
+        "\"token\":\"" + SOCIAL_TOKEN + "\","
+        "\"kind\":\"biography\","
+        "\"biography_request_token\":4242,"
+        "\"bot_guid\":500,"
+        "\"character_name\":\"Grimbold\","
+        "\"race_id\":3,"
+        "\"class_id\":1,"
+        "\"gender_id\":0}";
+
+    auto const encoded = ClaudeChat::SerializeBiographyRequest(request, SOCIAL_TOKEN);
+    ASSERT_TRUE(encoded.has_value());
+    EXPECT_EQ(*encoded, expected);
+}
+
+TEST(ClaudeChatSocialProtocolTest, ABiographyRequestWithoutATokenIsNeverBuilt)
+{
+    /*
+     * Definition of Done 2. The token is what identifies WHICH request a completion answers, and
+     * the profile's own state cannot: after the pending timeout and a fresh request, a very late
+     * reply to the superseded call still finds the profile Pending and would be accepted. A
+     * request that travels without one is unidentifiable on return, so it is refused at the point
+     * of building rather than sent and reconciled later.
+     */
+    ClaudeChat::BiographyRequest good;
+    good.biographyRequestToken = 4242;
+    good.botGuidCounter = 500;
+    good.characterName = "Grimbold";
+    ASSERT_TRUE(ClaudeChat::SerializeBiographyRequest(good, SOCIAL_TOKEN).has_value());
+
+    for (auto const& [name, mutate] :
+         std::initializer_list<std::pair<char const*, void (*)(ClaudeChat::BiographyRequest&)>>{
+             {"no request token", [](ClaudeChat::BiographyRequest& r) { r.biographyRequestToken = 0; }},
+             {"no bot", [](ClaudeChat::BiographyRequest& r) { r.botGuidCounter = 0; }},
+             {"no name", [](ClaudeChat::BiographyRequest& r) { r.characterName.clear(); }},
+             {"long name",
+              [](ClaudeChat::BiographyRequest& r) { r.characterName = std::string(200, 'a'); }}})
+    {
+        ClaudeChat::BiographyRequest bad = good;
+        mutate(bad);
+        EXPECT_FALSE(ClaudeChat::SerializeBiographyRequest(bad, SOCIAL_TOKEN).has_value()) << name;
+    }
+}
+
 TEST(ClaudeChatSocialProtocolTest, AStarterSubjectTravelsAsTheTypedContextShapeNotAsLooseText)
 {
     /*

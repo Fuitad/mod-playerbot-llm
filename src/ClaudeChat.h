@@ -83,7 +83,9 @@ namespace ClaudeChat
     {
         Chat = 0,
         Career,
-        Social
+        Social,
+        Biography,
+        Memory
     };
 
     [[nodiscard]] bool ResponseKindIsValid(ResponseKind kind);
@@ -341,6 +343,34 @@ namespace ClaudeChat
      * reads any field and would refuse the request outright.
      */
     [[nodiscard]] std::string EncodeStarterContext(std::string const& subject);
+
+    /*
+     * A request for one bot's backstory.
+     *
+     * Carries the identity rather than asking for it. The generated reply has nowhere to put a
+     * name, race, class or gender, so those travel out here and are stamped back on afterwards:
+     * a generated value can then never become an identity, because the model is never asked.
+     *
+     * `biographyRequestToken` is the half of the staleness rule the profile's own state cannot
+     * supply. Requiring the profile to still be Pending stops a completion replacing a biography
+     * that is already Ready, but it cannot say WHICH request a completion answers, so after the
+     * pending timeout and a fresh request a very late reply to the superseded call still finds
+     * the profile Pending. Only a token minted per request and echoed back closes that.
+     */
+    struct BiographyRequest
+    {
+        uint64 biographyRequestToken = 0;
+        uint64 botGuidCounter = 0;
+        std::string characterName;
+        uint8 raceId = 0;
+        uint8 classId = 0;
+        uint8 genderId = 0;
+    };
+
+    [[nodiscard]] bool BiographyRequestIsUsable(BiographyRequest const& request, std::string const& token);
+
+    std::optional<std::string> SerializeBiographyRequest(BiographyRequest const& request,
+                                                         std::string const& token);
 
     /*
      * Strict parser for a social answer.

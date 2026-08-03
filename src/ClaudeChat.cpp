@@ -568,6 +568,8 @@ bool ClaudeChat::ResponseKindIsValid(ResponseKind kind)
         case ResponseKind::Chat:
         case ResponseKind::Career:
         case ResponseKind::Social:
+        case ResponseKind::Biography:
+        case ResponseKind::Memory:
             return true;
         default:
             break;
@@ -586,6 +588,10 @@ char const* ClaudeChat::ResponseKindName(ResponseKind kind)
             return "career";
         case ResponseKind::Social:
             return "social";
+        case ResponseKind::Biography:
+            return "biography";
+        case ResponseKind::Memory:
+            return "memory";
         default:
             break;
     }
@@ -603,6 +609,10 @@ std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::st
         return ResponseKind::Career;
     if (name == "social")
         return ResponseKind::Social;
+    if (name == "biography")
+        return ResponseKind::Biography;
+    if (name == "memory")
+        return ResponseKind::Memory;
 
     return std::nullopt;
 }
@@ -962,6 +972,52 @@ namespace
         return kept;
     }
 }  // namespace
+
+bool ClaudeChat::BiographyRequestIsUsable(BiographyRequest const& request, std::string const& token)
+{
+    if (!BridgeTokenIsUsable(token))
+        return false;
+
+    /*
+     * A request with no token cannot be answered identifiably, so it is refused here rather than
+     * sent and reconciled later. Definition of Done 2 rests on the echo, and a zero token would
+     * make every completion for this bot indistinguishable from every other.
+     */
+    if (request.biographyRequestToken == 0)
+        return false;
+
+    if (request.botGuidCounter == 0)
+        return false;
+
+    // The name reaches the TRUSTED half of the prompt, because the bot has to be told who it is,
+    // so its bound is a security property rather than a formatting preference.
+    if (request.characterName.empty() || request.characterName.size() > MAX_ACTOR_NAME_BYTES)
+        return false;
+
+    return true;
+}
+
+std::optional<std::string> ClaudeChat::SerializeBiographyRequest(BiographyRequest const& request,
+                                                                 std::string const& token)
+{
+    if (!BiographyRequestIsUsable(request, token))
+        return std::nullopt;
+
+    std::string out;
+    out.reserve(256);
+    out += '{';
+    AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
+    AppendJsonField(out, "token", token);
+    AppendJsonField(out, "kind", std::string(ResponseKindName(ResponseKind::Biography)));
+    AppendJsonField(out, "biography_request_token", request.biographyRequestToken);
+    AppendJsonField(out, "bot_guid", request.botGuidCounter);
+    AppendJsonField(out, "character_name", request.characterName);
+    AppendJsonField(out, "race_id", static_cast<uint64>(request.raceId));
+    AppendJsonField(out, "class_id", static_cast<uint64>(request.classId));
+    AppendJsonField(out, "gender_id", static_cast<uint64>(request.genderId));
+    out += '}';
+    return out;
+}
 
 std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
 {
