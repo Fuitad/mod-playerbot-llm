@@ -795,6 +795,207 @@ def encode_biography_response(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+class MemorySubject(BaseModel):
+    """One character a memory from this thread may be about.
+
+    Sent explicitly rather than parsed out of the thread lines, because the coordinator has
+    already filtered these for consent and presence, and a name recovered from a line is a value
+    a PLAYER chose. Every guid here is one the worldserver is willing to store against.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        # Same rule as every other actor name: this one is interpolated into the TRUSTED half of
+        # the prompt so the model can attribute a memory, so length alone is not a bound.
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"actor name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        if not actor_name_is_usable(value):
+            raise ValueError("actor name is not a usable character name")
+
+        return value
+
+
+class MemoryRequest(BaseModel):
+    """One idle conversation, offered for whatever is worth remembering about it.
+
+    Nobody is waiting on this. It runs in the background lane beside a biography, because a
+    memory extracted a second late costs nothing while a player watching for an answer is
+    watching now.
+
+    `scope` is deliberately narrower than the memory scopes the rest of the protocol carries: a
+    whisper is never buffered on the worldserver, so a whisper scoped extraction cannot
+    legitimately exist, and one arriving here means the producer stopped honouring that. The
+    schema refuses it rather than trusting the far side, because being wrong means private
+    messages inside a provider request.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[4]
+    token: str
+    kind: Literal["memory"]
+    memory_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    bot_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
+    thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
+    scope: Literal["public", "party"]
+    subjects: Annotated[list[MemorySubject], Field(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRIES)]
+
+    # The same two bounds the worldserver's buffer enforces. A request past either did not come
+    # from a buffer applying them, so accepting it would let one producer bug become an
+    # unbounded prompt.
+    thread: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
+        Field(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
+    ]
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        return _validated_token(value)
+
+    @field_validator("bot_name")
+    @classmethod
+    def _validate_bot_name(cls, value: str) -> str:
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"actor name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        if not actor_name_is_usable(value):
+            raise ValueError("actor name is not a usable character name")
+
+        return value
+
+    @field_validator("thread_id")
+    @classmethod
+    def _validate_thread_id(cls, value: str) -> str:
+        if _byte_length(value) > MAX_THREAD_ID_BYTES:
+            raise ValueError(f"thread_id must be at most {MAX_THREAD_ID_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("thread")
+    @classmethod
+    def _validate_thread(cls, value: list[str]) -> list[str]:
+        # Characters versus bytes again, per entry and in total. The per entry declaration above
+        # is the cheap first cut; a multibyte thread passes it and still overflows the frame.
+        if any(_byte_length(line) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES for line in value):
+            raise ValueError(f"a thread line must be at most {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes")
+
+        if sum(_byte_length(line) for line in value) > MAX_SOCIAL_CONTEXT_BYTES:
+            raise ValueError(f"the thread must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
+
+        return value
+
+    @model_validator(mode="after")
+    def _subjects_are_distinct(self) -> Self:
+        guids = [subject.guid for subject in self.subjects]
+        if len(guids) != len(set(guids)):
+            raise ValueError("memory subjects must be distinct")
+
+        return self
+
+    @property
+    def subject_guids(self) -> tuple[int, ...]:
+        return tuple(subject.guid for subject in self.subjects)
+
+
+def parse_memory_request(payload: bytes, expected_token: str) -> MemoryRequest:
+    """Strict parser for a memory extraction request. Mirrors parse_social_request field for field."""
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProtocolError("memory request payload is not valid UTF-8") from error
+
+    try:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ProtocolError("memory request payload is not valid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ProtocolError("memory request payload is not a JSON object")
+
+    try:
+        request = MemoryRequest.model_validate(data)
+    except ValidationError as error:
+        raise ProtocolError(f"memory request schema violation: {error.error_count()} error(s)") from error
+
+    if not hmac.compare_digest(request.token.encode("utf-8"), expected_token.encode("utf-8")):
+        raise TokenMismatchError("bridge token mismatch")
+
+    return request
+
+
+def encode_memory_response(
+    memory_request_token: int,
+    bot_guid: int,
+    thread_id: str,
+    candidates: list[dict[str, object]],
+    token: str,
+) -> bytes:
+    """Builds the payload the C++ memory reply parser accepts.
+
+    An empty candidate list is a normal answer and is encoded like any other. Most conversations
+    are not worth remembering, and the coordinator still needs a reply to close the request out;
+    treating "nothing found" as silence would leave it waiting for its own timeout instead.
+
+    The thread identity travels back so the coordinator can check the conversation is still the
+    one it asked about. A thread pruned while this was in flight makes the answer stale rather
+    than wrong, and that is its to decide, not this encoder's.
+    """
+
+    if not 1 <= memory_request_token <= _UINT64_MAX:
+        raise ProtocolError("memory_request_token out of range")
+
+    if not 1 <= bot_guid <= _UINT64_MAX:
+        raise ProtocolError("bot_guid out of range")
+
+    if not thread_id or _byte_length(thread_id) > MAX_THREAD_ID_BYTES:
+        raise ProtocolError("thread_id out of range")
+
+    if len(candidates) > MAX_SOCIAL_CONTEXT_ENTRIES:
+        raise ProtocolError("memory reply carries more candidates than a thread could support")
+
+    token = _encoder_token(token)
+
+    for candidate in candidates:
+        paraphrase = candidate.get("paraphrase")
+        if not isinstance(paraphrase, str) or not paraphrase.strip():
+            raise ProtocolError("memory candidate is empty")
+
+        if _byte_length(paraphrase) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
+            raise ProtocolError(f"memory candidate exceeds {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes")
+
+        about_guid = candidate.get("about_guid")
+        # bool is a subclass of int, so True would otherwise pass as guid 1.
+        if not isinstance(about_guid, int) or isinstance(about_guid, bool):
+            raise ProtocolError("memory candidate names no subject")
+
+        if not 1 <= about_guid <= _UINT64_MAX:
+            raise ProtocolError("memory candidate subject out of range")
+
+        if candidate.get("scope") not in SOCIAL_MEMORY_SCOPES:
+            raise ProtocolError("memory candidate carries an unknown scope")
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "token": token,
+        "kind": "memory",
+        "memory_request_token": memory_request_token,
+        "bot_guid": bot_guid,
+        "thread_id": thread_id,
+        "candidates": candidates,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def parse_request(payload: bytes, expected_token: str) -> ChatRequest:
     try:
         text = payload.decode("utf-8")

@@ -368,6 +368,8 @@ class SidecarService:
             return await self._process_social_payload(payload)
         if kind == "biography":
             return await self._process_biography_payload(payload)
+        if kind == "memory":
+            return await self._process_memory_payload(payload)
         if kind is not None:
             # Fail closed. A kind nobody here recognizes is a newer worldserver talking to an
             # older sidecar, and guessing which handler it meant is how the wrong one runs.
@@ -438,6 +440,105 @@ class SidecarService:
         except TimeoutError:
             _log(f"biography {token}: response deadline exceeded, staying silent")
             return None
+
+    async def _process_memory_payload(self, payload: bytes) -> bytes | None:
+        """One finished conversation, read for whatever is worth remembering.
+
+        Nobody is waiting on this either, so silence is the only failure answer and there is
+        nothing to regenerate against: a conversation that produced an unusable answer is not
+        more likely to produce a good one on a second read of the same text.
+        """
+
+        request = protocol.parse_memory_request(payload, self._token)
+        token = request.memory_request_token
+
+        if not self._config.generation_allowed:
+            _log(f"memory {token}: no budget configured, staying silent")
+            return None
+
+        try:
+            async with asyncio.timeout(self._config.response_deadline_ms / 1000):
+                return await self._process_memory_within_deadline(request)
+        except TimeoutError:
+            _log(f"memory {token}: response deadline exceeded, staying silent")
+            return None
+
+    async def _process_memory_within_deadline(self, request: protocol.MemoryRequest) -> bytes | None:
+        token = request.memory_request_token
+        if self._store is None:
+            _log(f"memory {token}: no durable state is open, staying silent")
+            return None
+
+        store = self._store
+        input_prices = self._config.price_texts
+
+        async with self._generation_lock:
+            now = self._now()
+
+            try:
+                input_tokens = await asyncio.to_thread(self._adapter.count_memory_input_tokens, request)
+            except claude.ClaudeError as error:
+                _log(f"memory {token}: {type(error).__name__}: {error}")
+                return None
+
+            if input_tokens > claude.MAX_INPUT_TOKENS:
+                _log(
+                    f"memory {token}: prompt is {input_tokens} tokens "
+                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                )
+                return None
+
+            max_cost_nano = budget.conservative_max_cost_nano(
+                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+            )
+            # The background lane, for the same reason a biography uses it: the conversation has
+            # already ended, so this must never take the slice held for a player who just spoke
+            # and is watching for an answer.
+            decision, reservation = await store.reserve(
+                request_id=token,
+                max_cost_nano=max_cost_nano,
+                priority=RequestPriority.BACKGROUND,
+                now=now,
+            )
+            if decision is not AdmissionDecision.ADMITTED or reservation is None:
+                _log(f"memory {token}: {decision.value}, staying silent")
+                return None
+
+            try:
+                candidates, usage = await asyncio.to_thread(self._adapter.generate_memories, request)
+            except claude.ClaudeError as error:
+                # A refused candidate lands here alongside a provider failure. Both were billed
+                # if the model ran, both are settled, and neither is retried: the gate refused
+                # this reading of this conversation, and the text is already gone on the far side.
+                outcome = await self._account_for_failure(store, reservation, error)
+                _log(f"memory {token}: {type(error).__name__}: {error} ({outcome})")
+                return None
+
+            settled_at = self._now()
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+            except ValueError as error:
+                _log(f"memory {token}: cannot price the completion: {error}")
+                return None
+
+            if not await store.settle(
+                reservation=reservation,
+                actual_cost_nano=actual_cost_nano,
+                now=settled_at,
+            ):
+                _log(f"memory {token}: settlement refused, the reservation had already expired")
+                return None
+
+        # An empty list is encoded and sent like any other answer. Most conversations support
+        # nothing, and the coordinator needs the reply to close the request rather than waiting
+        # out its own timeout on a question that was answered correctly.
+        return protocol.encode_memory_response(
+            memory_request_token=token,
+            bot_guid=request.bot_guid,
+            thread_id=request.thread_id,
+            candidates=candidates,
+            token=self._token,
+        )
 
     async def _process_biography_within_deadline(self, request: protocol.BiographyRequest) -> bytes | None:
         token = request.biography_request_token
