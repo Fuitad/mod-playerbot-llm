@@ -4,6 +4,10 @@
 
 #include "ClaudeChat.h"
 
+// The worldserver's own biography whitelist. Included so the two field lists can be asserted
+// against each other rather than merely written to look alike.
+#include "Bot/Personality/PlayerbotPersonality.h"
+
 #include "gtest/gtest.h"
 
 #include <boost/asio.hpp>
@@ -1287,6 +1291,28 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestWithoutATokenIsNeverBuilt)
         mutate(bad);
         EXPECT_FALSE(ClaudeChat::SerializeBiographyRequest(bad, SOCIAL_TOKEN).has_value()) << name;
     }
+}
+
+TEST(ClaudeChatSocialProtocolTest, TheBiographyFieldContractAgreesWithTheWorldserversOwnWhitelist)
+{
+    /*
+     * The generated field list exists in THREE places: the sidecar's BIOGRAPHY_FIELD_NAMES, this
+     * module's copy, and the worldserver's BIOGRAPHY_FIELDS table. The sidecar asserts its reply
+     * model against its own tuple at import, and the byte for byte pins tie this module to the
+     * sidecar. This is the one remaining link, and without it the three could drift with only a
+     * runtime rejection to show for it: a field added on one side and not the other reaches the
+     * assembler as UnknownField, which refuses a biography that was already generated and paid for.
+     */
+    for (char const* name : ClaudeChat::BIOGRAPHY_FIELD_NAMES)
+        EXPECT_TRUE(PlayerbotBiographyFieldIsKnown(name)) << "worldserver does not accept: " << name;
+
+    // And the reverse direction, so this module cannot simply carry a subset. A name the
+    // worldserver requires but this module never transports arrives as MissingRequiredField.
+    EXPECT_EQ(ClaudeChat::BIOGRAPHY_FIELD_NAMES.size(), PLAYERBOT_SOCIAL_BIOGRAPHY_FIELD_COUNT);
+
+    // The bound travels with the names. A field this module accepted and the worldserver refused as
+    // FieldTooLong would burn a generation on every attempt.
+    EXPECT_EQ(ClaudeChat::MAX_BIOGRAPHY_FIELD_BYTES, PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH);
 }
 
 TEST(ClaudeChatSocialProtocolTest, ABiographyResponseIsReadFromTheBytesTheSidecarActuallySends)
