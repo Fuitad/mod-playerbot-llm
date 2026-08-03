@@ -13,7 +13,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import anthropic
 import httpx
@@ -1908,7 +1908,7 @@ def test_a_model_cannot_vouch_for_its_own_output() -> None:
     the guarantee hold: adding a `safe` or `confidence` field here would break it silently.
     """
     assert set(claude.SocialReply.model_fields) == {"message", "emote"}
-    assert claude.SocialReply.model_config["extra"] == "forbid"
+    assert claude.SocialReply.model_config.get("extra") == "forbid"
 
 
 async def test_rejected_output_asks_for_a_regeneration_rather_than_going_silent(tmp_path) -> None:
@@ -1995,13 +1995,13 @@ def test_the_reply_vocabulary_matches_the_protocol_vocabulary() -> None:
     asserted rather than assumed. This is the exact shape that was found six times in Task 8:
     a rule that holds for part of what it names.
     """
-    literal_names = {name for name in claude.SocialReply.model_fields["emote"].annotation.__args__ if name}
+    literal_names = {name for name in get_args(claude.SocialReply.model_fields["emote"].annotation) if name}
     assert literal_names == set(protocol.SOCIAL_EMOTES)
     assert protocol.SOCIAL_EMOTE_IDS == frozenset(protocol.SOCIAL_EMOTES.values())
 
 
 def _context(**overrides: object) -> str:
-    body = {
+    body: dict[str, object] = {
         "persona": "gruff, slow to trust, loyal once earned",
         "relationship": "fought beside Deszy twice; still owes her a potion",
         "nearby": ["Deszy: that pull was my fault", "Marn: no harm done"],
@@ -2166,7 +2166,7 @@ BIOGRAPHY_IDENTITY = {"character_name": "Grimbold", "race_id": 1, "class_id": 4,
 
 
 def _biography(**overrides: object) -> dict[str, object]:
-    body = {
+    body: dict[str, object] = {
         "origin": "raised in a stonecutters' camp in the foothills",
         "motivation": "wants to pay off a debt owed to a caravan master",
         "formative_experience": "lost a season's wages to a collapsed tunnel",
@@ -2263,7 +2263,11 @@ def test_memory_candidates_carry_provenance_and_never_a_raw_quote() -> None:
         }
     )
     accepted = claude.validate_memory_reply(reply, thread)
-    assert accepted[0]["paraphrase"].startswith("Deszy's brother")
+    paraphrase = accepted[0]["paraphrase"]
+    # The declared return type is object-valued, so the text assertion below is only meaningful
+    # once the value is known to be text at all.
+    assert isinstance(paraphrase, str)
+    assert paraphrase.startswith("Deszy's brother")
 
     verbatim = claude.MemoryReply.model_validate(
         {
