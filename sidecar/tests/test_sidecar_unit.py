@@ -29,7 +29,7 @@ FIXED_NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 
 # Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
 CPP_REQUEST_FIXTURE = (
-    '{"schema_version":3,'
+    '{"schema_version":4,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":7,'
     '"channel":"whisper",'
@@ -51,7 +51,7 @@ CPP_REQUEST_FIXTURE = (
 
 # Byte-for-byte copy of the C++ AmbientRequestSerializesToExactContractJson fixture.
 CPP_AMBIENT_REQUEST_FIXTURE = (
-    '{"schema_version":3,'
+    '{"schema_version":4,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":8,'
     '"channel":"world",'
@@ -203,7 +203,7 @@ def test_accepts_exact_cpp_ambient_fixture() -> None:
 
 def test_rejects_invalid_utf8_payload() -> None:
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_request(b'{"schema_version":3,"bad":"\xff"}', TEST_TOKEN)
+        protocol.parse_request(b'{"schema_version":4,"bad":"\xff"}', TEST_TOKEN)
 
 
 def test_rejects_non_object_payload() -> None:
@@ -390,7 +390,7 @@ def test_response_payload_matches_cpp_accepted_shape() -> None:
     payload = protocol.encode_response(7, "I enjoy fishing.", TEST_TOKEN)
     # Byte-for-byte the shape the C++ ValidResponseRoundTrips fixture accepts.
     assert payload == (
-        b'{"schema_version":3,"token":"0123456789abcdef0123456789abcdef",'
+        b'{"schema_version":4,"token":"0123456789abcdef0123456789abcdef",'
         b'"request_id":7,"message":"I enjoy fishing."}'
     )
 
@@ -944,7 +944,7 @@ async def test_the_service_answers_a_valid_request(tmp_path) -> None:
     assert payload is not None
 
     response = json.loads(payload)
-    assert response["schema_version"] == 3
+    assert response["schema_version"] == protocol.SCHEMA_VERSION
     assert response["request_id"] == 7
     assert response["message"] == "A fine day for fishing."
     assert response["token"] == TEST_TOKEN
@@ -1485,7 +1485,7 @@ def test_response_rejects_invalid_messages() -> None:
 
 def _social_request_payload(**overrides: object) -> bytes:
     payload = {
-        "schema_version": 3,
+        "schema_version": protocol.SCHEMA_VERSION,
         "token": TEST_TOKEN,
         "kind": "social",
         "social_request_token": 77,
@@ -1501,6 +1501,66 @@ def _social_request_payload(**overrides: object) -> bytes:
     }
     payload.update(overrides)
     return json.dumps(payload).encode("utf-8")
+
+
+def _biography_request_payload(**overrides: object) -> bytes:
+    payload = {
+        "schema_version": protocol.SCHEMA_VERSION,
+        "token": TEST_TOKEN,
+        "kind": "biography",
+        "biography_request_token": 4242,
+        "bot_guid": 500,
+        "character_name": "Grimbold",
+        "race_id": 3,
+        "class_id": 1,
+        "gender_id": 0,
+    }
+    payload.update(overrides)
+    return json.dumps(payload).encode("utf-8")
+
+
+def test_biography_request_round_trips() -> None:
+    """Task 10A Definition of Done 1: a biography request has to reach the sidecar at all."""
+    request = protocol.parse_biography_request(_biography_request_payload(), TEST_TOKEN)
+
+    assert request.biography_request_token == 4242
+    assert request.bot_guid == 500
+    assert request.character_name == "Grimbold"
+    assert request.race_id == 3
+    assert request.class_id == 1
+    assert request.gender_id == 0
+
+
+def test_a_biography_request_carries_a_token_to_echo_back() -> None:
+    """Definition of Done 2, the half the state machine cannot provide.
+
+    Requiring the profile to still be Pending stops a completion replacing a biography that is
+    already Ready. It cannot say WHICH request a completion answers, so after a timeout and a
+    fresh request, a very late reply to the superseded call still finds the profile Pending and
+    is accepted. Only a token minted at the request and echoed back closes that, so a request
+    without one is refused here rather than being allowed to travel unidentifiable.
+    """
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_biography_request(_biography_request_payload(biography_request_token=0), TEST_TOKEN)
+
+    payload = json.loads(_biography_request_payload())
+    del payload["biography_request_token"]
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_biography_request(json.dumps(payload).encode("utf-8"), TEST_TOKEN)
+
+
+def test_a_biography_request_is_never_confused_with_another_kind() -> None:
+    """Definition of Done 4: told apart by declared kind AND by field shape, not by one of them."""
+    assert protocol.declared_kind(_biography_request_payload()) == "biography"
+
+    # By kind: the biography parser refuses anything not declaring itself one.
+    for kind in ("social", "career", "memory", "chat"):
+        with pytest.raises(protocol.ProtocolError):
+            protocol.parse_biography_request(_biography_request_payload(kind=kind), TEST_TOKEN)
+
+    # By shape: the social parser refuses a biography frame even though both carry bot_guid.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_biography_request_payload(), TEST_TOKEN)
 
 
 def test_social_request_round_trips() -> None:
@@ -1546,7 +1606,7 @@ def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
     encoded = json.loads(protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN))
 
     assert encoded == {
-        "schema_version": 3,
+        "schema_version": protocol.SCHEMA_VERSION,
         "token": TEST_TOKEN,
         "kind": "social",
         "social_request_token": 77,

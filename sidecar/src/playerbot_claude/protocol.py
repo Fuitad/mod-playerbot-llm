@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -229,7 +229,7 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     channel: Literal["whisper", "party", "world", "career", "social"]
@@ -369,7 +369,7 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -551,6 +551,80 @@ def declared_kind(payload: bytes) -> str | None:
         raise ProtocolError("request kind must be a string")
 
     return kind
+
+
+class BiographyRequest(BaseModel):
+    """A request for one bot's backstory.
+
+    Carries the identity rather than asking for it. Name, race, class and gender are
+    authoritative character data, and `BiographyReply` deliberately has nowhere to put them, so
+    they travel out here and are stamped back on afterwards. A generated value can then never
+    become an identity, because the model is never asked for one.
+
+    `biography_request_token` is the half of the staleness rule that the profile's own state
+    cannot supply. Requiring the profile to still be Pending stops a completion replacing a
+    biography that is already Ready, but it cannot say WHICH request a completion answers: after
+    the pending timeout and a fresh request, a very late reply to the superseded call still finds
+    the profile Pending. Only a token minted per request and echoed back closes that, so it is
+    required here rather than optional.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[4]
+    token: str
+    kind: Literal["biography"]
+    biography_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    character_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
+    race_id: Annotated[int, Field(ge=0, le=255)]
+    class_id: Annotated[int, Field(ge=0, le=255)]
+    gender_id: Annotated[int, Field(ge=0, le=255)]
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        return _validated_token(value)
+
+    @field_validator("character_name")
+    @classmethod
+    def _validate_character_name(cls, value: str) -> str:
+        # The same rule the social path applies, and for the same reason: this name reaches the
+        # TRUSTED half of the prompt, because the bot has to be told who it is.
+        if not actor_name_is_usable(value):
+            raise ValueError("character name is not a usable character name")
+
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"character name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        return value
+
+
+def parse_biography_request(payload: bytes, expected_token: str) -> BiographyRequest:
+    """Strict parser for a biography request. Mirrors parse_social_request field for field."""
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProtocolError("biography request payload is not valid UTF-8") from error
+
+    try:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ProtocolError("biography request payload is not valid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ProtocolError("biography request payload is not a JSON object")
+
+    try:
+        request = BiographyRequest.model_validate(data)
+    except ValidationError as error:
+        raise ProtocolError(f"biography request schema violation: {error.error_count()} error(s)") from error
+
+    if not hmac.compare_digest(request.token.encode("utf-8"), expected_token.encode("utf-8")):
+        raise TokenMismatchError("bridge token mismatch")
+
+    return request
 
 
 def parse_social_request(payload: bytes, expected_token: str) -> SocialRequest:

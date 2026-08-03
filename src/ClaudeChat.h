@@ -36,7 +36,7 @@ namespace ClaudeChat
      * variant. A sidecar speaking 2 is rejected outright rather than partially understood, which is
      * what "fail closed on a mismatched protocol" means here.
      */
-    inline constexpr uint32 SCHEMA_VERSION = 3;
+    inline constexpr uint32 SCHEMA_VERSION = 4;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;

@@ -48,7 +48,8 @@ namespace
     }
 
     std::string ValidResponsePayload(uint64 requestId, std::string const& message,
-                                     std::string const& token = TEST_TOKEN, uint32 schemaVersion = 3)
+                                     std::string const& token = TEST_TOKEN,
+                                     uint32 schemaVersion = ClaudeChat::SCHEMA_VERSION)
     {
         return "{\"schema_version\":" + std::to_string(schemaVersion) + ",\"token\":\"" + token +
                "\",\"request_id\":" + std::to_string(requestId) + ",\"message\":\"" + message + "\"}";
@@ -204,7 +205,7 @@ TEST(ClaudeChatProtocolTest, FrameLengthDecodeRejectsOversizedLength)
 TEST(ClaudeChatProtocolTest, RequestSerializesToExactContractJson)
 {
     std::string const expected =
-        "{\"schema_version\":3,"
+        "{\"schema_version\":4,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":7,"
         "\"channel\":\"whisper\","
@@ -254,7 +255,7 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
     request.occurrence = 9;
 
     std::string const expected =
-        "{\"schema_version\":3,"
+        "{\"schema_version\":4,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":8,"
         "\"channel\":\"world\","
@@ -1073,9 +1074,20 @@ TEST(ClaudeChatSocialProtocolTest, TheResponseKindEnumFailsClosed)
 
 TEST(ClaudeChatSocialProtocolTest, TheProtocolVersionMovedSoAnOlderSidecarIsRefused)
 {
-    // Fail closed on a mismatched protocol: a sidecar speaking the previous version is rejected
-    // outright rather than partially understood.
-    EXPECT_EQ(ClaudeChat::SCHEMA_VERSION, 3u);
+    /*
+     * Fail closed on a mismatched protocol: a sidecar speaking the previous version is rejected
+     * outright rather than partially understood.
+     *
+     * Task 10A moved this to 4 to carry the biography and memory kinds. The assertion on the
+     * constant is the tripwire that makes the bump deliberate, and it is deliberately paired with
+     * the behaviour it is supposed to produce. On its own it only proved the constant had a value
+     * somebody had typed, which is not the same claim as "an older sidecar is refused".
+     */
+    EXPECT_EQ(ClaudeChat::SCHEMA_VERSION, 4u);
+
+    std::string const previous = "{\"schema_version\":3,\"token\":\"" + TEST_TOKEN +
+                                 "\",\"request_id\":1,\"message\":\"hi\"}";
+    EXPECT_FALSE(ClaudeChat::ParseResponsePayload(previous, TEST_TOKEN).has_value());
 }
 
 TEST(ClaudeChatSocialProtocolTest, ALegacyChatAnswerIsNotASocialAnswerAndViceVersa)
@@ -1085,7 +1097,7 @@ TEST(ClaudeChatSocialProtocolTest, ALegacyChatAnswerIsNotASocialAnswerAndViceVer
      * fed the other's payload even if a caller mixed them up.
      */
     EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
-                     "{\"schema_version\":3,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
                      SOCIAL_TOKEN, 77, 500)
                      .has_value());
     EXPECT_FALSE(ClaudeChat::ParseResponsePayload(SocialPayload(), SOCIAL_TOKEN).has_value());
@@ -1388,7 +1400,7 @@ TEST(ClaudeChatSocialProtocolTest, ResponseParsersBoundTheTokenExplicitly)
 
     EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), tooLong, 77, 500).has_value());
     EXPECT_FALSE(ClaudeChat::ParseResponsePayload(
-                     "{\"schema_version\":3,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":4,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
                      tooLong)
                      .has_value());
 
