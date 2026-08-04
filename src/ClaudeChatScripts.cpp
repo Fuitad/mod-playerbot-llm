@@ -862,9 +862,7 @@ namespace
              * GetGameTimeMS is milliseconds since server START, and mixing the two would schedule a
              * delivery decades in the past on a freshly restarted realm.
              */
-            uint64 const nowMs = static_cast<uint64>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(GameTime::GetSystemTime().time_since_epoch())
-                    .count());
+            uint64 const nowMs = PlayerbotSocialUnixMilliseconds(GameTime::GetSystemTime());
 
             for (ClaudeSocialTransport::Completed const& completed : _socialTransport->Drain())
             {

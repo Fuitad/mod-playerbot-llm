@@ -579,7 +579,7 @@ class SidecarService:
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens, claude.BIOGRAPHY_MAX_OUTPUT_TOKENS, *input_prices
             )
             # The background lane, deliberately. Nobody is waiting on a backstory, so it must
             # never spend the slice held for a player who just said something and is watching
@@ -893,7 +893,10 @@ class SidecarService:
                     break
 
                 if response is None:
-                    continue
+                    # The bridge is synchronously waiting for this frame before it can dequeue
+                    # another request. Closing is the protocol's silent answer and releases that
+                    # read immediately; keeping the socket open can strand the whole FIFO.
+                    break
 
                 writer.write(protocol.encode_frame(response))
                 await writer.drain()

@@ -153,24 +153,23 @@ async def test_wrong_token_closes_connection_and_server_keeps_accepting(tmp_path
         assert response["request_id"] == 8
 
 
-async def test_oversized_input_is_silent_and_connection_survives(tmp_path) -> None:
+async def test_oversized_input_closes_the_connection_and_server_keeps_accepting(tmp_path) -> None:
     async with running_sidecar(tmp_path) as harness:
         reader, writer = await asyncio.open_connection("127.0.0.1", harness.port)
         try:
             writer.write(protocol.encode_frame(request_payload(request_id=7, message="oversized")))
             await writer.drain()
 
-            # The same connection stays usable; the next reply proves the first
-            # request produced no response frame at all.
-            writer.write(protocol.encode_frame(request_payload(request_id=8)))
-            await writer.drain()
-
-            response = json.loads(await protocol.read_frame(reader))
-            assert response["request_id"] == 8
+            # A silent answer has no frame. Closing is what releases the bridge's synchronous
+            # read so it can dequeue another request instead of stranding the shared FIFO.
+            with pytest.raises(protocol.FrameError):
+                await asyncio.wait_for(protocol.read_frame(reader), timeout=0.5)
         finally:
             writer.close()
             await writer.wait_closed()
 
+        response = await round_trip(harness.port, request_payload(request_id=8))
+        assert response["request_id"] == 8
         assert len(harness.adapter.requests) == 1
         assert harness.store.outstanding == {}
 

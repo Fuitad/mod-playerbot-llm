@@ -2208,6 +2208,22 @@ def test_a_starter_subject_is_fenced_like_every_other_untrusted_section() -> Non
     assert "SUBVERTED" not in claude.build_social_system_prompt(request)
 
 
+def test_a_starter_keeps_the_speaking_bots_own_point_of_view() -> None:
+    """A converted ambient event belongs to the bot selected to speak about it."""
+    request = protocol.parse_social_request(
+        _social_request_payload(
+            speak_on_channel=0,
+            context=json.dumps({"starter": "I just looted a Chipped Claw"}),
+        ),
+        TEST_TOKEN,
+    )
+
+    system = claude.build_social_system_prompt(request)
+
+    assert "STARTER describes your own experience or possession" in system
+    assert "Do not turn it into something another character did or owns" in system
+
+
 # Biography and memory extraction ---------------------------------------------------------
 #
 # Task 10 defines and validates these models. Nothing requests one and nothing carries one:
@@ -2950,6 +2966,44 @@ def test_a_generated_biography_carries_only_the_fields_the_worldserver_accepts()
 
     assert set(fields) == set(claude.BiographyReply.model_fields)
     assert "character_name" not in fields
+
+
+def test_a_biography_gets_a_larger_response_envelope_than_one_chat_line() -> None:
+    """The eight-field JSON must not be truncated at the one-line chat ceiling."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        body = {
+            "id": "msg_biography_01",
+            "type": "message",
+            "role": "assistant",
+            "model": claude.MODEL_ID,
+            "content": [
+                {
+                    "type": "text",
+                    "text": _acceptable_biography_reply().model_dump_json(),
+                }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 400,
+                "output_tokens": 180,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }
+        return httpx.Response(200, json=body)
+
+    request = protocol.parse_biography_request(_biography_request_payload(), TEST_TOKEN)
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler))
+
+    fields, _ = adapter.generate_biography(request)
+
+    assert fields["origin"] == _acceptable_biography_reply().origin
+    assert captured["body"]["max_tokens"] == claude.BIOGRAPHY_MAX_OUTPUT_TOKENS
+    assert claude.BIOGRAPHY_MAX_OUTPUT_TOKENS > claude.MAX_OUTPUT_TOKENS
     assert "race_id" not in fields
 
 
@@ -3127,3 +3181,17 @@ async def test_a_biography_never_takes_the_lane_a_player_is_waiting_on(tmp_path)
     await service.process_payload(_biography_request_payload())
 
     assert store.reserved_priorities == [app.RequestPriority.BACKGROUND]
+
+
+async def test_a_biography_reservation_covers_its_larger_response_envelope(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
+
+    await service.process_payload(_biography_request_payload())
+
+    expected = budget.conservative_max_cost_nano(
+        adapter.input_tokens,
+        claude.BIOGRAPHY_MAX_OUTPUT_TOKENS,
+        "1",
+        "5",
+    )
+    assert store.reservations[0].max_cost_nano == expected
