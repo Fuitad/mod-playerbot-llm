@@ -30,10 +30,12 @@ never duplicated into the sidecar's own configuration.
 
 All game state lives on the world thread. The bridge worker thread never touches it.
 
-- `ClaudeChatScripts.cpp` runs only on the world thread. It observes supported chat and milestone events, owns ambient cadence, and implements the optional playerbot career provider. Chat requests contain immutable names, personality values, and text. Career requests contain immutable personality values plus opaque legal candidates. No pointers cross the thread boundary.
+- `ClaudeChatScripts.cpp` runs only on the world thread. It observes supported chat and milestone events, owns the legacy ambient cadence, and implements the optional playerbot career and social providers. Chat requests contain immutable names, personality values, and text. Career requests contain immutable personality values plus opaque legal candidates. No pointers cross the thread boundary.
 - `ClaudeChat.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
 - Delivery happens back on the world thread during world update. The bot GUID is re-resolved through `ObjectAccessor` immediately before speaking; if the bot is gone, offline, or the deadline (`ResponseDeadlineMs`) has passed, the response is dropped. World delivery also requires a human to remain connected, an alive bot outside combat, and a current World channel. `SayToWorld` failure is inspected and produces no fallback text.
-- Ambient mode requires `AiPlayerbot.EnableBroadcasts = 0`. When canned broadcasts remain enabled, only ambient scheduling is disabled. Whisper, party, and milestone Claude behavior remains available.
+- Which mode is in force is decided by `AiPlayerbot.SocialChat.Enable`. While it is on, this module registers with the coordinator and the legacy whisper, party, and ambient hooks stand down, so one message can never produce two answers chosen by two different rules. `PlayerbotClaude.AmbientWorldEnable` is then reported as ignored in the log rather than silently skipped.
+- The gate is read at two different cadences on purpose. Provider registration reads it once at startup, because `SetSocialProvider` is the worldserver's registration seam and a provider that appeared and vanished as an operator toggled a config would leave outstanding requests pointing at nothing; turning the feature on or off therefore takes effect at the next startup. The legacy hooks and the ambient limiter re-read it every tick, so a gate that becomes live-controllable silences them immediately rather than at the next restart. Both directions fail toward silence.
+- Legacy ambient mode, for a server with the social gate off, additionally requires `AiPlayerbot.EnableBroadcasts = 0`. When canned broadcasts remain enabled, only ambient scheduling is disabled. Whisper, party, and milestone Claude behavior remains available.
 - The model cannot act. Chat responses contain one `message`. Career responses contain one candidate token and one spending style. Playerbot code validates the response against its pending request and legal candidate set before persisting it.
 
 ## Wire protocol (loopback TCP)
@@ -44,7 +46,7 @@ All game state lives on the world thread. The bridge worker thread never touches
 - Social uses channel `social` and declares `kind: "social"`. A social request carries the coordinator's correlation token, a bot actor and an optional subject actor in one shared field shape differing only in a `human` flag, the channel the line should be spoken on, an opaque thread identity, and a bounded context. A social response echoes the correlation token and bot identity, which are checked before the message is read, so a well formed answer to a different request is refused rather than delivered. It may instead set `regenerate`, which carries no message and is honoured at most once per request.
 - Response kind is declared rather than inferred from shape. Career and social answers travel the same socket, and the chat and social payloads are additionally mutually exclusive by field count, so a career decision cannot arrive as a line to speak.
 - Every string bound in this protocol is a UTF-8 BYTE budget, enforced on both sides. Pydantic's `max_length` counts characters, so each bounded string carries an explicit byte validator beside it.
-- Not yet present: the transport that owns an exchange, implements the worldserver's provider interface, and registers itself. This module currently speaks the protocol and yields its legacy hooks; nothing here submits a social request yet.
+- `SocialExchange` owns one social request from submission to verdict, and `ClaudeChatState` implements the worldserver's `PlayerbotSocialProvider` interface and registers itself through `SetSocialProvider` while the gate is on. It deregisters on shutdown, so the coordinator never holds a provider whose bridge has gone.
 - Ambient uses channel `world` and event kind `4`. Its trusted combination requires speaker GUID `0`, an empty speaker name, subject ID `0`, and marker `ambient_world`. Direct requests reject the empty speaker identity.
 - Every payload carries the bridge token from `PLAYERBOT_CLAUDE_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
 - The socket binds to 127.0.0.1 only. The token exists to stop other local processes from injecting bot speech or draining budget.
@@ -89,7 +91,9 @@ Failure handling depends on what can be proven:
 
 Anything left outstanding stays charged at its maximum until another transaction reclaims it, ten minutes after creation. That holds the money against the ceiling while the request might still matter and stops guessing once it cannot. A completion arriving after the reclaim is refused rather than charged twice, because `settle` only accepts a reservation still in the reserved state.
 
-The ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary.
+The legacy ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary. Nothing reaches it while the social gate is on, because the limiter is never configured alongside the coordinator.
+
+The two sides disagree on that ceiling, and the sidecar is the one that decides. `MAX_AMBIENT_MESSAGES_PER_HOUR` is `60` in `ClaudeChat.h` and `6` in `ledger.py`, so worldserver will schedule attempts at a configured rate the sidecar then declines one by one. The effect is silence rather than overspend, which is why it is documented as an effective ceiling of `6` rather than repaired here: changing either constant is a behaviour change to the legacy path and does not belong in a documentation synchronization.
 
 ## Storage schema
 
@@ -120,8 +124,10 @@ Every failure ends in bot silence. There is no fallback text anywhere in the pip
 | Malformed frame or JSON | Connection closed |
 | Prompt above 4,095 tokens | Dropped before reservation |
 | Budget exhausted | Dropped before the provider call |
-| Ambient hourly rate exhausted | Dropped before token counting |
-| No connected human or eligible World bot | No ambient request is enqueued |
+| Ambient hourly rate exhausted (legacy mode) | Dropped before token counting |
+| No connected human or eligible World bot (legacy mode) | No ambient request is enqueued |
+| Social gate on, so a legacy hook fires | Yielded to the coordinator; nothing is enqueued here |
+| Social gate on but this module is absent or its bridge is down | The coordinator has no provider and the bot stays silent; functional chat is unaffected |
 | Provider auth or rate limit refusal | Dropped; reservation released, since nothing was generated |
 | Provider timeout or error | Dropped; reservation left outstanding for expiry, since billing cannot be determined |
 | Sidecar pipeline exceeds `ResponseDeadlineMs` | Dropped; reservation left outstanding for expiry reclaim |

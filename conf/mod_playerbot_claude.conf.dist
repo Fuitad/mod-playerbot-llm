@@ -23,8 +23,16 @@ PlayerbotClaude.Enable = 0
 
 #
 #    PlayerbotClaude.AmbientWorldEnable
+#        LEGACY. Kept only for a server running with AiPlayerbot.SocialChat.Enable = 0.
+#
 #        Description: Enables personality shaped ambient messages in the World channel. Requires
 #                     AiPlayerbot.EnableBroadcasts = 0 so canned and Claude chatter cannot overlap.
+#
+#                     Inert while interactive social chat is on. That feature owns unprompted
+#                     chatter, and it never speaks in World at all: zone General, say, party, and
+#                     whispers are the only surfaces it uses. Setting this to 1 alongside it does
+#                     not produce World chatter, and the module logs that the setting was ignored
+#                     rather than skipping it silently.
 #        Default:     0 - Disabled
 #                     1 - Enabled
 
@@ -32,8 +40,13 @@ PlayerbotClaude.AmbientWorldEnable = 0
 
 #
 #    PlayerbotClaude.AmbientMaxMessagesPerHour
-#        Description: Maximum accepted ambient attempts in any rolling hour. Values from 1 through
-#                     60 are valid. Values outside that range disable ambient World chat.
+#        LEGACY. Applies only to the setting above, and only while social chat is off.
+#
+#        Description: Maximum accepted ambient attempts in any rolling hour. Values outside the
+#                     range disable ambient World chat.
+#        Valid:       1 through 6. Worldserver accepts up to 60, but the sidecar refuses every
+#                     attempt above 6, so a value in between schedules ambient work that is
+#                     silently declined and no World line is ever spoken. Treat 6 as the ceiling.
 #        Default:     6
 
 PlayerbotClaude.AmbientMaxMessagesPerHour = 6

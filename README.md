@@ -42,8 +42,8 @@ All keys live in `mod_playerbot_claude.conf` and are read by both worldserver an
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `PlayerbotClaude.Enable` | `0` | Master switch for the worldserver hooks. |
-| `PlayerbotClaude.AmbientWorldEnable` | `0` | Enables personality shaped ambient World chatter. |
-| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | Persistent rolling hourly limit. Values above `60` disable ambient chatter. |
+| `PlayerbotClaude.AmbientWorldEnable` | `0` | **Legacy.** Ambient World chatter, for a server running with `AiPlayerbot.SocialChat.Enable = 0`. Inert while social chat is on. |
+| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | **Legacy.** Rolling hourly limit for the setting above. Effective range is `1` through `6`: worldserver accepts up to `60`, but the sidecar declines every attempt above `6`, so a larger value yields silence rather than more chatter. |
 | `PlayerbotClaude.BridgePort` | `0` | Loopback TCP port shared by worldserver and sidecar. `0` disables both. |
 | `PlayerbotClaude.DailyBudgetUsd` | `5` | The daily UTC ceiling shared by all Claude generation. The configured value is the only ceiling. |
 | `PlayerbotClaude.HumanBudgetReserveRatio` | `0.25` | Share of the ceiling reserved for work a player is waiting on. Valid from `0` through `1`. |
@@ -94,10 +94,28 @@ uv run playerbot-claude profile \
 
 ## Talking to bots
 
+Which of the two modes below is in force is decided entirely by `AiPlayerbot.SocialChat.Enable` in `playerbots.conf`, never by a setting in this module. The two never run together: whichever one is off contributes nothing at all rather than falling back.
+
+### With interactive social chat enabled (`AiPlayerbot.SocialChat.Enable = 1`)
+
+mod-playerbots owns the conversation. Its coordinator watches zone General, say, party, and whispers, decides which opportunities are worth answering and who answers them, and asks this module for the line. There is no prefix and no command: bots take part in ordinary conversation, and a whisper to a bot is answered because it was addressed to that bot.
+
+This module's own whisper, party, and ambient hooks stand down completely in this mode, so one message can never produce two unrelated answers chosen by two different rules. `PlayerbotClaude.AmbientWorldEnable` is reported as ignored in the log rather than silently skipped, and no bot chatter reaches the World channel from either module.
+
+See the interactive social chat section of the mod-playerbots README for the surfaces, the opt out commands, retention, and moderation.
+
+### With interactive social chat disabled (`AiPlayerbot.SocialChat.Enable = 0`)
+
+The legacy behaviour, unchanged:
+
 - **Whisper** a bot naturally: any whisper that mod-playerbots does not recognize as a bot command becomes Claude conversation. Known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. Prefixing with `llm ` forces Claude even for command-shaped text (`llm follow` asks the bot about following instead of ordering it to).
 - **Party chat**: `llm <bot-name> <message>` addresses one bot in your group. Party chat keeps the explicit prefix so ordinary group conversation never reaches the API.
-- **Milestones**: after a quest completion, a level gain, or a rare or epic loot drop, one deterministically selected group bot may react, at most once per `GroupCooldownSeconds` per group.
 - **Ambient World chatter**: set `PlayerbotClaude.AmbientWorldEnable = 1` and set `AiPlayerbot.EnableBroadcasts = 0` in `playerbots.conf`. The module refuses ambient mode while canned broadcasts remain enabled, but direct Claude conversations continue working. Ambient attempts occur only while a human player is connected, use an eligible online bot that is alive, outside combat, and able to speak in the human player's faction World channel, and are limited to the configured rolling hourly limit. Delivery checks the human, bot, and channel membership again before speech.
+
+### Either way
+
+- **Milestones**: after a quest completion, a level gain, or a rare or epic loot drop, one deterministically selected group bot may react, at most once per `GroupCooldownSeconds` per group.
+- **Career choices**: unaffected by the social gate. They have their own request kind and their own budget priority.
 
 Replies are one short line (at most 240 bytes), in the bot's fixed voice. If anything fails (budget, timeout, provider error, invalid output), the bot simply stays silent.
 
@@ -119,9 +137,17 @@ For a direct conversation or milestone, the sidecar sends the following to the A
 
 An ambient request sends only the selected bot's name, personality numbers, voice, and a fixed instruction to offer one brief World observation. It sends no human identity, human text, or conversation history. Ambient input and output are never appended to conversation memory.
 
+A social request, when `AiPlayerbot.SocialChat.Enable = 1`, sends the speaking bot's name, the other character's name, which of the four channels the answer will be spoken on, an opaque thread identity, and a bounded context the coordinator assembled: the bot's persona, its relationship with that character, who is nearby, recent lines from the thread, the subject when it is opening a conversation, and the memories it is allowed to draw on. Everything in it is bounded per field and in total, and all of it is marked untrusted.
+
+Memories are filtered by the channel's privacy scope, twice. The coordinator filters before sending and the sidecar filters again on arrival, so something a bot learned in a whisper cannot be repeated in a zone even if the producer has a bug. Identity in a social prompt is the character name the coordinator supplied, and the answer is validated against that name rather than against anything the model wrote.
+
+After a conversation ends, a separate memory extraction request may send that finished thread and ask what is worth remembering. It is the one request that sends character GUIDs, and only as the closed list of characters a memory may be attributed to, alongside their names. That is deliberate: the model must choose one of a fixed set, and the deterministic gate afterwards refuses any value outside it, so an invented attribution cannot become a stored memory. The instructions require a paraphrase rather than a reproduced line and forbid recording any real world detail, and the gate re-checks the result rather than trusting it.
+
 A career request sends the bot name, personality values, and opaque candidate descriptions. It sends no raw profession, skill, spell, item, or recipe identifiers and no conversation history. The returned career decision is diagnostic data only in the sidecar. The authoritative validated plan remains in mod-playerbots.
 
-Never sent: account names, GUIDs, IP addresses, positions, inventories, combat state, the bridge token, recognized bot commands, or any party/group chat without the `llm ` prefix. Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. If you want the stricter opt-in-per-message behavior back, whisper traffic is exactly the `llm `-prefixed subset.
+Never sent, on any path: account names, IP addresses, positions, inventories, combat state, the bridge token, or recognized bot commands. Character GUIDs are sent on exactly one path, memory extraction, for the reason given above; no other request carries one.
+
+Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. With interactive social chat off, party and group chat without the `llm ` prefix is never sent, and whisper traffic is the only thing that leaves without a prefix. With it on, mod-playerbots decides what is sent on all four surfaces and a character can opt out of the feature entirely with `.playerbots social off`.
 
 ## Budgeting
 
