@@ -2501,3 +2501,35 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextStaysWithinTheWholeContextB
     EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
     EXPECT_NE(encoded.find("\"persona\":"), std::string::npos) << "the persona is never the field dropped";
 }
+
+TEST(ClaudeChatSocialProtocolTest, AnAssembledContextNeverEmitsMoreEntriesThanTheFarSideAccepts)
+{
+    /*
+     * The producer bounds its own lists, but this encoder is the last thing between a context and
+     * the wire. A list one entry over the declared maximum is not trimmed on the far side, it drops
+     * the whole context, so a producer that forgets its bound must be caught here rather than
+     * silencing a bot.
+     */
+    PlayerbotSocialRequestContext context;
+    for (std::size_t index = 0; index < ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES + 5; ++index)
+    {
+        context.thread.push_back("line " + std::to_string(index));
+        context.nearby.push_back("bystander " + std::to_string(index));
+        context.memories.push_back({"detail " + std::to_string(index), PlayerbotSocialPrivacyScope::Public});
+    }
+
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+
+    auto count = [&encoded](std::string const& needle)
+    {
+        std::size_t found = 0;
+        for (std::size_t at = encoded.find(needle); at != std::string::npos; at = encoded.find(needle, at + 1))
+            ++found;
+        return found;
+    };
+
+    EXPECT_EQ(count("\"line "), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES);
+    EXPECT_EQ(count("\"bystander "), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES);
+    EXPECT_EQ(count("\"scope\":"), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES);
+    EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+}

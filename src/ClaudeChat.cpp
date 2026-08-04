@@ -1043,7 +1043,13 @@ namespace
         return "whisper";
     }
 
-    // One entry of a bounded string list, or nothing when the list is empty.
+    /*
+     * A bounded string list, or nothing when it is empty.
+     *
+     * Bounded in COUNT here as well as per entry, and not only because the producer already is: the
+     * far side refuses a list longer than its declared maximum and drops the whole context with it,
+     * so this is the last place a producer that forgot its own bound can be caught before the wire.
+     */
     void AppendJsonStringList(std::string& out, char const* key, std::vector<std::string> const& values)
     {
         if (values.empty())
@@ -1053,13 +1059,18 @@ namespace
         out += key;
         out += "\":[";
         bool first = true;
+        std::size_t written = 0;
         for (std::string const& value : values)
         {
+            if (written >= ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES)
+                break;
+
             if (!first)
                 out += ',';
             AppendEscapedJsonString(
                 out, value.substr(0, Utf8PrefixLength(value, ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
             first = false;
+            ++written;
         }
         out += ']';
     }
@@ -1104,9 +1115,12 @@ std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const&
     {
         lists += ",\"memories\":[";
         bool firstMemory = true;
+        std::size_t writtenMemories = 0;
         for (PlayerbotSocialContextMemory const& memory : context.memories)
         {
-            if (memory.text.empty())
+            // Bounded here too, for the reason the string lists are: the far side drops the whole
+            // context over a list one entry too long, and this is the last place to catch it.
+            if (memory.text.empty() || writtenMemories >= MAX_SOCIAL_CONTEXT_ENTRIES)
                 continue;
 
             if (!firstMemory)
@@ -1119,6 +1133,7 @@ std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const&
             lists += PrivacyScopeName(memory.scope);
             lists += "\"}";
             firstMemory = false;
+            ++writtenMemories;
         }
         lists += ']';
 
@@ -1146,7 +1161,7 @@ std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const&
      * relationship exceed the total. Blocks are shed from the end, which is the order they were
      * written in, so the persona is the last thing to go and in practice never does.
      */
-    while (out.size() > MAX_SOCIAL_CONTEXT_BYTES && !context.memories.empty())
+    if (out.size() > MAX_SOCIAL_CONTEXT_BYTES && !context.memories.empty())
     {
         PlayerbotSocialRequestContext shorter = context;
         shorter.memories.pop_back();
