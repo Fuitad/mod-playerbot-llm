@@ -44,6 +44,8 @@ class FakeState:
         # itself does not carry the lane, so without this a test can only assert that money was
         # reserved, never that a background job stayed out of the slice held for a waiting player.
         self.reserved_priorities: list[budget.RequestPriority] = []
+        self.reserved_kinds: list[budget.RequestKind] = []
+        self.reserved_models: list[str] = []
         self.released: list[ledger.Reservation] = []
         self.settlements: list[tuple[ledger.Reservation, int]] = []
         self._next_id = 1
@@ -96,9 +98,16 @@ class FakeState:
             "spending_style": spending_style,
         }
 
-    async def reserve(self, *, request_id, max_cost_nano, priority, now):
+    async def reserve(self, *, request_kind, model, max_cost_nano, priority, now):
         self.calls.append("reserve")
         self.reserved_priorities.append(priority)
+        self.reserved_kinds.append(request_kind)
+        self.reserved_models.append(model)
+        # The real ledger rounds up to what the DECIMAL column holds before deciding, so
+        # a fake that admits against the unrounded figure admits a different amount than
+        # production would.
+        if max_cost_nano is not None and max_cost_nano > 0:
+            max_cost_nano = budget.quantize_storable_nano(max_cost_nano)
         decision = budget.admit(
             ceiling_nano=self.ceiling_nano,
             state=self._budget_state(),
@@ -111,7 +120,8 @@ class FakeState:
 
         reservation = ledger.Reservation(
             reservation_id=self._next_id,
-            usage_date=ledger.utc_day(now),
+            public_id=ledger.mint_public_id(),
+            budget_date=ledger.utc_day(now),
             max_cost_nano=int(max_cost_nano or 0),
         )
         self._next_id += 1

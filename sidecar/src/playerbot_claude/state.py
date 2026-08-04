@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Protocol
 import aiomysql
 
 from playerbot_claude import ledger, protocol
-from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestPriority
+from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
 
 if TYPE_CHECKING:
     # Only for typing: app imports this module, so importing it back at runtime would
@@ -76,7 +76,8 @@ class SidecarState(Protocol):
     async def reserve(
         self,
         *,
-        request_id: int,
+        request_kind: RequestKind,
+        model: str,
         max_cost_nano: int | None,
         priority: RequestPriority,
         now: datetime,
@@ -172,7 +173,8 @@ class MySqlSidecarState:
     async def reserve(
         self,
         *,
-        request_id: int,
+        request_kind: RequestKind,
+        model: str,
         max_cost_nano: int | None,
         priority: RequestPriority,
         now: datetime,
@@ -180,7 +182,8 @@ class MySqlSidecarState:
         async with self._connection() as connection:
             return await self._ledger.reserve(
                 connection,
-                request_id=request_id,
+                request_kind=request_kind,
+                model=model,
                 max_cost_nano=max_cost_nano,
                 priority=priority,
                 now=now,

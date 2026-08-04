@@ -63,7 +63,7 @@ All game state lives on the world thread. The bridge worker thread never touches
 
 ## Budget ledger
 
-All money is integer nano-USD (1 USD = 1,000,000,000 nano), so documented examples reproduce exactly and no float rounding can leak into the ledger.
+All arithmetic is in integer nano-USD (1 USD = 1,000,000,000 nano), so documented examples reproduce exactly and no float rounding can leak into the ledger. Storage is decimal dollars: the `mod-playerbots` schema records money in `DECIMAL(12, 6)` columns, so an amount is rounded UP to the nearest millionth of a dollar before it is admitted, not on the way to the database. Rounding at the write instead would leave the running totals disagreeing with the rows they are meant to be the sum of, by up to 999 nano a row, permanently.
 
 Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at the default Haiku 4.5 rates, rounded up. Tested examples:
 
@@ -76,11 +76,13 @@ The reserve-then-settle cycle, one MySQL transaction per step:
 
 1. **Count.** The exact prompt is counted via the API, with the same structured output schema the generation request sends (the schema is billed as input). Input above 4,095 tokens is rejected before any money moves.
 2. **Reserve.** The maximum possible cost (counted input plus the full 96 token output allowance, rounded up) is charged. Reading the day's totals, applying the admission policy, and inserting the reservation all happen inside one transaction holding the `budget_day` named lock, so two concurrent requests cannot both see the same remaining budget and both fit.
-3. **Settle.** After a successful reply, the reported usage replaces the maximum. If the reported cost exceeds what was reserved, the day's circuit breaker opens, the true figure is recorded, and every later request is denied.
+3. **Settle.** After a successful reply, the reported usage replaces the maximum. If the reported cost exceeds what was reserved, the circuit breaker opens, the true figure is recorded, and every later request is denied.
 
 Admission is refused, in this order, for an open circuit, unknown pricing, the total ceiling, and then the human reserve. The reserve denies background work only: `HumanBudgetReserveRatio` protects a share of the ceiling for whispers, party lines, and social replies, while ambient World chatter and career selection are background. Human work is protected from background work; it is not exempt from the ceiling.
 
-The ceiling is per UTC calendar day, so it rolls over at one instant regardless of server timezone or daylight saving. The configured `DailyBudgetUsd` is the only ceiling; no policy maximum sits above it. It is refused above what `BIGINT UNSIGNED` can record, roughly 18.4 billion USD, because a ceiling the ledger cannot enforce would let honest traffic saturate the day's settled total. That refusal is what makes saturation a reliable integrity signal rather than an ordinary outcome.
+The ceiling is per UTC calendar day, so it rolls over at one instant regardless of server timezone or daylight saving. The configured `DailyBudgetUsd` is the only ceiling; no policy maximum sits above it. It is refused above what `DECIMAL(12, 6)` can record, 999999.999999 USD, because a ceiling the ledger cannot enforce would let honest traffic saturate the day's spent total. That refusal is what makes saturation a reliable integrity signal rather than an ordinary outcome.
+
+The breaker itself does not live on the day. It is on the singleton `playerbot_social_runtime_control` row, which is what stops it reopening by itself at UTC rollover: a provider reporting an impossible cost is not a fact about one calendar day. The row is created by the breaker if it is not already there, so a realm that has never tripped it has no row rather than an unknown state.
 
 Failure handling depends on what can be proven:
 
@@ -97,21 +99,30 @@ The two sides disagree on that ceiling, and the sidecar is the one that decides.
 
 ## Storage schema
 
-All in `acore_playerbots`, created on start if absent. Nothing migrates from the removed SQLite file.
+All in `acore_playerbots`. Nothing migrates from the removed SQLite file.
 
-| Table | Contents | Bound |
-| --- | --- | --- |
-| `playerbot_claude_profile` | Latest observed trusted profile per bot | One row per bot |
-| `playerbot_claude_conversation_turn` | Rolling dialogue memory | 12 turns per bot, trimmed on write |
-| `playerbot_claude_budget_day` | Settled total and circuit breaker state | One row per UTC day |
-| `playerbot_claude_budget_reservation` | One row per attempt, with maximum and settled cost | Unique on request id and attempt |
-| `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps | Rolling one hour |
-| `playerbot_claude_career_decision` | Validated opaque career response diagnostics | Latest row per bot |
-| `playerbot_claude_lock` | Named serialization points | Bounded key set, never deleted |
+Two owners, and the split matters. The sidecar creates the five tables it alone uses. The budget tables and the runtime control row belong to the `mod-playerbots` SQL revisions under `data/sql/playerbots/updates`, and the sidecar refuses to start when they are absent rather than creating its own version of them.
+
+| Table | Contents | Bound | Created by |
+| --- | --- | --- | --- |
+| `playerbot_claude_profile` | Latest observed trusted profile per bot | One row per bot | sidecar |
+| `playerbot_claude_conversation_turn` | Rolling dialogue memory | 12 turns per bot, trimmed on write | sidecar |
+| `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps | Rolling one hour | sidecar |
+| `playerbot_claude_career_decision` | Validated opaque career response diagnostics | Latest row per bot | sidecar |
+| `playerbot_claude_lock` | Named serialization points | Bounded key set, never deleted | sidecar |
+| `playerbot_claude_daily_budget` | Reserved and spent decimal totals | One row per UTC day | mod-playerbots |
+| `playerbot_claude_budget_reservation` | One row per attempt, with request kind, model, maximum, and settled cost | Unique on the minted `req_` public id | mod-playerbots |
+| `playerbot_social_runtime_control` | Operator controls, including the budget circuit breaker | Singleton row | mod-playerbots |
+
+That split is not tidiness. Both definitions used `CREATE TABLE IF NOT EXISTS`, so whichever ran first won and the other silently did nothing, and on a deployed realm that was the module. Every write the sidecar made to a column only its own definition had would have failed at runtime and nowhere else. The sidecar's ledger tests apply the module's revision files rather than a copy of them, so a column renamed there fails in the run that renames it.
 
 Conversation memory is trimmed on write rather than on read, so the table is bounded on disk and not merely in what a query returns.
 
-The worldserver's request ids come from a per-process counter that restarts at 1, so they are unique only within one worldserver run. The attempt number is derived inside the day lock as the next unused value for that request id, which is why a repeat after a restart gets its own reservation rather than colliding on the unique key.
+A reservation's identity is minted by the sidecar as `req_` followed by 32 lowercase hex, and that is the unique key. Nothing about the caller has to be unique for a repeat to get its own row, which is the point: the worldserver's request ids come from a per-process counter that restarts at 1, so a key derived from one collides with whatever the previous run left behind.
+
+`priority_lane` on that row reads `unspecified`. The lane is decided on the worldserver side, collapsed to a queue priority, and discarded before the request is encoded, so it never crosses the bridge and the sidecar cannot know it. That is an accurate statement that the row's producer does not know, not a guess, and it matches how the plan already treats the other producer facts in the same telemetry contract. The truthful lane arrives when a producer for it lands. `model` beside it is written truthfully, because the sidecar is the process that chooses the model.
+
+`reserved_usd` on the daily row is derived rather than incremented: every admission, settlement, release, and expiry sweep rewrites it from the reservations themselves, inside the day lock. Three separate increments and decrements that must each be right is three chances to be wrong.
 
 ## Failure modes
 

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 from playerbot_claude import budget, claude, ledger, protocol, state
-from playerbot_claude.budget import AdmissionDecision, RequestPriority
+from playerbot_claude.budget import AdmissionDecision, RequestKind, RequestPriority
 
 CONFIG_SECTION = "worldserver"
 CONFIG_PREFIX = "PlayerbotClaude."
@@ -288,6 +288,17 @@ def _priority_for(request: protocol.ChatRequest) -> RequestPriority:
     return RequestPriority.IMMEDIATE_HUMAN
 
 
+def _request_kind_for(request: protocol.ChatRequest) -> RequestKind:
+    """What the ledger row says this request was paying for.
+
+    Separate from :func:`_priority_for`, and not derivable from it. Career selection and
+    ambient chatter share the background lane but are different kinds of work, and a
+    career decision is the one the operator is most likely to go looking for by name.
+    """
+
+    return RequestKind.CAREER_GENERATION if request.is_career else RequestKind.CHAT_RESPONSE
+
+
 def _actual_cost_nano(usage: claude.UsageTotals, prices: tuple[str, str]) -> int:
     """What a completed call really cost, from the provider's own token counts.
 
@@ -495,7 +506,8 @@ class SidecarService:
             # already ended, so this must never take the slice held for a player who just spoke
             # and is watching for an answer.
             decision, reservation = await store.reserve(
-                request_id=token,
+                request_kind=RequestKind.MEMORY_EXTRACTION,
+                model=claude.MODEL_ID,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.BACKGROUND,
                 now=now,
@@ -572,7 +584,8 @@ class SidecarService:
             # never spend the slice held for a player who just said something and is watching
             # for an answer. This is Key Decision 2 expressed where it is actually enforced.
             decision, reservation = await store.reserve(
-                request_id=token,
+                request_kind=RequestKind.BACKSTORY_GENERATION,
+                model=claude.MODEL_ID,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.BACKGROUND,
                 now=now,
@@ -645,7 +658,8 @@ class SidecarService:
             # A social line always has somebody waiting on it, which is the reserve's whole
             # purpose. The coordinator already decided this conversation was worth having.
             decision, reservation = await store.reserve(
-                request_id=token,
+                request_kind=RequestKind.CHAT_RESPONSE,
+                model=claude.MODEL_ID,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.IMMEDIATE_HUMAN,
                 now=now,
@@ -738,7 +752,8 @@ class SidecarService:
                 input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
             )
             decision, reservation = await store.reserve(
-                request_id=request.request_id,
+                request_kind=_request_kind_for(request),
+                model=claude.MODEL_ID,
                 max_cost_nano=max_cost_nano,
                 priority=_priority_for(request),
                 now=now,

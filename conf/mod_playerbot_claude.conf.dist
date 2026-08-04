@@ -68,9 +68,13 @@ PlayerbotClaude.BridgePort = 0
 #                     or daylight saving. This is the SOLE ceiling: no policy limit is applied
 #                     above it, so a large configured value is honoured as written. The one hard
 #                     limit is physical rather than policy, since the ledger records money in
-#                     BIGINT UNSIGNED columns: a value above roughly 18400000000 is refused rather
-#                     than clamped, because it is a ceiling the ledger could not enforce. 0, a
+#                     DECIMAL(12, 6) columns: a value above 999999.999999 is refused rather than
+#                     clamped, because it is a ceiling the ledger could not enforce. 0, a
 #                     negative value, or an unrecordable value disables all generation.
+#
+#                     Amounts are recorded to six decimal places, so a single reservation or
+#                     settlement is rounded UP to the nearest millionth of a dollar. The rounding
+#                     always favours the budget, never the spend.
 #        Default:     5
 
 PlayerbotClaude.DailyBudgetUsd = 5

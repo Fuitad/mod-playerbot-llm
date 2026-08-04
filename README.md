@@ -158,9 +158,9 @@ Cost per reply is `(input_tokens * InputUsdPerMTok + output_tokens * OutputUsdPe
 
 `PlayerbotClaude.DailyBudgetUsd = 5` is an emergency ceiling for all Claude features together. A measured day with about 7,700 input tokens and 610 output tokens costs approximately `0.01075 USD` at the configured rates, so the default is roughly 465 times observed usage and is not a spending target.
 
-The configured value is the only ceiling. No policy maximum sits above it: a large configured budget is honoured as configured. The one hard limit is physical, not policy. The ledger records money in `BIGINT UNSIGNED` columns, so a ceiling above roughly 18.4 billion USD per day is one the ledger could not enforce, and it is refused rather than quietly clamped. Missing, negative, zero, or unrecordable values disable generation, as does a price of zero. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
+The configured value is the only ceiling. No policy maximum sits above it: a large configured budget is honoured as configured. The one hard limit is physical, not policy. The ledger records money in `DECIMAL(12, 6)` columns, so a ceiling above `999999.999999` USD per day is one the ledger could not enforce, and it is refused rather than quietly clamped. Missing, negative, zero, or unrecordable values disable generation, as does a price of zero. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
 
-The ceiling is per UTC calendar day, rolling over at one instant regardless of server timezone or daylight saving. Money is tracked as integer nano-USD (1 USD = 1,000,000,000), so no float rounding can accumulate into the ledger.
+The ceiling is per UTC calendar day, rolling over at one instant regardless of server timezone or daylight saving. Arithmetic runs in integer nano-USD (1 USD = 1,000,000,000), so no float rounding can accumulate into the ledger, and amounts are stored to six decimal places. A single reservation or settlement is rounded up to the nearest millionth of a dollar, always in the direction that protects the budget.
 
 How one request spends:
 
@@ -175,27 +175,35 @@ How one request spends:
 
 `PlayerbotClaude.HumanBudgetReserveRatio` protects a share of the ceiling for work somebody is waiting on: whispers, party lines, and social replies. Ambient World chatter and career selection are background work and are denied once the remainder reaches the reserve, while a human request may still use it. Human work is protected from background work; it is not exempt from the ceiling itself. `0` disables the protection and `1` stops background generation entirely.
 
-If the provider ever reports a cost above what was reserved, the budget circuit breaker opens: the ceiling has already been crossed by an amount nobody authorised, the true figure is recorded, and every later request is denied until the breaker is cleared.
+If the provider ever reports a cost above what was reserved, the budget circuit breaker opens: the ceiling has already been crossed by an amount nobody authorised, the true figure is recorded, and every later request is denied until the breaker is cleared. The breaker lives on the social runtime control row rather than on the day, so it does not reopen by itself at UTC rollover. An impossible cost report is not a fact about one calendar day.
 
 ## Data retention and deletion
 
-The sidecar keeps its state in the shared `acore_playerbots` database, in tables prefixed `playerbot_claude_`:
+The sidecar keeps its state in the shared `acore_playerbots` database. It creates and owns five tables:
 
 | Table | Holds |
 | --- | --- |
 | `playerbot_claude_profile` | The latest observed personality profile per bot |
 | `playerbot_claude_conversation_turn` | The most recent 12 conversation turns per bot, trimmed on every write |
-| `playerbot_claude_budget_day` | One row per UTC day: settled total and circuit breaker state |
-| `playerbot_claude_budget_reservation` | One row per attempt, with its maximum and settled cost |
 | `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps for the rolling hourly gate |
 | `playerbot_claude_career_decision` | The current validated career decision per bot |
 | `playerbot_claude_lock` | Named serialization points, from a bounded key set |
+
+Three more tables it writes to belong to mod-playerbots and are created by that module's SQL revisions, not by the sidecar:
+
+| Table | Holds |
+| --- | --- |
+| `playerbot_claude_daily_budget` | One row per UTC day: the reserved and spent decimal totals |
+| `playerbot_claude_budget_reservation` | One row per attempt, with its request kind, model, maximum, and settled cost |
+| `playerbot_social_runtime_control` | The operator controls, including the budget circuit breaker |
+
+The sidecar refuses to start when those three are missing, naming them, rather than creating its own version. Apply `modules/mod-playerbots/data/sql/playerbots/updates` to the Playerbots database first.
 
 The conversation turns are the only table holding player text. No secrets are ever stored, and nothing here records account names, IP addresses, or positions.
 
 Sharing the Playerbots database rather than a private file means the budget survives a sidecar restart, holds across two sidecars pointed at one realm, and is backed up by whatever already backs up that database.
 
-To delete all retained data, stop the sidecar and drop those tables; the sidecar recreates them empty on next start. To delete only player text, `TRUNCATE TABLE playerbot_claude_conversation_turn`. Anthropic's own data handling is governed by their API terms.
+To delete the data the sidecar owns, stop it and drop the five tables in the first list; it recreates them empty on next start. Dropping the three in the second list needs the module's SQL revisions reapplied before the sidecar will start again. To delete only player text, `TRUNCATE TABLE playerbot_claude_conversation_turn`. Anthropic's own data handling is governed by their API terms.
 
 Upgrading from a version that kept its own file: nothing is migrated, and no code reads it. Delete it once the sidecar starts successfully against MySQL. A leftover `PlayerbotClaude.SidecarDatabase` line in the config is ignored.
 

@@ -19,12 +19,13 @@ history is written out at :meth:`BudgetLedger._lock_day`.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from playerbot_claude import budget
-from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestPriority
+from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
 
 # How long a reservation may sit unsettled before another transaction may reclaim it.
 #
@@ -101,46 +102,83 @@ SCHEMA_STATEMENTS = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
       COMMENT='Rolling hourly ambient rate, surviving restart.'
     """,
-    """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_budget_day (
-        `usage_date` DATE NOT NULL,
-        `settled_nano` BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        `circuit_open` TINYINT UNSIGNED NOT NULL DEFAULT 0,
-        `circuit_reason` VARCHAR(255) NOT NULL DEFAULT '',
-        PRIMARY KEY (`usage_date`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-      COMMENT='One row per UTC day. Every reservation serializes on it.'
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_budget_reservation (
-        `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        `usage_date` DATE NOT NULL,
-        `request_id` BIGINT UNSIGNED NOT NULL,
-        `attempt` INT UNSIGNED NOT NULL DEFAULT 1,
-        `priority` ENUM('immediate_human','background') NOT NULL,
-        `max_cost_nano` BIGINT UNSIGNED NOT NULL,
-        `actual_cost_nano` BIGINT UNSIGNED NULL,
-        `state` ENUM('reserved','settled','released') NOT NULL DEFAULT 'reserved',
-        `created_at` DATETIME NOT NULL,
-        `settled_at` DATETIME NULL,
-        PRIMARY KEY (`id`),
-        UNIQUE KEY `uk_request_attempt` (`request_id`, `attempt`),
-        KEY `ix_open` (`usage_date`, `state`, `created_at`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-      COMMENT='Every retry gets its own row, so each has its own reservation and cost.'
-    """,
 )
+
+# The budget tables are NOT in the list above, deliberately.
+#
+# `playerbot_claude_daily_budget`, `playerbot_claude_budget_reservation`, and the
+# `playerbot_social_runtime_control` row that carries the circuit breaker belong to
+# mod-playerbots and are created by its SQL revisions. The sidecar used to carry a second
+# definition of the first two here, with different column names, integer nano money
+# instead of decimal dollars, and a breaker on the daily row. Both definitions used
+# CREATE TABLE IF NOT EXISTS, so whichever ran first won and the other silently did
+# nothing: on the deployed database that was the module, and every write this file made to
+# columns only its own DDL had would have failed at runtime and nowhere else.
+#
+# One owner, and it is the module. This process verifies the tables are there and refuses
+# to start if they are not, rather than papering over a database the schema revisions
+# never reached.
+REQUIRED_MODULE_TABLES = (
+    "playerbot_claude_daily_budget",
+    "playerbot_claude_budget_reservation",
+    "playerbot_social_runtime_control",
+)
+
+# The singleton primary key of `playerbot_social_runtime_control`, enforced by a CHECK
+# constraint on the table itself.
+RUNTIME_CONTROL_ID = 1
+
+# Width of `budget_circuit_reason`. An over-long reason would fail the update, roll the
+# transaction back, and leave the breaker shut for the exact case it exists to catch, so
+# the reason is sliced to fit rather than trusted to.
+CIRCUIT_REASON_LIMIT = 128
+
+# Width of the reservation's `model` column.
+MODEL_NAME_LIMIT = 64
+
+# What the sidecar writes into `priority_lane`.
+#
+# The lane is decided on the worldserver side, in PlayerbotSocialAdmissionLane, collapsed
+# to a queue priority, and then discarded before the request is encoded. It never crosses
+# the bridge, so this process cannot know it. `unspecified` is not a guess about which lane
+# a request was in; it is an accurate statement that the row's producer does not know, and
+# the truthful lane arrives when the separate telemetry task gives this column a producer.
+#
+# `model` beside it is different, and is written truthfully: the sidecar chooses the model,
+# so it is a fact this process actually holds.
+PRIORITY_LANE_UNSPECIFIED = "unspecified"
+
+# The opaque public identity of a reservation: a kind prefix and 32 lowercase hex.
+PUBLIC_ID_PREFIX = "req_"
+PUBLIC_ID_BODY_BYTES = 16
 
 
 @dataclass(frozen=True)
 class Reservation:
     reservation_id: int
-    usage_date: date
+    public_id: str
+    budget_date: date
     max_cost_nano: int
 
 
 class LedgerError(RuntimeError):
     """The ledger could not complete an operation it was asked to perform."""
+
+
+def mint_public_id() -> str:
+    """A fresh opaque identity for one reservation attempt.
+
+    Random rather than derived, and that is what makes it durable. The previous key was
+    the worldserver's request id paired with an attempt number, and the worldserver's
+    request ids come from a per-process counter that restarts at 1: after a restart,
+    request id 1 comes round again and collides with the row the previous run left behind.
+    The old code worked around that by deriving the attempt number from a MAX over the
+    table, which made every reservation unique but also meant the key deduplicated
+    nothing. Minting an identity here says the same thing without the lookup, and says it
+    across restarts.
+    """
+
+    return PUBLIC_ID_PREFIX + secrets.token_hex(PUBLIC_ID_BODY_BYTES)
 
 
 async def acquire_named_lock(cursor, key: str) -> None:
@@ -224,7 +262,27 @@ class BudgetLedger:
             # a key of either shape, so the residue is a fixed historical set rather
             # than a table that keeps growing. `retire_superseded_locks` below removes
             # it when an operator knows no old process remains.
+
+            await cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name IN (%s, %s, %s)",
+                REQUIRED_MODULE_TABLES,
+            )
+            present = {row[0] for row in await cursor.fetchall()}
+
         await connection.commit()
+
+        missing = [name for name in REQUIRED_MODULE_TABLES if name not in present]
+        if missing:
+            # Refused rather than created. These tables belong to the mod-playerbots SQL
+            # revisions, and a sidecar that creates its own version of them is how the two
+            # definitions diverged in the first place. A missing table here means the
+            # revisions have not been applied to this database, which is an operator
+            # problem with an operator fix.
+            raise LedgerError(
+                "the mod-playerbots social schema is missing from this database "
+                f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
+            )
 
     async def retire_superseded_locks(self, connection) -> int:
         """Removes lock rows from the retired per day and per bot key shapes.
@@ -261,8 +319,66 @@ class BudgetLedger:
 
         return removed
 
+    async def _circuit_open(self, cursor) -> bool:
+        """Whether the breaker is currently stopping all spending.
+
+        Read from the social runtime control row rather than from the day. The breaker
+        opens because a provider reported a cost nobody authorised, which is not a fact
+        about one calendar day, and a per-day breaker silently reopens at UTC midnight
+        with the underlying problem untouched.
+
+        A missing singleton row reads as closed. The row is created lazily, by the breaker
+        itself, so its absence means nothing has ever tripped it rather than that the
+        state is unknown.
+        """
+
+        await cursor.execute(
+            "SELECT budget_circuit_open FROM playerbot_social_runtime_control WHERE id = %s",
+            (RUNTIME_CONTROL_ID,),
+        )
+        row = await cursor.fetchone()
+        return bool(row[0]) if row else False
+
+    async def _open_circuit(self, cursor, reason: str, now: datetime) -> None:
+        """Stops all spending, and records why and when.
+
+        An upsert rather than an update, because nothing seeds the singleton and a
+        breaker that fails to record itself because a row was missing is not a breaker.
+        The other control columns take their schema defaults, which are the permissive
+        ones: this creates the row, it does not decide the operator's other settings.
+        """
+
+        trimmed = reason[:CIRCUIT_REASON_LIMIT]
+        await cursor.execute(
+            "INSERT INTO playerbot_social_runtime_control "
+            "(id, budget_circuit_open, budget_circuit_reason, budget_circuit_opened_at) "
+            "VALUES (%s, 1, %s, %s) "
+            "ON DUPLICATE KEY UPDATE budget_circuit_open = 1, "
+            "budget_circuit_reason = %s, budget_circuit_opened_at = %s",
+            (RUNTIME_CONTROL_ID, trimmed, now, trimmed, now),
+        )
+
+    async def _refresh_reserved_usd(self, cursor, day: date) -> None:
+        """Rewrites the day's reserved total from the reservations themselves.
+
+        Derived rather than incremented, so it cannot drift. An expiry sweep, a
+        settlement, and a release all change what is outstanding, and three separate
+        increments and decrements that must each be right is three chances to be wrong.
+        Recomputing costs one indexed aggregate over a table bounded by the day.
+
+        Always called inside the day lock, because a running total written outside it is
+        a total two transactions can each compute before either writes.
+        """
+
+        await cursor.execute(
+            "UPDATE playerbot_claude_daily_budget SET reserved_usd = COALESCE("
+            "(SELECT SUM(max_cost_usd) FROM playerbot_claude_budget_reservation "
+            "WHERE budget_date = %s AND state = 'reserved'), 0) WHERE budget_date = %s",
+            (day, day),
+        )
+
     async def _lock_day(self, cursor, day: date) -> tuple[int, bool]:
-        """Serializes on the day, then reads its settled total and circuit state.
+        """Serializes on the day, then reads its spent total and circuit state.
 
         The lock is taken through :func:`acquire_named_lock` rather than on the budget
         row itself. Two earlier attempts both had races that only appear when the row is
@@ -286,12 +402,12 @@ class BudgetLedger:
         await acquire_named_lock(cursor, "budget_day")
 
         await cursor.execute(
-            "INSERT INTO playerbot_claude_budget_day (usage_date, settled_nano) VALUES (%s, 0) "
-            "ON DUPLICATE KEY UPDATE usage_date = usage_date",
+            "INSERT INTO playerbot_claude_daily_budget (budget_date) VALUES (%s) "
+            "ON DUPLICATE KEY UPDATE budget_date = budget_date",
             (day,),
         )
         await cursor.execute(
-            "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day WHERE usage_date = %s",
+            "SELECT spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
             (day,),
         )
         row = await cursor.fetchone()
@@ -299,7 +415,7 @@ class BudgetLedger:
         if row is None:  # pragma: no cover - the upsert above guarantees a row
             raise LedgerError("budget day row vanished between upsert and read")
 
-        return int(row[0]), bool(row[1])
+        return budget.usd_to_nano(row[0]), await self._circuit_open(cursor)
 
     async def _outstanding_nano(self, cursor, day: date, now: datetime) -> int:
         """Live reservations only. Expired ones are reclaimed rather than counted.
@@ -309,52 +425,37 @@ class BudgetLedger:
         transaction is what makes the recovery safe: the settle path below only accepts
         a reservation still in the reserved state, so a late completion for a reclaimed
         row is refused rather than charged twice.
+
+        Reclaimed rows move to ``expired`` rather than ``released``. Both stop counting
+        against the ceiling, but they are different events with different causes, and a
+        row that says released when nothing released it sends whoever reads it after the
+        wrong thing. The deployed schema has a state for each; the sidecar's own DDL had
+        only one, which is why this used to say released.
+
+        Scoped to one day, so a reservation stranded either side of a UTC midnight is
+        reclaimed by the day it belongs to rather than by whichever day happens to be
+        current. Nothing reads a past day's totals, so nothing waits on that sweep.
         """
 
-        cutoff = now - RESERVATION_EXPIRY
         await cursor.execute(
-            "UPDATE playerbot_claude_budget_reservation SET state = 'released' "
-            "WHERE usage_date = %s AND state = 'reserved' AND created_at < %s",
-            (day, cutoff),
+            "UPDATE playerbot_claude_budget_reservation SET state = 'expired' "
+            "WHERE budget_date = %s AND state = 'reserved' AND expires_at <= %s",
+            (day, now),
         )
         await cursor.execute(
-            "SELECT COALESCE(SUM(max_cost_nano), 0) FROM playerbot_claude_budget_reservation "
-            "WHERE usage_date = %s AND state = 'reserved'",
+            "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_claude_budget_reservation "
+            "WHERE budget_date = %s AND state = 'reserved'",
             (day,),
         )
         row = await cursor.fetchone()
-        return int(row[0]) if row else 0
-
-    async def _next_attempt(self, cursor, request_id: int) -> int:
-        """The next unused attempt number for one request id.
-
-        Reads the unique key's own leading column, so this is an index lookup rather than
-        a scan. It runs under :meth:`_lock_day`, whose key is the single global
-        ``budget_day`` rather than one key per date, so every reservation in the process
-        serializes here regardless of which calendar day it falls on and no two can derive
-        the same number, midnight included.
-
-        If that key ever became per-day, this would need revisiting: two reservations for
-        one request id either side of a UTC midnight would then hold different locks. The
-        unique key would refuse the second and the request would fail closed rather than
-        quietly sharing a reservation, which is survivable, but it would stop being
-        impossible.
-        """
-
-        await cursor.execute(
-            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM playerbot_claude_budget_reservation "
-            "WHERE request_id = %s",
-            (request_id,),
-        )
-        row = await cursor.fetchone()
-        return int(row[0]) if row else 1
+        return budget.usd_to_nano(row[0]) if row else 0
 
     async def reserve(
         self,
         connection,
         *,
-        request_id: int,
-        attempt: int | None = None,
+        request_kind: RequestKind,
+        model: str,
         max_cost_nano: int | None,
         priority: RequestPriority,
         now: datetime,
@@ -366,30 +467,35 @@ class BudgetLedger:
         makes Definition of Done 1 hold: two concurrent callers cannot both see the same
         remaining budget.
 
-        ``attempt`` defaults to the next unused number for this request id. The
-        worldserver's request ids come from a per-process counter that restarts at 1, so
-        they are unique only within one worldserver run: after a restart, request id 1
-        comes round again and a fixed attempt of 1 would collide with the row the
-        previous run left behind. Deriving it means a repeat of any kind, a genuine
-        retry or a counter that wrapped back over a restart, gets its own reservation and
-        its own cost record rather than a duplicate key error, which is Definition of
-        Done 3. Callers that know their own attempt number may still pass one.
+        Every reservation gets its own row under its own freshly minted ``public_id``, so
+        a repeat of any kind, a genuine retry or a worldserver counter that wrapped back
+        over a restart, is its own reservation with its own cost record rather than a
+        duplicate key error. That is Definition of Done 3, and it no longer depends on a
+        per-process request id being unique, which it never was.
+
+        The maximum is rounded up to the microdollar BEFORE the decision, so the amount
+        admitted against the ceiling is the amount the row will hold.
         """
+
+        if not model or len(model) > MODEL_NAME_LIMIT:
+            # Checked rather than truncated. A model name silently cut to 64 characters
+            # records a model that was never called, which is worse than no row at all.
+            raise LedgerError(f"model name is empty or too long for the ledger: {model!r}")
+
+        if max_cost_nano is not None and max_cost_nano > 0:
+            max_cost_nano = budget.quantize_storable_nano(max_cost_nano)
 
         day = utc_day(now)
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
-                settled, circuit_open = await self._lock_day(cursor, day)
+                spent, circuit_open = await self._lock_day(cursor, day)
                 outstanding = await self._outstanding_nano(cursor, day, now)
-
-                if attempt is None:
-                    attempt = await self._next_attempt(cursor, request_id)
 
                 decision = budget.admit(
                     ceiling_nano=self._ceiling_nano,
                     state=BudgetState(
-                        settled_nano=settled,
+                        settled_nano=spent,
                         outstanding_nano=outstanding,
                         circuit_open=circuit_open,
                     ),
@@ -399,16 +505,29 @@ class BudgetLedger:
                 )
 
                 if decision is not AdmissionDecision.ADMITTED:
+                    # The sweep above may have reclaimed rows even though nothing was
+                    # admitted, so the day's reserved figure still has to be rewritten.
+                    await self._refresh_reserved_usd(cursor, day)
                     await connection.commit()
                     return decision, None
 
+                public_id = mint_public_id()
                 await cursor.execute(
                     "INSERT INTO playerbot_claude_budget_reservation "
-                    "(usage_date, request_id, attempt, priority, max_cost_nano, state, created_at) "
-                    "VALUES (%s, %s, %s, %s, %s, 'reserved', %s)",
-                    (day, request_id, attempt, priority.value, max_cost_nano, now),
+                    "(public_id, budget_date, request_kind, priority_lane, model, max_cost_usd, "
+                    "state, expires_at) VALUES (%s, %s, %s, %s, %s, %s, 'reserved', %s)",
+                    (
+                        public_id,
+                        day,
+                        request_kind.value,
+                        PRIORITY_LANE_UNSPECIFIED,
+                        model,
+                        budget.nano_to_usd_string(max_cost_nano or 0),
+                        now + RESERVATION_EXPIRY,
+                    ),
                 )
                 reservation_id = cursor.lastrowid
+                await self._refresh_reserved_usd(cursor, day)
 
             await connection.commit()
         except Exception:
@@ -416,7 +535,10 @@ class BudgetLedger:
             raise
 
         return AdmissionDecision.ADMITTED, Reservation(
-            reservation_id=reservation_id, usage_date=day, max_cost_nano=int(max_cost_nano or 0)
+            reservation_id=reservation_id,
+            public_id=public_id,
+            budget_date=day,
+            max_cost_nano=int(max_cost_nano or 0),
         )
 
     async def settle(
@@ -443,26 +565,26 @@ class BudgetLedger:
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
-                settled_before, _ = await self._lock_day(cursor, reservation.usage_date)
+                spent_before, _ = await self._lock_day(cursor, reservation.budget_date)
 
                 await cursor.execute(
                     "UPDATE playerbot_claude_budget_reservation "
-                    "SET state = 'settled', actual_cost_nano = %s, settled_at = %s "
+                    "SET state = 'completed', actual_cost_usd = %s, settled_at = %s "
                     "WHERE id = %s AND state = 'reserved'",
-                    (storable, now, reservation.reservation_id),
+                    (budget.nano_to_usd_string(storable), now, reservation.reservation_id),
                 )
                 if cursor.rowcount == 0:
                     await connection.commit()
                     return False
 
                 # The SUM is clamped, not just the value. Clamping only the addend still
-                # overflows BIGINT UNSIGNED once anything has been spent, and MySQL then
+                # overflows DECIMAL(12, 6) once anything has been spent, and MySQL then
                 # rejects the statement, rolls the transaction back, and leaves the
                 # breaker shut for the exact report it exists to catch. The headroom comes
                 # from the total this transaction already read under the lock, so the
-                # arithmetic happens in Python where it cannot wrap.
-                headroom = budget.MAX_STORABLE_NANO - settled_before
-                added = min(storable, headroom)
+                # arithmetic happens in Python where it cannot overflow.
+                headroom = budget.MAX_STORABLE_NANO - spent_before
+                added = max(0, min(storable, headroom))
                 saturated = added < storable
                 if saturated:
                     # A total that is no longer the sum of what was charged is an
@@ -473,22 +595,17 @@ class BudgetLedger:
                     breach = True
 
                 await cursor.execute(
-                    "UPDATE playerbot_claude_budget_day SET settled_nano = settled_nano + %s "
-                    "WHERE usage_date = %s",
-                    (added, reservation.usage_date),
+                    "UPDATE playerbot_claude_daily_budget SET spent_usd = spent_usd + %s "
+                    "WHERE budget_date = %s",
+                    (budget.nano_to_usd_string(added), reservation.budget_date),
                 )
+                # This reservation has left the reserved state, so the day owes less.
+                await self._refresh_reserved_usd(cursor, reservation.budget_date)
 
                 if breach:
                     # The REPORTED figure goes in the reason even when it could not be
                     # stored in the column, because the number is the evidence.
                     #
-                    # Built as one string and then sliced. Slicing the expression inline
-                    # is equivalent, because adjacent literals concatenate into a single
-                    # atom before the subscript applies, but it reads as though the bound
-                    # covers only the last fragment and a reviewer has already misread it
-                    # that way. The column is VARCHAR(255); an over-long reason would
-                    # fail the update, roll the transaction back, and leave the breaker
-                    # shut for the exact case it exists to catch.
                     # Named for what actually happened. Saturation and an overrun are
                     # different incidents with different causes, and a reason that
                     # reports an overrun when the cost was within its reservation sends
@@ -496,20 +613,15 @@ class BudgetLedger:
                     causes = []
                     if budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano):
                         causes.append(
-                            f"reported cost {actual_cost_nano} exceeded reservation "
-                            f"{reservation.max_cost_nano}"
+                            f"cost {budget.nano_to_usd_string(actual_cost_nano)} over reservation "
+                            f"{budget.nano_to_usd_string(reservation.max_cost_nano)}"
                         )
                     if saturated:
                         causes.append(
-                            f"day total saturated at {budget.MAX_STORABLE_NANO} nano, "
-                            f"discarding {storable - added}"
+                            f"day saturated at {budget.nano_to_usd_string(budget.MAX_STORABLE_NANO)}, "
+                            f"discarding {budget.nano_to_usd_string(storable - added)}"
                         )
-                    reason = "; ".join(causes)
-                    await cursor.execute(
-                        "UPDATE playerbot_claude_budget_day SET circuit_open = 1, circuit_reason = %s "
-                        "WHERE usage_date = %s",
-                        (reason[:255], reservation.usage_date),
-                    )
+                    await self._open_circuit(cursor, "; ".join(causes), now)
 
             await connection.commit()
         except Exception:
@@ -519,17 +631,25 @@ class BudgetLedger:
         return True
 
     async def release(self, connection, *, reservation: Reservation) -> bool:
-        """Gives back an unused reservation, for a request that failed before spending."""
+        """Gives back an unused reservation, for a request that failed before spending.
+
+        Takes the day lock even though it writes one row, because it also rewrites the
+        day's reserved total, and an aggregate recomputed outside the lock is one two
+        transactions can each read before either writes.
+        """
 
         try:
             await connection.begin()
             async with connection.cursor() as cursor:
+                await self._lock_day(cursor, reservation.budget_date)
                 await cursor.execute(
                     "UPDATE playerbot_claude_budget_reservation SET state = 'released' "
                     "WHERE id = %s AND state = 'reserved'",
                     (reservation.reservation_id,),
                 )
                 released = cursor.rowcount > 0
+                if released:
+                    await self._refresh_reserved_usd(cursor, reservation.budget_date)
             await connection.commit()
         except Exception:
             await connection.rollback()
@@ -543,22 +663,27 @@ class BudgetLedger:
         day = utc_day(now)
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "SELECT settled_nano, circuit_open FROM playerbot_claude_budget_day WHERE usage_date = %s",
+                "SELECT spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
                 (day,),
             )
             row = await cursor.fetchone()
-            settled, circuit_open = (int(row[0]), bool(row[1])) if row else (0, False)
+            spent = budget.usd_to_nano(row[0]) if row else 0
 
+            # Reads the reservations rather than the day's `reserved_usd`, so an expiry
+            # that has not been swept yet is excluded here too. The stored figure is
+            # rewritten under the lock and would otherwise still count a reservation this
+            # read can already see is dead.
             await cursor.execute(
-                "SELECT COALESCE(SUM(max_cost_nano), 0) FROM playerbot_claude_budget_reservation "
-                "WHERE usage_date = %s AND state = 'reserved' AND created_at >= %s",
-                (day, now - RESERVATION_EXPIRY),
+                "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_claude_budget_reservation "
+                "WHERE budget_date = %s AND state = 'reserved' AND expires_at > %s",
+                (day, now),
             )
             outstanding_row = await cursor.fetchone()
+            circuit_open = await self._circuit_open(cursor)
 
         return BudgetState(
-            settled_nano=settled,
-            outstanding_nano=int(outstanding_row[0]) if outstanding_row else 0,
+            settled_nano=spent,
+            outstanding_nano=budget.usd_to_nano(outstanding_row[0]) if outstanding_row else 0,
             circuit_open=circuit_open,
         )
 

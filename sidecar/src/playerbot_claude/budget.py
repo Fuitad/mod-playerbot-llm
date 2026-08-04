@@ -6,7 +6,10 @@ after two tasks of review: a rule that lives inside a transaction is a rule the 
 reach only through a transaction, and the arithmetic is the part that has to be right.
 
 Money is integer nano-USD throughout. Floats do not sum to a ceiling reliably, and a
-budget whose enforcement depends on the last bit of a double is not enforced.
+budget whose enforcement depends on the last bit of a double is not enforced. The ledger
+stores decimal dollars, because the deployed columns are ``DECIMAL(12, 6)``; the
+conversion happens there, and :func:`quantize_storable_nano` is what keeps the two
+representations describing the same amount.
 """
 
 from __future__ import annotations
@@ -30,6 +33,27 @@ class RequestPriority(enum.Enum):
 
     IMMEDIATE_HUMAN = "immediate_human"
     BACKGROUND = "background"
+
+
+class RequestKind(enum.Enum):
+    """What a reservation is paying for.
+
+    The values are the deployed ``request_kind`` enumerators, character for character.
+    They are not the sidecar's own vocabulary: the column belongs to the mod-playerbots
+    schema, and a value this enum can produce that the column cannot hold is a write that
+    fails in production and nowhere else.
+
+    ``MODERATION_CLASSIFICATION`` has no producer in the sidecar today. Moderation is
+    decided on the worldserver side without a provider call, so nothing here reserves
+    against it. It is listed because the column accepts it, not because this process
+    writes it.
+    """
+
+    CHAT_RESPONSE = "chat_response"
+    BACKSTORY_GENERATION = "backstory_generation"
+    MEMORY_EXTRACTION = "memory_extraction"
+    MODERATION_CLASSIFICATION = "moderation_classification"
+    CAREER_GENERATION = "career_generation"
 
 
 class AdmissionDecision(enum.Enum):
@@ -111,14 +135,17 @@ def validate_daily_ceiling(usd: Decimal | str | int) -> int:
     ignore what they asked for.
 
     There is one hard limit, and it is physical rather than a policy: the ledger records
-    money in ``BIGINT UNSIGNED`` columns, so a ceiling above what those can hold is a
+    money in ``DECIMAL(12, 6)`` columns, so a ceiling above what those can hold is a
     ceiling the ledger cannot enforce. Honest traffic under such a ceiling would eventually
-    saturate the day's settled total, and the settle path would have to either overflow or
+    saturate the day's spent total, and the settle path would have to either overflow or
     report a breach that never happened. Refused LOUDLY rather than quietly clamped: an
     unenforceable budget is a configuration mistake, and silently substituting a different
     number is exactly what removing the old hard-coded cap was meant to stop.
 
-    The limit is roughly 18.4 billion USD in one day, so it constrains nothing real.
+    The limit is 999999.999999 USD in one day. It was roughly 18.4 billion while the
+    sidecar kept its own ``BIGINT UNSIGNED`` nano columns; the deployed schema records
+    decimal dollars instead, and this is what that shape can hold. It still constrains
+    nothing a realm would configure on purpose.
     """
 
     ceiling = usd_to_nano(usd)
@@ -264,15 +291,45 @@ def admit(
     return AdmissionDecision.ADMITTED
 
 
-# The widest value the ledger's BIGINT UNSIGNED columns can hold. A reported cost outside
-# this cannot be stored at all, which matters because the breaker exists precisely for
-# impossible reports: if storing one fails, the transaction rolls back and the breaker
-# never fires for the case it was built for.
-MAX_STORABLE_NANO = 2**64 - 1
+# One microdollar, in nano-USD. The deployed money columns are DECIMAL(12, 6), so six
+# fractional digits are all a stored amount can carry, while the arithmetic above runs at
+# nine.
+STORAGE_SCALE_NANO = 1_000
+
+# The widest value the ledger's DECIMAL(12, 6) columns can hold: 999999.999999 USD. A
+# reported cost outside this cannot be stored at all, which matters because the breaker
+# exists precisely for impossible reports: if storing one fails, the transaction rolls
+# back and the breaker never fires for the case it was built for.
+MAX_STORABLE_NANO = 999_999_999_999_000
+
+
+def quantize_storable_nano(nano: int) -> int:
+    """Rounds a nano amount UP to something a DECIMAL(12, 6) column holds exactly.
+
+    Rounded up rather than to nearest, for the same reason every other rounding in this
+    module goes that way: on a reservation, a maximum that rounds down is not a maximum,
+    and on a settlement, rounding toward the ceiling keeps the error on the side that
+    protects the budget.
+
+    The ledger quantizes BEFORE deciding, not on the way to the database, so the number it
+    admitted against and the number the column holds are the same number. Quantizing only
+    at the write would leave the running totals disagreeing with the rows they are meant
+    to be the sum of, by up to 999 nano a row, forever.
+    """
+
+    if nano <= 0:
+        return 0
+
+    return -(-nano // STORAGE_SCALE_NANO) * STORAGE_SCALE_NANO
 
 
 def storable_actual_cost_nano(actual_cost_nano: int) -> int:
-    """Clamps a reported cost into what the ledger can physically record.
+    """Fits a reported cost into what the ledger can physically record.
+
+    Two adjustments, in this order. Rounded UP to the microdollar the column can hold,
+    then clamped to the widest value it can hold. Rounding first and clamping second is
+    what keeps the result inside the bound, since the bound is itself a whole number of
+    microdollars.
 
     Deliberately NOT a silent correction: the caller opens the circuit for the same
     value, so the clamped figure is stored alongside an open breaker and a reason rather
@@ -285,7 +342,7 @@ def storable_actual_cost_nano(actual_cost_nano: int) -> int:
     if actual_cost_nano < 0:
         return 0
 
-    return min(actual_cost_nano, MAX_STORABLE_NANO)
+    return min(quantize_storable_nano(actual_cost_nano), MAX_STORABLE_NANO)
 
 
 def circuit_should_open(max_cost_nano: int, actual_cost_nano: int) -> bool:
