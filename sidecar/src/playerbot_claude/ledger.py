@@ -124,6 +124,17 @@ REQUIRED_MODULE_TABLES = (
     "playerbot_social_runtime_control",
 )
 
+# The other half of that split: the tables SCHEMA_STATEMENTS above creates. Named here so
+# the ownership boundary is one list rather than a property of statement order, and so a
+# test can assert that a refused start left none of them behind.
+SIDECAR_OWNED_TABLES = (
+    "playerbot_claude_lock",
+    "playerbot_claude_profile",
+    "playerbot_claude_conversation_turn",
+    "playerbot_claude_career_decision",
+    "playerbot_claude_ambient_attempt",
+)
+
 # The singleton primary key of `playerbot_social_runtime_control`, enforced by a CHECK
 # constraint on the table itself.
 RUNTIME_CONTROL_ID = 1
@@ -237,6 +248,32 @@ class BudgetLedger:
         self._reserve_ratio = reserve_ratio
 
     async def ensure_schema(self, connection) -> None:
+        # The guard runs FIRST, before any DDL. `CREATE TABLE` commits itself in MySQL,
+        # so a guard placed after the loop cannot be undone by refusing afterwards: the
+        # sidecar's five tables would already be sitting in a database its own message
+        # says is not ready. Refusing to touch a database that has not been migrated
+        # means not touching it.
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name IN (%s, %s, %s)",
+                REQUIRED_MODULE_TABLES,
+            )
+            present = {row[0] for row in await cursor.fetchall()}
+        await connection.commit()
+
+        missing = [name for name in REQUIRED_MODULE_TABLES if name not in present]
+        if missing:
+            # Refused rather than created. These tables belong to the mod-playerbots SQL
+            # revisions, and a sidecar that creates its own version of them is how the two
+            # definitions diverged in the first place. A missing table here means the
+            # revisions have not been applied to this database, which is an operator
+            # problem with an operator fix.
+            raise LedgerError(
+                "the mod-playerbots social schema is missing from this database "
+                f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
+            )
+
         async with connection.cursor() as cursor:
             # Every start after the first would otherwise print one "table already
             # exists" note per table. The driver surfaces those as Python warnings on
@@ -263,26 +300,7 @@ class BudgetLedger:
             # than a table that keeps growing. `retire_superseded_locks` below removes
             # it when an operator knows no old process remains.
 
-            await cursor.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() AND table_name IN (%s, %s, %s)",
-                REQUIRED_MODULE_TABLES,
-            )
-            present = {row[0] for row in await cursor.fetchall()}
-
         await connection.commit()
-
-        missing = [name for name in REQUIRED_MODULE_TABLES if name not in present]
-        if missing:
-            # Refused rather than created. These tables belong to the mod-playerbots SQL
-            # revisions, and a sidecar that creates its own version of them is how the two
-            # definitions diverged in the first place. A missing table here means the
-            # revisions have not been applied to this database, which is an operator
-            # problem with an operator fix.
-            raise LedgerError(
-                "the mod-playerbots social schema is missing from this database "
-                f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
-            )
 
     async def retire_superseded_locks(self, connection) -> int:
         """Removes lock rows from the retired per day and per bot key shapes.

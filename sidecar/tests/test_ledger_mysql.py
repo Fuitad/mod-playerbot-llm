@@ -147,51 +147,75 @@ async def test_starting_against_a_database_without_the_module_schema_is_refused(
     came to exist: both used CREATE TABLE IF NOT EXISTS, so whichever ran first won and
     the other silently did nothing. Refusing to start is the honest replacement. Creating
     them here again would put the divergence straight back.
+
+    The second half of this test is the one that bites. `CREATE TABLE` commits itself in
+    MySQL, so a guard placed after the DDL loop cannot be undone by raising afterwards:
+    the sidecar's own five tables would already be sitting in a database its own error
+    message calls unready. Asserting on the module table alone would not have caught that,
+    because the sidecar never creates that one either way. The whole sidecar set has to be
+    absent for the refusal to mean what it says.
     """
 
     settings = _settings()
     bare = f"{settings.database}_bare"
 
-    admin = await _connect()
-    try:
-        async with admin.cursor() as cursor:
-            await cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{bare}`")
-        await admin.commit()
-    finally:
-        admin.close()
+    async def _drop_and_create() -> None:
+        # DROP first, not just CREATE IF NOT EXISTS. A previous run that failed its
+        # assertions leaves this database behind with whatever it created, and reusing
+        # it would make the next run assert against the last run's residue. Recreating
+        # from nothing is what makes "no table exists" mean this run created none.
+        admin = await _connect()
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f"DROP DATABASE IF EXISTS `{bare}`")
+                await cursor.execute(f"CREATE DATABASE `{bare}`")
+            await admin.commit()
+        finally:
+            admin.close()
 
-    connection = await aiomysql.connect(
-        host=settings.host,
-        port=settings.port,
-        user=settings.user,
-        password=settings.password,
-        db=bare,
-        autocommit=False,
-    )
-    try:
-        with pytest.raises(ledger.LedgerError, match="social schema is missing"):
-            await ledger.BudgetLedger(CEILING, QUARTER).ensure_schema(connection)
+    async def _drop() -> None:
+        admin = await _connect()
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f"DROP DATABASE IF EXISTS `{bare}`")
+            await admin.commit()
+        finally:
+            admin.close()
 
-        # And it did not quietly create them on the way out.
-        async with connection.cursor() as cursor:
-            await cursor.execute(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() AND table_name = %s",
-                ("playerbot_claude_budget_reservation",),
-            )
-            row = await cursor.fetchone()
-        await connection.commit()
-        assert int(row[0]) == 0
-    finally:
-        connection.close()
-
-    admin = await _connect()
+    await _drop_and_create()
     try:
-        async with admin.cursor() as cursor:
-            await cursor.execute(f"DROP DATABASE IF EXISTS `{bare}`")
-        await admin.commit()
+        connection = await aiomysql.connect(
+            host=settings.host,
+            port=settings.port,
+            user=settings.user,
+            password=settings.password,
+            db=bare,
+            autocommit=False,
+        )
+        try:
+            with pytest.raises(ledger.LedgerError, match="social schema is missing"):
+                await ledger.BudgetLedger(CEILING, QUARTER).ensure_schema(connection)
+
+            # Nothing at all was created: not the module's tables, and not the sidecar's.
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()"
+                )
+                created = {row[0] for row in await cursor.fetchall()}
+            await connection.commit()
+            assert created == set(), f"a refused start left tables behind: {sorted(created)}"
+
+            # Spelled out as well as compared, so a future table added to either list is
+            # covered by name rather than by the emptiness of a set nobody re-reads.
+            assert not created & set(ledger.SIDECAR_OWNED_TABLES)
+            assert not created & set(ledger.REQUIRED_MODULE_TABLES)
+        finally:
+            connection.close()
     finally:
-        admin.close()
+        # In a finally, so a failing assertion cannot leave this database for the next
+        # run to inherit. That is exactly how the first version of this test passed
+        # against a defect it had already been shown to catch.
+        await _drop()
 
 
 async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger) -> None:

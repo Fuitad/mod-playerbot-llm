@@ -106,11 +106,11 @@ See the interactive social chat section of the mod-playerbots README for the sur
 
 ### With interactive social chat disabled (`AiPlayerbot.SocialChat.Enable = 0`)
 
-The legacy behaviour, unchanged:
+Legacy compatibility only. This is what a realm that has not turned interactive social chat on still gets, described so an operator upgrading from it knows what changes. It is not the intended configuration and nothing below is part of Social.
 
-- **Whisper** a bot naturally: any whisper that mod-playerbots does not recognize as a bot command becomes Claude conversation. Known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. Prefixing with `llm ` forces Claude even for command-shaped text (`llm follow` asks the bot about following instead of ordering it to).
-- **Party chat**: `llm <bot-name> <message>` addresses one bot in your group. Party chat keeps the explicit prefix so ordinary group conversation never reaches the API.
-- **Ambient World chatter**: set `PlayerbotClaude.AmbientWorldEnable = 1` and set `AiPlayerbot.EnableBroadcasts = 0` in `playerbots.conf`. The module refuses ambient mode while canned broadcasts remain enabled, but direct Claude conversations continue working. Ambient attempts occur only while a human player is connected, use an eligible online bot that is alive, outside combat, and able to speak in the human player's faction World channel, and are limited to the configured rolling hourly limit. Delivery checks the human, bot, and channel membership again before speech.
+- **Whispers** reach Claude the same way they always did: a whisper mod-playerbots does not recognize as a bot command becomes conversation, while known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. A `llm ` prefix forces conversation even for command-shaped text.
+- **Party chat** reaches Claude only behind that same explicit prefix, so ordinary group conversation never leaves the machine. Interactive social chat replaces this: it reads party chat directly and decides for itself, with no prefix.
+- **World chatter** is the one surface Social never uses. The legacy ambient path can speak in the World channel, gated on `PlayerbotClaude.AmbientWorldEnable` and on canned broadcasts being off, bounded by a rolling hourly limit, and re-checked against the human, the bot, and channel membership immediately before speech. With interactive social chat on it is inert and the setting is logged as ignored. Zone General, say, party, and whispers are the only surfaces Social ever uses.
 
 ### Either way
 
