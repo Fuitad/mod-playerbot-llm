@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 from playerbot_claude import budget, claude, ledger, protocol, state
+from playerbot_claude import store as store_module
 from playerbot_claude.budget import AdmissionDecision, RequestKind, RequestPriority
 
 CONFIG_SECTION = "worldserver"
@@ -213,7 +214,7 @@ class SidecarConfig:
     def ambient_allowed(self) -> bool:
         return (
             self.ambient_world_enable
-            and 1 <= self.ambient_max_messages_per_hour <= ledger.MAX_AMBIENT_MESSAGES_PER_HOUR
+            and 1 <= self.ambient_max_messages_per_hour <= store_module.MAX_AMBIENT_MESSAGES_PER_HOUR
         )
 
 

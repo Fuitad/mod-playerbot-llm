@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from playerbot_claude import budget, ledger
+from playerbot_claude import budget, ledger, schema
 
 
 class FakeState:
@@ -121,7 +121,7 @@ class FakeState:
         reservation = ledger.Reservation(
             reservation_id=self._next_id,
             public_id=ledger.mint_public_id(),
-            budget_date=ledger.utc_day(now),
+            budget_date=schema.utc_day(now),
             max_cost_nano=int(max_cost_nano or 0),
         )
         self._next_id += 1

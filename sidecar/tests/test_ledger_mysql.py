@@ -23,8 +23,9 @@ import aiomysql
 import pytest
 from pymysql.constants import CLIENT
 
-from playerbot_claude import app, budget, claude, ledger, protocol
+from playerbot_claude import app, budget, claude, ledger, protocol, schema
 from playerbot_claude import state as state_module
+from playerbot_claude import store as store_module
 from playerbot_claude.app import PlayerbotsDatabaseSettings
 from playerbot_claude.budget import AdmissionDecision, RequestKind, RequestPriority
 
@@ -127,7 +128,7 @@ async def clean_ledger():
     book = ledger.BudgetLedger(CEILING, QUARTER)
     connection = await _connect()
     try:
-        await book.ensure_schema(connection)
+        await schema.ensure_schema(connection)
         async with connection.cursor() as cursor:
             await cursor.execute("DELETE FROM playerbot_claude_budget_reservation")
             await cursor.execute("DELETE FROM playerbot_claude_daily_budget")
@@ -193,8 +194,8 @@ async def test_starting_against_a_database_without_the_module_schema_is_refused(
             autocommit=False,
         )
         try:
-            with pytest.raises(ledger.LedgerError, match="social schema is missing"):
-                await ledger.BudgetLedger(CEILING, QUARTER).ensure_schema(connection)
+            with pytest.raises(schema.LedgerError, match="social schema is missing"):
+                await schema.ensure_schema(connection)
 
             # Nothing at all was created: not the module's tables, and not the sidecar's.
             async with connection.cursor() as cursor:
@@ -207,8 +208,8 @@ async def test_starting_against_a_database_without_the_module_schema_is_refused(
 
             # Spelled out as well as compared, so a future table added to either list is
             # covered by name rather than by the emptiness of a set nobody re-reads.
-            assert not created & set(ledger.SIDECAR_OWNED_TABLES)
-            assert not created & set(ledger.REQUIRED_MODULE_TABLES)
+            assert not created & set(schema.SIDECAR_OWNED_TABLES)
+            assert not created & set(schema.REQUIRED_MODULE_TABLES)
         finally:
             connection.close()
     finally:
@@ -356,7 +357,7 @@ async def test_two_concurrent_reservations_cannot_jointly_exceed_the_ceiling(cle
         async with first_connection.cursor() as cursor:
             await cursor.execute(
                 "INSERT IGNORE INTO playerbot_claude_daily_budget (budget_date) VALUES (%s)",
-                (ledger.utc_day(NOW),),
+                (schema.utc_day(NOW),),
             )
         await first_connection.commit()
 
@@ -625,7 +626,7 @@ async def store(clean_ledger):
         await cursor.execute("DELETE FROM playerbot_claude_career_decision")
         await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
     await connection.commit()
-    return ledger.SidecarStore(), connection
+    return store_module.SidecarStore(), connection
 
 
 async def test_a_profile_round_trips_and_the_latest_write_wins(store) -> None:
@@ -667,27 +668,27 @@ async def test_conversation_memory_is_trimmed_on_disk_not_merely_on_read(store) 
     """An unbounded history is an unbounded prompt, which is an unbounded cost."""
     book, connection = store
 
-    for index in range(ledger.CONVERSATION_TURN_LIMIT + 5):
+    for index in range(store_module.CONVERSATION_TURN_LIMIT + 5):
         await book.append_turn(connection, bot_guid=7, role="user", content=f"turn {index}", now=NOW)
 
     turns = await book.recent_turns(connection, bot_guid=7)
-    assert len(turns) == ledger.CONVERSATION_TURN_LIMIT
+    assert len(turns) == store_module.CONVERSATION_TURN_LIMIT
     # The OLDEST are the ones dropped, and order is preserved.
     assert turns[0][1] == "turn 5"
-    assert turns[-1][1] == f"turn {ledger.CONVERSATION_TURN_LIMIT + 4}"
+    assert turns[-1][1] == f"turn {store_module.CONVERSATION_TURN_LIMIT + 4}"
 
     # And the trim really happened in the table, not just in what the query returned.
     async with connection.cursor() as cursor:
         await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_conversation_turn WHERE bot_guid = 7")
         row = await cursor.fetchone()
-    assert int(row[0]) == ledger.CONVERSATION_TURN_LIMIT
+    assert int(row[0]) == store_module.CONVERSATION_TURN_LIMIT
 
 
 async def test_one_bots_memory_does_not_trim_another(store) -> None:
     book, connection = store
 
     await book.append_turn(connection, bot_guid=1, role="user", content="mine", now=NOW)
-    for index in range(ledger.CONVERSATION_TURN_LIMIT + 3):
+    for index in range(store_module.CONVERSATION_TURN_LIMIT + 3):
         await book.append_turn(connection, bot_guid=2, role="user", content=str(index), now=NOW)
 
     assert len(await book.recent_turns(connection, bot_guid=1)) == 1
@@ -696,7 +697,7 @@ async def test_one_bots_memory_does_not_trim_another(store) -> None:
 async def test_an_unsupported_role_is_refused_rather_than_stored(store) -> None:
     book, connection = store
 
-    with pytest.raises(ledger.LedgerError):
+    with pytest.raises(schema.LedgerError):
         await book.append_turn(connection, bot_guid=7, role="system", content="x", now=NOW)
 
     # The name says "rather than stored", so the test has to check that rather than
@@ -743,7 +744,7 @@ async def test_the_ambient_rate_holds_across_a_rolling_hour(store) -> None:
     assert await book.try_begin_ambient(connection, messages_per_hour=3, now=NOW) is False
 
     # An hour later the window has rolled and the slots are back.
-    later = NOW + ledger.AMBIENT_WINDOW + timedelta(seconds=1)
+    later = NOW + store_module.AMBIENT_WINDOW + timedelta(seconds=1)
     assert await book.try_begin_ambient(connection, messages_per_hour=3, now=later) is True
 
 
@@ -753,7 +754,7 @@ async def test_an_out_of_range_ambient_rate_consumes_nothing(store) -> None:
     assert await book.try_begin_ambient(connection, messages_per_hour=0, now=NOW) is False
     assert (
         await book.try_begin_ambient(
-            connection, messages_per_hour=ledger.MAX_AMBIENT_MESSAGES_PER_HOUR + 1, now=NOW
+            connection, messages_per_hour=store_module.MAX_AMBIENT_MESSAGES_PER_HOUR + 1, now=NOW
         )
         is False
     )
@@ -813,7 +814,7 @@ async def test_repeated_appends_for_one_bot_from_two_connections_settle_correctl
     """
     _, first_connection = clean_ledger
     second_connection = await _connect()
-    book = ledger.SidecarStore()
+    book = store_module.SidecarStore()
 
     try:
         async with first_connection.cursor() as cursor:
@@ -824,7 +825,7 @@ async def test_repeated_appends_for_one_bot_from_two_connections_settle_correctl
 
         async def append_many(connection, label):
             await barrier.wait()
-            for index in range(ledger.CONVERSATION_TURN_LIMIT):
+            for index in range(store_module.CONVERSATION_TURN_LIMIT):
                 await book.append_turn(
                     connection, bot_guid=7, role="user", content=f"{label}{index}", now=NOW
                 )
@@ -832,7 +833,7 @@ async def test_repeated_appends_for_one_bot_from_two_connections_settle_correctl
         await asyncio.gather(append_many(first_connection, "a"), append_many(second_connection, "b"))
 
         turns = await book.recent_turns(first_connection, bot_guid=7)
-        assert len(turns) == ledger.CONVERSATION_TURN_LIMIT
+        assert len(turns) == store_module.CONVERSATION_TURN_LIMIT
     finally:
         second_connection.close()
 
@@ -844,7 +845,7 @@ async def test_two_ambient_attempts_for_the_last_slot_yield_exactly_one(clean_le
     """
     _, first_connection = clean_ledger
     second_connection = await _connect()
-    book = ledger.SidecarStore()
+    book = store_module.SidecarStore()
 
     try:
         async with first_connection.cursor() as cursor:
@@ -883,7 +884,7 @@ async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> Non
     try:
         await holder.begin()
         async with holder.cursor() as cursor:
-            await ledger.acquire_named_lock(cursor, "test-key")
+            await schema.acquire_named_lock(cursor, "test-key")
 
         async with contender.cursor() as cursor:
             await cursor.execute("SET SESSION innodb_lock_wait_timeout = 1")
@@ -891,7 +892,7 @@ async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> Non
         await contender.begin()
         with pytest.raises(aiomysql.OperationalError) as caught:
             async with contender.cursor() as cursor:
-                await ledger.acquire_named_lock(cursor, "test-key")
+                await schema.acquire_named_lock(cursor, "test-key")
 
         # 1205 is ER_LOCK_WAIT_TIMEOUT. The database is asserting the contention.
         assert caught.value.args[0] == 1205
@@ -901,7 +902,7 @@ async def test_the_named_lock_really_blocks_a_second_holder(clean_ledger) -> Non
         await holder.commit()
         await contender.begin()
         async with contender.cursor() as cursor:
-            await ledger.acquire_named_lock(cursor, "test-key")
+            await schema.acquire_named_lock(cursor, "test-key")
         await contender.commit()
     finally:
         contender.close()
@@ -915,12 +916,12 @@ async def test_a_different_key_is_not_blocked_by_a_held_one(clean_ledger) -> Non
     try:
         await holder.begin()
         async with holder.cursor() as cursor:
-            await ledger.acquire_named_lock(cursor, "key-a")
+            await schema.acquire_named_lock(cursor, "key-a")
 
         async def take_other():
             await other.begin()
             async with other.cursor() as cursor:
-                await ledger.acquire_named_lock(cursor, "key-b")
+                await schema.acquire_named_lock(cursor, "key-b")
             await other.commit()
 
         await asyncio.wait_for(take_other(), timeout=10.0)
@@ -936,7 +937,7 @@ async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
     still take that key reintroduces the missing-row race the helper exists to avoid.
     """
     book, connection = clean_ledger
-    store = ledger.SidecarStore()
+    store = store_module.SidecarStore()
 
     async with connection.cursor() as cursor:
         await cursor.execute("DELETE FROM playerbot_claude_lock")
@@ -963,7 +964,7 @@ async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
 
     # One budget key plus at most one per conversation bucket, regardless of bot count
     # or how many days were touched.
-    assert int(row[0]) <= 1 + ledger.CONVERSATION_LOCK_BUCKETS
+    assert int(row[0]) <= 1 + schema.CONVERSATION_LOCK_BUCKETS
     assert int(row[0]) < CONVERSATION_LOCK_SAMPLE
 
 
@@ -974,7 +975,7 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     keys as its live locks, so removing them mid flight strips its mutual exclusion.
     Leaving them is bounded anyway: nothing creates either shape any more.
     """
-    book, connection = clean_ledger
+    _, connection = clean_ledger
 
     async with connection.cursor() as cursor:
         await cursor.execute("DELETE FROM playerbot_claude_lock")
@@ -992,13 +993,13 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     await connection.commit()
 
     # ensure_schema must NOT remove them on its own.
-    await book.ensure_schema(connection)
+    await schema.ensure_schema(connection)
     async with connection.cursor() as cursor:
         await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_lock")
         row = await cursor.fetchone()
     assert int(row[0]) == 6
 
-    removed = await book.retire_superseded_locks(connection)
+    removed = await schema.retire_superseded_locks(connection)
     assert removed == 3  # two dated budget keys and the out of range conversation key
 
     async with connection.cursor() as cursor:
@@ -1364,7 +1365,7 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     async with connection.cursor() as cursor:
         await cursor.execute(
             "UPDATE playerbot_claude_daily_budget SET spent_usd = %s WHERE budget_date = %s",
-            (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 10_000), ledger.utc_day(NOW)),
+            (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 10_000), schema.utc_day(NOW)),
         )
     await connection.commit()
 
@@ -1439,7 +1440,7 @@ async def test_saturation_alone_is_reported_as_saturation_not_as_an_overrun(clea
     async with connection.cursor() as cursor:
         await cursor.execute(
             "UPDATE playerbot_claude_daily_budget SET spent_usd = %s WHERE budget_date = %s",
-            (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 1_000), ledger.utc_day(NOW)),
+            (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 1_000), schema.utc_day(NOW)),
         )
     await connection.commit()
 

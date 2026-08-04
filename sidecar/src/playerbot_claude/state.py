@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import aiomysql
 
-from playerbot_claude import ledger, protocol
+from playerbot_claude import ledger, protocol, schema
+from playerbot_claude import store as store_module
 from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
 
 if TYPE_CHECKING:
@@ -95,7 +96,9 @@ class SidecarState(Protocol):
 class MySqlSidecarState:
     """The Playerbots database, behind :class:`SidecarState`."""
 
-    def __init__(self, pool: aiomysql.Pool, book: ledger.BudgetLedger, store: ledger.SidecarStore) -> None:
+    def __init__(
+        self, pool: aiomysql.Pool, book: ledger.BudgetLedger, store: store_module.SidecarStore
+    ) -> None:
         self._pool = pool
         self._ledger = book
         self._store = store
@@ -230,10 +233,10 @@ async def open_state(
     )
 
     book = ledger.BudgetLedger(ceiling_nano, reserve_ratio)
-    store = ledger.SidecarStore()
+    store = store_module.SidecarStore()
 
     async with pool.acquire() as connection:
-        await book.ensure_schema(connection)
+        await schema.ensure_schema(connection)
         # ensure_schema runs DDL, which MySQL commits implicitly, but the connection is
         # still handed back to a pool that discards anything with an open transaction.
         if connection.get_transaction_status():

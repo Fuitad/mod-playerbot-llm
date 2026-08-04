@@ -108,8 +108,8 @@ See the interactive social chat section of the mod-playerbots README for the sur
 
 Legacy compatibility only. This is what a realm that has not turned interactive social chat on still gets, described so an operator upgrading from it knows what changes. It is not the intended configuration and nothing below is part of Social.
 
-- **Whispers** reach Claude the same way they always did: a whisper mod-playerbots does not recognize as a bot command becomes conversation, while known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens. A `llm ` prefix forces conversation even for command-shaped text.
-- **Party chat** reaches Claude only behind that same explicit prefix, so ordinary group conversation never leaves the machine. Interactive social chat replaces this: it reads party chat directly and decides for itself, with no prefix.
+- **Whispers** reach Claude the same way they always did: a whisper mod-playerbots does not recognize as a bot command becomes conversation, while known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens.
+- **Party chat** reaches Claude only when a message is explicitly marked for it, so ordinary group conversation never leaves the machine. Interactive social chat replaces that boundary entirely: it reads party chat directly and decides for itself, and no marker exists or is needed.
 - **World chatter** is the one surface Social never uses. The legacy ambient path can speak in the World channel, gated on `PlayerbotClaude.AmbientWorldEnable` and on canned broadcasts being off, bounded by a rolling hourly limit, and re-checked against the human, the bot, and channel membership immediately before speech. With interactive social chat on it is inert and the setting is logged as ignored. Zone General, say, party, and whispers are the only surfaces Social ever uses.
 
 ### Either way
@@ -132,7 +132,7 @@ For a direct conversation or milestone, the sidecar sends the following to the A
 - The bot's name and its personality numbers and voice (derived data, not player data)
 - The channel kind (whisper or party) and the milestone kind, when applicable
 - The name of the speaking player character
-- The player's `llm` message text, marked as untrusted
+- The player's message text, marked as untrusted
 - Up to 20 prior turns of that bot's stored conversation memory
 
 An ambient request sends only the selected bot's name, personality numbers, voice, and a fixed instruction to offer one brief World observation. It sends no human identity, human text, or conversation history. Ambient input and output are never appended to conversation memory.
@@ -147,7 +147,7 @@ A career request sends the bot name, personality values, and opaque candidate de
 
 Never sent, on any path: account names, IP addresses, positions, inventories, combat state, the bridge token, or recognized bot commands. Character GUIDs are sent on exactly one path, memory extraction, for the reason given above; no other request carries one.
 
-Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. With interactive social chat off, party and group chat without the `llm ` prefix is never sent, and whisper traffic is the only thing that leaves without a prefix. With it on, mod-playerbots decides what is sent on all four surfaces and a character can opt out of the feature entirely with `.playerbots social off`.
+Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. With interactive social chat off, party and group chat leave only when explicitly marked for Claude, so whisper traffic is the only thing that leaves unmarked. With it on, mod-playerbots decides what is sent on all four surfaces and a character can opt out of the feature entirely with `.playerbots social off`.
 
 ## Budgeting
 
