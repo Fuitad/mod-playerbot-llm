@@ -10,6 +10,8 @@ worldserver (C++)                     sidecar (Python)              Anthropic AP
 | bridge worker       |  length-      |  claude.py         |        +-----------+
 |  ClaudeChat/Bridge  |  prefixed     |  budget.py         |
 +---------------------+  JSON frames  |  ledger.py         |
+                                      |  store.py          |
+                                      |  schema.py         |
                                       |  state.py          |
                                       +---------+----------+
                                                 |
@@ -72,6 +74,16 @@ Cost formula: `(input_tokens * 1.00 + output_tokens * 5.00) / 1,000,000` USD at 
 
 The decisions and the storage are deliberately separate. `budget.py` holds every rule as a pure function of its arguments: no clock, no database, no network. `ledger.py` holds only what genuinely needs a database. A rule embedded in a transaction is a rule the tests can reach only through a transaction, and the arithmetic is the part that has to be right.
 
+The storage half is three modules rather than one, along the seams that were already there:
+
+| Module | Holds |
+| --- | --- |
+| `schema.py` | The sidecar's own DDL, both ownership lists, the startup guard, the named lock, and the UTC day |
+| `ledger.py` | The budget: admission, settlement, release, the reservation identity, and the circuit breaker |
+| `store.py` | Profiles, dialogue memory, career decisions, and the legacy ambient rate |
+
+`ledger.py` and `store.py` both import `schema.py`; neither imports the other. They share a connection and the lock table and nothing else, which is why they are separate: money has a ceiling, a breaker, and a schema it does not own, and none of that should be in the way of reading how conversation memory is trimmed.
+
 The reserve-then-settle cycle, one MySQL transaction per step:
 
 1. **Count.** The exact prompt is counted via the API, with the same structured output schema the generation request sends (the schema is billed as input). Input above 4,095 tokens is rejected before any money moves.
@@ -95,7 +107,7 @@ Anything left outstanding stays charged at its maximum until another transaction
 
 The legacy ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary. Nothing reaches it while the social gate is on, because the limiter is never configured alongside the coordinator.
 
-The two sides disagree on that ceiling, and the sidecar is the one that decides. `MAX_AMBIENT_MESSAGES_PER_HOUR` is `60` in `ClaudeChat.h` and `6` in `ledger.py`, so worldserver will schedule attempts at a configured rate the sidecar then declines one by one. The effect is silence rather than overspend, which is why it is documented as an effective ceiling of `6` rather than repaired here: changing either constant is a behaviour change to the legacy path and does not belong in a documentation synchronization.
+The two sides disagree on that ceiling, and the sidecar is the one that decides. `MAX_AMBIENT_MESSAGES_PER_HOUR` is `60` in `ClaudeChat.h` and `6` in `store.py`, so worldserver will schedule attempts at a configured rate the sidecar then declines one by one. The effect is silence rather than overspend, which is why it is documented as an effective ceiling of `6` rather than repaired here: changing either constant is a behaviour change to the legacy path and does not belong in a documentation synchronization.
 
 ## Storage schema
 
