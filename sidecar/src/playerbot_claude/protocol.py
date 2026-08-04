@@ -485,10 +485,13 @@ class SocialMemory(BaseModel):
 class SocialContext(BaseModel):
     """What the coordinator assembled for one social line.
 
-    Every field is optional, because nothing populates this yet: Task 8's transport sends an
-    empty context and Task 9A is what will fill it. A context that does not parse as this
-    shape is not an error either, it is just text, and the caller falls back to treating it
-    as one opaque untrusted block rather than going silent.
+    Every field is optional because an empty one is a legitimate answer rather than a gap: a
+    reply has no starter, a bot meeting somebody for the first time has no relationship, and a
+    fresh thread has no memories. The producer omits what it did not assemble instead of
+    sending an empty value, so an absent key and an empty one never have to mean different
+    things here. A context that does not parse as this shape is not an error either, it is just
+    text, and the caller falls back to treating it as one opaque untrusted block rather than
+    going silent.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)

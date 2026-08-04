@@ -345,6 +345,23 @@ namespace ClaudeChat
     [[nodiscard]] std::string EncodeStarterContext(std::string const& subject);
 
     /*
+     * The whole assembled context, as the shape the sidecar's `SocialContext` declares.
+     *
+     * Only the fields that hold something are emitted. An empty field is not the same as an absent
+     * one to a prompt builder, which fences each block by name: an empty persona would produce a
+     * PERSONA heading with nothing under it. An entirely empty context encodes to the empty string,
+     * which is the spelling "nothing was assembled" already had.
+     *
+     * Bounded twice, and both bounds matter for different reasons. Each entry is bounded because
+     * the far side refuses an over long one; the whole payload is bounded because it refuses an
+     * over long context too, and twelve individually legal memories can still exceed it together.
+     * When the total has to give, the least specific block goes first and the persona goes last: a
+     * line generated without a remembered detail is still in character, and one generated without a
+     * character is the failure this whole path exists to remove.
+     */
+    [[nodiscard]] std::string EncodeSocialContext(PlayerbotSocialRequestContext const& context);
+
+    /*
      * A request for one bot's backstory.
      *
      * Carries the identity rather than asking for it. The generated reply has nowhere to put a

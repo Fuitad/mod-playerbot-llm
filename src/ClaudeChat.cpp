@@ -1019,6 +1019,160 @@ std::optional<std::string> ClaudeChat::SerializeBiographyRequest(BiographyReques
     return out;
 }
 
+namespace
+{
+    char const* PrivacyScopeName(PlayerbotSocialPrivacyScope scope)
+    {
+        switch (scope)
+        {
+            case PlayerbotSocialPrivacyScope::Party:
+                return "party";
+            case PlayerbotSocialPrivacyScope::Whisper:
+                return "whisper";
+            case PlayerbotSocialPrivacyScope::Public:
+                return "public";
+            default:
+                break;
+        }
+
+        /*
+         * A value from outside the enum is narrowed to the most private name rather than the most
+         * public one. The far side filters again by scope, and a corrupt value read as "public"
+         * would be a fact repeated in a zone on the strength of a byte nobody wrote.
+         */
+        return "whisper";
+    }
+
+    // One entry of a bounded string list, or nothing when the list is empty.
+    void AppendJsonStringList(std::string& out, char const* key, std::vector<std::string> const& values)
+    {
+        if (values.empty())
+            return;
+
+        out += ",\"";
+        out += key;
+        out += "\":[";
+        bool first = true;
+        for (std::string const& value : values)
+        {
+            if (!first)
+                out += ',';
+            AppendEscapedJsonString(
+                out, value.substr(0, Utf8PrefixLength(value, ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
+            first = false;
+        }
+        out += ']';
+    }
+}
+
+std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
+{
+    /*
+     * Assembled most specific last, so that dropping from the end to fit the total bound sheds the
+     * least useful block first. The persona is written first for the same reason: whatever else has
+     * to go, a bot still sounds like itself.
+     */
+    std::string out;
+    out.reserve(512);
+    out += '{';
+
+    bool first = true;
+    auto appendEntry = [&](char const* key, std::string const& value)
+    {
+        if (value.empty())
+            return;
+
+        AppendJsonField(out, key,
+                        value.substr(0, Utf8PrefixLength(value, MAX_SOCIAL_CONTEXT_ENTRY_BYTES)), first);
+        first = false;
+    };
+
+    appendEntry("persona", context.persona);
+    appendEntry("relationship", context.relationship);
+    appendEntry("starter", context.starter);
+
+    /*
+     * The lists come after the scalars, and the leading comma inside the helper is why: by this
+     * point at least one scalar has almost always been written, and a context of lists alone is
+     * repaired below rather than complicating every call.
+     */
+    std::string lists;
+    AppendJsonStringList(lists, "nearby", context.nearby);
+    AppendJsonStringList(lists, "thread", context.thread);
+
+    if (!context.memories.empty())
+    {
+        lists += ",\"memories\":[";
+        bool firstMemory = true;
+        for (PlayerbotSocialContextMemory const& memory : context.memories)
+        {
+            if (memory.text.empty())
+                continue;
+
+            if (!firstMemory)
+                lists += ',';
+
+            lists += "{\"text\":";
+            AppendEscapedJsonString(
+                lists, memory.text.substr(0, Utf8PrefixLength(memory.text, MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
+            lists += ",\"scope\":\"";
+            lists += PrivacyScopeName(memory.scope);
+            lists += "\"}";
+            firstMemory = false;
+        }
+        lists += ']';
+
+        // Every entry was empty, so the key would have been an empty array the far side has no use
+        // for. Rewinding is cheaper than deciding in advance whether any survived the bound.
+        if (firstMemory)
+            lists.resize(lists.size() - std::string(",\"memories\":[]").size());
+    }
+
+    if (!lists.empty())
+    {
+        // A context of lists alone starts with the helper's separator, which would be a leading
+        // comma after the brace.
+        out += first ? lists.substr(1) : lists;
+        first = false;
+    }
+
+    if (first)
+        return std::string();
+
+    out += '}';
+
+    /*
+     * The last resort, and it is a real one: twelve bounded memories plus a bounded persona and
+     * relationship exceed the total. Blocks are shed from the end, which is the order they were
+     * written in, so the persona is the last thing to go and in practice never does.
+     */
+    while (out.size() > MAX_SOCIAL_CONTEXT_BYTES && !context.memories.empty())
+    {
+        PlayerbotSocialRequestContext shorter = context;
+        shorter.memories.pop_back();
+        return EncodeSocialContext(shorter);
+    }
+
+    if (out.size() > MAX_SOCIAL_CONTEXT_BYTES)
+    {
+        PlayerbotSocialRequestContext shorter = context;
+        if (!shorter.thread.empty())
+            shorter.thread.pop_back();
+        else if (!shorter.nearby.empty())
+            shorter.nearby.pop_back();
+        else if (!shorter.starter.empty())
+            shorter.starter.clear();
+        else if (!shorter.relationship.empty())
+            shorter.relationship.clear();
+        else
+            return std::string();
+
+        return EncodeSocialContext(shorter);
+    }
+
+    return out;
+}
+
 std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
 {
     if (subject.empty())

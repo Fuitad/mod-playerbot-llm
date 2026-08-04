@@ -257,7 +257,7 @@ namespace
          */
         bool Submit(uint64 requestToken, uint64 botGuidCounter, uint64 targetGuidCounter,
                     PlayerbotSocialChannel channel, std::string const& threadPublicId,
-                    std::string const& starterSubject) override
+                    PlayerbotSocialRequestContext const& context) override
         {
             if (!_socialTransport || !_bridge)
                 return false;
@@ -275,14 +275,16 @@ namespace
             request.threadPublicId = threadPublicId;
 
             /*
-             * The starter's subject, and empty for a reply, where the thread is the subject.
+             * Everything the coordinator selected for this line: who the bot is, how it feels about
+             * the listener, and what it may remember about them. The starter's subject rides in the
+             * same value and is empty for a reply, where the thread is the subject.
              *
-             * It travels as the assembled context shape rather than as loose text in the same
-             * field. The two are not interchangeable: a context that does not parse is dropped on
-             * every channel but a whisper, so a raw subject would reach the prompt nowhere on
-             * General, which is the only surface a starter speaks on.
+             * It travels as the assembled context shape rather than as loose text: a context that
+             * does not parse is dropped on every channel but a whisper, so anything sent in another
+             * shape would reach the prompt nowhere on General, which is the only surface a starter
+             * speaks on.
              */
-            request.context = ClaudeChat::EncodeStarterContext(starterSubject);
+            request.context = ClaudeChat::EncodeSocialContext(context);
 
             /*
              * The subject is left fully absent when it cannot be resolved, never half described. A
@@ -300,12 +302,6 @@ namespace
                 }
             }
 
-            /*
-             * SHORTCUT: the context is empty, so the sidecar generates from the persona and the
-             * thread identity alone. Task 10 owns the typed prompt and is what fills it with the
-             * effective persona, the relationship, the bounded thread, and privacy filtered memory.
-             * Upgrade trigger: Task 10's prompt assembly landing.
-             */
             return _socialTransport->Submit(request);
         }
 

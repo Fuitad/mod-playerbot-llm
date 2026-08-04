@@ -2423,3 +2423,81 @@ TEST(ClaudeChatSocialProtocolTest, AMemoryReplyThatDisagreesWithItsOwnCountIsRef
                                                         SOCIAL_TOKEN, 91, 500)
                      .has_value());
 }
+
+// Task 15A: the whole assembled context on the wire ---------------------------------------------
+
+TEST(ClaudeChatSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSideDeclares)
+{
+    /*
+     * The far side forbids unknown keys and rejects the whole context when one appears, so this
+     * encoder and `SocialContext` are one contract with two spellings. Every field it declares is
+     * emitted under exactly that name, and nothing else is.
+     */
+    PlayerbotSocialRequestContext context;
+    context.persona = "speaks wry, reserved toward this listener";
+    context.relationship = "familiarity 0.80, affinity 0.60, trust 0.40";
+    context.starter = "the harvest golems are out again";
+    context.memories.push_back({"runs the same dungeon every night", PlayerbotSocialPrivacyScope::Public});
+    context.memories.push_back({"asked about the auction house", PlayerbotSocialPrivacyScope::Party});
+
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+
+    EXPECT_NE(encoded.find("\"persona\":\"speaks wry, reserved toward this listener\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"relationship\":\"familiarity 0.80, affinity 0.60, trust 0.40\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"starter\":\"the harvest golems are out again\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"memories\":["), std::string::npos);
+    EXPECT_NE(encoded.find("\"scope\":\"public\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"scope\":\"party\""), std::string::npos);
+    EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnEmptyAssembledContextEncodesToNothingRatherThanToAnEmptyObject)
+{
+    /*
+     * "Nothing was assembled" already has a spelling, and it is the empty string: that is what the
+     * transport bounds against and what the far side reads as absent. Emitting `{}` instead would
+     * spend bytes to say the same thing and would make an unfilled context indistinguishable from
+     * one that parsed to no fields.
+     */
+    EXPECT_EQ(ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext()), "");
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnAssembledContextOmitsTheFieldsThatHaveNothingInThem)
+{
+    /*
+     * An empty field is not the same as an absent one to a prompt builder: it fences a heading with
+     * nothing under it. Emitting only what was assembled also keeps the payload inside its bound
+     * without any field having to be dropped.
+     */
+    PlayerbotSocialRequestContext context;
+    context.persona = "speaks earnest, neutral toward this listener";
+
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+
+    EXPECT_NE(encoded.find("\"persona\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"relationship\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"starter\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"memories\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"nearby\":"), std::string::npos);
+    EXPECT_EQ(encoded.find("\"thread\":"), std::string::npos);
+}
+
+TEST(ClaudeChatSocialProtocolTest, AnAssembledContextStaysWithinTheWholeContextBound)
+{
+    /*
+     * Each entry is bounded by its producer, but twelve bounded memories plus a persona and a
+     * relationship can still exceed the total. The far side refuses an oversized context outright,
+     * so exceeding the bound is not a longer prompt, it is a bot that says nothing.
+     */
+    PlayerbotSocialRequestContext context;
+    context.persona = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'p');
+    context.relationship = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'r');
+    for (int index = 0; index < 12; ++index)
+        context.memories.push_back({std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
+                                    PlayerbotSocialPrivacyScope::Public});
+
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+
+    EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+    EXPECT_NE(encoded.find("\"persona\":"), std::string::npos) << "the persona is never the field dropped";
+}
