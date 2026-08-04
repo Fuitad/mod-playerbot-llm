@@ -161,6 +161,25 @@ namespace ClaudeChat
     inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512;
 
     /*
+     * The most entries one list inside the context may carry, mirroring the sidecar's
+     * MAX_SOCIAL_CONTEXT_ENTRIES. A longer list is refused there rather than trimmed.
+     */
+    inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRIES = 12;
+
+    /*
+     * The producer in mod-playerbots bounds every value it assembles, and this encoder bounds every
+     * value it writes. Two independent bounds are correct, and two DIFFERENT bounds are a producer
+     * emitting something this encoder silently shortens, so the disagreement is a build failure
+     * rather than a behaviour nobody notices.
+     */
+    static_assert(MAX_SOCIAL_CONTEXT_BYTES == PLAYERBOT_SOCIAL_CONTEXT_BYTES,
+                  "the whole context bound must match the producer's");
+    static_assert(MAX_SOCIAL_CONTEXT_ENTRY_BYTES == PLAYERBOT_SOCIAL_CONTEXT_ENTRY_BYTES,
+                  "the per entry bound must match the producer's");
+    static_assert(MAX_SOCIAL_CONTEXT_ENTRIES == PLAYERBOT_SOCIAL_CONTEXT_ENTRIES,
+                  "the per list bound must match the producer's");
+
+    /*
      * At most one regeneration for a fresh invalid response.
      *
      * A sidecar that keeps returning malformed output would otherwise be retried indefinitely on
