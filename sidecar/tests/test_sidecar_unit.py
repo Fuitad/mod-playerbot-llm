@@ -414,6 +414,15 @@ def make_request_model(**overrides: object) -> protocol.ChatRequest:
     return protocol.parse_request(json.dumps(data).encode(), TEST_TOKEN)
 
 
+def test_the_legacy_chat_prompt_also_models_an_mmo_player() -> None:
+    system = claude.build_system_prompt(make_request_model())
+
+    assert "ordinary player" in system
+    assert "not roleplaying" in system
+    assert "speaking in character" not in system
+    assert "adventurer in the world of Azeroth" not in system
+
+
 def messages_response(message_text: str, usage: dict[str, int] | None = None) -> httpx.Response:
     body = {
         "id": "msg_test_01",
@@ -1894,6 +1903,17 @@ def test_the_social_system_prompt_carries_no_untrusted_text() -> None:
     assert "a private whisper" in system
 
 
+def test_the_social_system_prompt_models_an_mmo_player_not_an_azeroth_roleplayer() -> None:
+    request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
+
+    system = claude.build_social_system_prompt(request)
+
+    assert "ordinary player" in system
+    assert "not roleplaying" in system
+    assert "speaking in character" not in system
+    assert "adventurer in the world of Azeroth" not in system
+
+
 def test_an_absent_context_is_stated_rather_than_left_as_an_empty_fence() -> None:
     # Task 8's transport sends an empty context today, so this is the live shape.
     request = protocol.parse_social_request(_social_request_payload(context=""), TEST_TOKEN)
@@ -2220,8 +2240,8 @@ def test_a_starter_keeps_the_speaking_bots_own_point_of_view() -> None:
 
     system = claude.build_social_system_prompt(request)
 
-    assert "STARTER describes your own experience or possession" in system
-    assert "Do not turn it into something another character did or owns" in system
+    assert "STARTER describes your own gameplay experience or possession" in system
+    assert "Do not turn it into something another player did or owns" in system
     assert "standalone opening" in system
     assert "Do not imply that somebody already mentioned the subject" in system
 
@@ -2921,14 +2941,14 @@ def test_a_name_is_capped_at_the_length_the_game_allows() -> None:
 
 def _acceptable_biography_reply() -> claude.BiographyReply:
     return claude.BiographyReply(
-        origin="grew up in a mining camp in the foothills",
-        motivation="wants to earn enough to reopen the family forge",
-        formative_experience="was buried in a collapsed shaft for two days",
-        interests="ore, quiet taverns, well made tools",
-        aversions="cave ins, boastful strangers",
-        preferred_topics="mining, smithing, the weather",
-        mannerisms="taps a hammer while thinking",
-        values="a debt repaid is a debt remembered",
+        origin="usually levels through quests while gathering materials",
+        motivation="wants steady upgrades without rushing to the level cap",
+        formative_experience="learned dungeon pulls by watching patient groups",
+        interests="mining, dungeons, comparing gear",
+        aversions="loot drama, reckless pulls",
+        preferred_topics="builds, professions, dungeon routes",
+        mannerisms="keeps messages short and uses dry jokes",
+        values="prepared groups and fair loot",
     )
 
 
@@ -2941,6 +2961,9 @@ def test_a_biography_prompt_tells_the_bot_who_it_actually_is() -> None:
     assert "Dwarf" in prompt
     assert "Warrior" in prompt
     assert "male" in prompt
+    assert "player profile" in prompt
+    assert "not an in-world backstory" in prompt
+    assert "Write a compact backstory" not in prompt
 
 
 def test_an_unknown_race_or_class_is_refused_rather_than_named() -> None:

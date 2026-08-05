@@ -585,7 +585,7 @@ def declared_kind(payload: bytes) -> str | None:
 
 
 class BiographyRequest(BaseModel):
-    """A request for one bot's backstory.
+    """A request for one bot's stable player-style social profile.
 
     Carries the identity rather than asking for it. Name, race, class and gender are
     authoritative character data, and `BiographyReply` deliberately has nowhere to put them, so

@@ -432,7 +432,7 @@ class SidecarService:
             return None
 
     async def _process_biography_payload(self, payload: bytes) -> bytes | None:
-        """One bot's backstory, which nobody is waiting on.
+        """One bot's player profile, which nobody is waiting on.
 
         Silence is the only failure answer. A biography is generated once and kept, so there is
         nothing to regenerate against and no conversation to fall out of; the coordinator's own
@@ -581,7 +581,7 @@ class SidecarService:
             max_cost_nano = budget.conservative_max_cost_nano(
                 input_tokens, claude.BIOGRAPHY_MAX_OUTPUT_TOKENS, *input_prices
             )
-            # The background lane, deliberately. Nobody is waiting on a backstory, so it must
+            # The background lane, deliberately. Nobody is waiting on a player profile, so it must
             # never spend the slice held for a player who just said something and is watching
             # for an answer. This is Key Decision 2 expressed where it is actually enforced.
             decision, reservation = await store.reserve(
@@ -598,7 +598,7 @@ class SidecarService:
             try:
                 fields, usage = await asyncio.to_thread(self._adapter.generate_biography, request)
             except claude.ClaudeError as error:
-                # Covers a refused backstory as well as a provider failure. Both were billed if
+                # Covers a refused player profile as well as a provider failure. Both were billed if
                 # the model ran, both are settled, and both leave the coordinator to time the
                 # request out rather than being told to try again immediately: a bot that just
                 # produced a forbidden claim is not more likely to behave on the next attempt.
