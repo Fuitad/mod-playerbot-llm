@@ -2222,6 +2222,8 @@ def test_a_starter_keeps_the_speaking_bots_own_point_of_view() -> None:
 
     assert "STARTER describes your own experience or possession" in system
     assert "Do not turn it into something another character did or owns" in system
+    assert "standalone opening" in system
+    assert "Do not imply that somebody already mentioned the subject" in system
 
 
 # Biography and memory extraction ---------------------------------------------------------
