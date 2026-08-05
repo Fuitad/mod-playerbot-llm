@@ -137,6 +137,51 @@ SOCIAL_MEMORY_SCOPES = ("public", "party", "whisper")
 SOCIAL_CHANNEL_MEMORY_SCOPE = (0, 0, 1, 2)
 
 MAX_SOCIAL_CONTEXT_ENTRIES = 12
+FICTIONAL_IDENTITY_COUNTRIES = (
+    "United States",
+    "Canada",
+    "Mexico",
+    "Australia",
+    "New Zealand",
+    "Singapore",
+    "Malaysia",
+    "Thailand",
+    "Indonesia",
+    "Philippines",
+    "Brazil",
+    "Argentina",
+    "Chile",
+    "Colombia",
+    "Peru",
+    "Uruguay",
+    "Ecuador",
+    "Costa Rica",
+    "Panama",
+    "Guatemala",
+    "United Kingdom",
+    "Germany",
+    "France",
+    "Netherlands",
+    "Belgium",
+    "Ireland",
+    "Denmark",
+    "Sweden",
+    "Norway",
+    "Finland",
+    "Iceland",
+    "Spain",
+    "Italy",
+    "Portugal",
+    "Greece",
+    "Poland",
+    "Austria",
+    "Switzerland",
+    "Czechia",
+    "Hungary",
+    "Romania",
+    "Slovakia",
+    "Ukraine",
+)
 
 # The most memories one finished conversation may yield. Matches
 # PLAYERBOT_SOCIAL_MAX_EXTRACTED_MEMORIES on the worldserver. A dozen turns among a few people
@@ -497,6 +542,9 @@ class SocialContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     persona: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
+    fictional_identity_request: Literal["age", "home_country", "age_and_home_country"] | None = None
+    fictional_age: Annotated[int, Field(ge=18, le=65)] | None = None
+    fictional_home_country: Annotated[str, StringConstraints(min_length=1, max_length=32)] | None = None
     relationship: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
     starter: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
     nearby: Annotated[
@@ -508,6 +556,27 @@ class SocialContext(BaseModel):
         Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
     ] = []
     memories: Annotated[list[SocialMemory], Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES)] = []
+
+    @model_validator(mode="after")
+    def fictional_identity_is_coherent(self) -> Self:
+        """Facts are optional only when the matching request was withheld."""
+
+        request = self.fictional_identity_request
+        if request is None:
+            if self.fictional_age is not None or self.fictional_home_country is not None:
+                raise ValueError("fictional identity facts require a request marker")
+            return self
+
+        if self.fictional_age is not None and request not in {"age", "age_and_home_country"}:
+            raise ValueError("fictional age does not match the request marker")
+
+        if self.fictional_home_country is not None:
+            if request not in {"home_country", "age_and_home_country"}:
+                raise ValueError("fictional home country does not match the request marker")
+            if self.fictional_home_country not in FICTIONAL_IDENTITY_COUNTRIES:
+                raise ValueError("fictional home country is not in the approved roster")
+
+        return self
 
     def memories_within(self, channel: int) -> list[SocialMemory]:
         """The memories this channel may draw on, most private allowed first computed.

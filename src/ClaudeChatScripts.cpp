@@ -270,7 +270,7 @@ namespace
             request.socialRequestToken = requestToken;
             request.bot.guidCounter = botGuidCounter;
             request.bot.name = bot->GetName();
-            request.bot.human = false;
+            request.bot.human = !GET_PLAYERBOT_AI(bot);
             request.speakOnChannel = static_cast<uint8>(channel);
             request.threadPublicId = threadPublicId;
 

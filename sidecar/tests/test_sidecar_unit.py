@@ -2006,6 +2006,20 @@ async def test_rejected_output_asks_for_a_regeneration_rather_than_going_silent(
     assert store.outstanding == {}
 
 
+async def test_contradictory_identity_output_uses_the_existing_regeneration_path(tmp_path) -> None:
+    service, _, adapter = make_stored_service(tmp_path)
+    adapter.social_reply = "I'm 30."
+    context = _context(fictional_identity_request="age", fictional_age=29)
+
+    answer = await service.process_payload(_social_request_payload(context=context))
+
+    assert answer is not None
+    decoded = json.loads(answer)
+    assert decoded["regenerate"] == 1
+    assert decoded["message"] == ""
+    assert len(adapter.social_requests) == 1
+
+
 def test_an_emote_is_chosen_from_a_closed_vocabulary_not_invented() -> None:
     """The model names a gesture; the sidecar owns the number.
 
@@ -2087,6 +2101,190 @@ def _context(**overrides: object) -> str:
     }
     body.update(overrides)
     return json.dumps(body)
+
+
+def test_fictional_identity_context_accepts_one_coherent_approved_group() -> None:
+    context = protocol.parse_social_context(
+        _context(
+            fictional_identity_request="age_and_home_country",
+            fictional_age=29,
+            fictional_home_country="Canada",
+        )
+    )
+
+    assert context is not None
+    assert context.fictional_identity_request == "age_and_home_country"
+    assert context.fictional_age == 29
+    assert context.fictional_home_country == "Canada"
+
+
+def test_fictional_identity_context_enforces_the_complete_wire_contract() -> None:
+    coherent = (
+        {"fictional_identity_request": "age"},
+        {"fictional_identity_request": "age", "fictional_age": 18},
+        {"fictional_identity_request": "age", "fictional_age": 65},
+        {"fictional_identity_request": "home_country"},
+        {"fictional_identity_request": "home_country", "fictional_home_country": "Canada"},
+        {"fictional_identity_request": "age_and_home_country"},
+        {"fictional_identity_request": "age_and_home_country", "fictional_age": 29},
+        {
+            "fictional_identity_request": "age_and_home_country",
+            "fictional_home_country": "Canada",
+        },
+        {
+            "fictional_identity_request": "age_and_home_country",
+            "fictional_age": 29,
+            "fictional_home_country": "Canada",
+        },
+    )
+    for identity in coherent:
+        assert protocol.parse_social_context(_context(**identity)) is not None
+
+    for country in protocol.FICTIONAL_IDENTITY_COUNTRIES:
+        assert (
+            protocol.parse_social_context(
+                _context(
+                    fictional_identity_request="home_country",
+                    fictional_home_country=country,
+                )
+            )
+            is not None
+        )
+
+    invalid = (
+        {"fictional_identity_request": "age", "fictional_age": 17},
+        {"fictional_identity_request": "age", "fictional_age": 66},
+        {"fictional_identity_request": "location"},
+        {"fictional_age": 29},
+        {"fictional_home_country": "Canada"},
+        {"fictional_identity_request": "home_country", "fictional_age": 29},
+        {"fictional_identity_request": "age", "fictional_home_country": "Canada"},
+        {"fictional_identity_request": "home_country", "fictional_home_country": "canada"},
+        {"fictional_identity_request": "home_country", "fictional_home_country": "Atlantis"},
+        {
+            "fictional_identity_request": "home_country",
+            "fictional_home_country": "A" * 33,
+        },
+        {"fictional_identity_request": "age", "unknown": "stowaway"},
+    )
+    for identity in invalid:
+        assert protocol.parse_social_context(_context(**identity)) is None
+
+
+def test_approved_fictional_identity_is_trusted_and_never_rendered_as_player_context() -> None:
+    request = protocol.parse_social_request(
+        _social_request_payload(
+            context=_context(
+                fictional_identity_request="age_and_home_country",
+                fictional_age=29,
+                fictional_home_country="Canada",
+            )
+        ),
+        TEST_TOKEN,
+    )
+
+    system = claude.build_social_system_prompt(request)
+    user = claude.build_social_user_message(request)
+
+    assert "fictional player identity" in system.casefold()
+    assert "29" in system
+    assert "Canada" in system
+    assert "city" in system
+    assert "nationality" in system
+    assert "29" not in user
+    assert "Canada" not in user
+
+
+def test_malformed_reserved_identity_context_is_dropped_on_every_channel() -> None:
+    malformed_contexts = (
+        json.dumps(
+            {
+                "fictional_identity_request": "age",
+                "fictional_age": 29,
+                "unknown": "stowaway",
+            }
+        ),
+        json.dumps({"fictional_age": 29}),
+        '{"fictional_identity_request":"home_country","fictional_home_country":"Canada"',
+        json.dumps(
+            {
+                "fictional_identity_request": "home_country",
+                "fictional_home_country": "Atlantis" * 20,
+            }
+        ),
+    )
+
+    for channel in range(protocol.SOCIAL_CHANNEL_COUNT):
+        for context in malformed_contexts:
+            request = protocol.parse_social_request(
+                _social_request_payload(speak_on_channel=channel, context=context), TEST_TOKEN
+            )
+            system = claude.build_social_system_prompt(request)
+            user = claude.build_social_user_message(request)
+
+            assert "29" not in system + user
+            assert "Canada" not in system + user
+            assert "Atlantis" not in system + user
+
+
+def test_identity_output_gate_requires_approved_facts_and_rejects_substitutions() -> None:
+    def request_for(**identity: object) -> protocol.SocialRequest:
+        return protocol.parse_social_request(
+            _social_request_payload(context=_context(**identity)), TEST_TOKEN
+        )
+
+    approved_age = request_for(fictional_identity_request="age", fictional_age=29)
+    assert claude.validate_social_message("I'm 29.", approved_age) == "I'm 29."
+    assert claude.validate_social_message("I am 29 years old.", approved_age) == "I am 29 years old."
+
+    approved_country = request_for(fictional_identity_request="home_country", fictional_home_country="Canada")
+    assert claude.validate_social_message("I'm from Canada.", approved_country) == "I'm from Canada."
+
+    age_withheld = request_for(fictional_identity_request="age")
+    country_withheld = request_for(fictional_identity_request="home_country")
+    both_withheld = request_for(fictional_identity_request="age_and_home_country")
+    for request in (age_withheld, country_withheld, both_withheld):
+        assert claude.validate_social_message("I'd rather keep that private.", request) == (
+            "I'd rather keep that private."
+        )
+
+    mixed = request_for(fictional_identity_request="age_and_home_country", fictional_age=29)
+    assert claude.validate_social_message("I'm 29, but I'm not saying where.", mixed) == (
+        "I'm 29, but I'm not saying where."
+    )
+    assert claude.validate_social_message("I'm 29 and I'm not saying where.", mixed) == (
+        "I'm 29 and I'm not saying where."
+    )
+
+    both_approved = request_for(
+        fictional_identity_request="age_and_home_country",
+        fictional_age=29,
+        fictional_home_country="Canada",
+    )
+    assert claude.validate_social_message("I'm 29 and I'm from Canada.", both_approved) == (
+        "I'm 29 and I'm from Canada."
+    )
+
+    rejected = (
+        ("I'm 30.", approved_age),
+        ("Not telling you.", approved_age),
+        ("I'm from France.", approved_country),
+        ("I'm from Canada, not France.", approved_country),
+        ("I'm from Toronto.", approved_country),
+        ("I'm Canadian.", approved_country),
+        ("Keeping that private.", approved_country),
+        ("I'm 29.", age_withheld),
+        ("I'm from Canada.", country_withheld),
+        ("Not Canada.", country_withheld),
+        ("I'm 29 and I'm from Canada.", both_withheld),
+        ("I'm 29 and I'm from Toronto.", mixed),
+        ("I'm 29 and Canadian.", mixed),
+        ("I'm 29.", both_approved),
+    )
+    for message, request in rejected:
+        with pytest.raises(claude.ClaudeInvalidOutputError) as caught:
+            claude.validate_social_message(message, request)
+        assert caught.value.category == claude.ModerationCategory.FICTIONAL_IDENTITY
 
 
 def test_a_public_channel_never_sees_a_private_memory() -> None:
@@ -2596,6 +2794,7 @@ def test_a_rejection_names_an_objective_category() -> None:
         "emote_channel_illegal",
         "unknown_subject",
         "scope_mismatch",
+        "fictional_identity",
     }
 
 
@@ -2670,6 +2869,11 @@ def test_every_moderation_category_is_reachable() -> None:
 
     record(lambda: claude.validate_social_message("kill yourself", request))
     record(lambda: claude.validate_social_message("Deszy Deszy Deszy Deszy", request))
+    identity_request = protocol.parse_social_request(
+        _social_request_payload(context=_context(fictional_identity_request="age", fictional_age=29)),
+        TEST_TOKEN,
+    )
+    record(lambda: claude.validate_social_message("I'm 30.", identity_request))
 
     # BOTH_ANSWERS is raised inside generate_social_reply, which needs a provider, so it is
     # named here rather than exercised: the parametrized adapter tests cover that path.

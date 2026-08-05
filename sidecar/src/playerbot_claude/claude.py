@@ -69,6 +69,12 @@ SOCIAL_EMOTE_CHANNELS = protocol.SOCIAL_EMOTE_CHANNELS
 # because there is nothing more private for it to leak into.
 _WHISPER_CHANNEL = 3
 
+_FICTIONAL_IDENTITY_KEYS = (
+    "fictional_identity_request",
+    "fictional_age",
+    "fictional_home_country",
+)
+
 
 @dataclass(frozen=True)
 class UsageTotals:
@@ -147,6 +153,7 @@ class ModerationCategory(StrEnum):
     EMOTE_CHANNEL_ILLEGAL = "emote_channel_illegal"
     UNKNOWN_SUBJECT = "unknown_subject"
     SCOPE_MISMATCH = "scope_mismatch"
+    FICTIONAL_IDENTITY = "fictional_identity"
 
 
 class ClaudeInvalidOutputError(ClaudeError):
@@ -283,11 +290,45 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
             "characters, in `message`. Leave `emote` empty.\n"
         )
 
+    context = protocol.parse_social_context(request.context)
+    identity_rules = ""
+    if context is not None and context.fictional_identity_request is not None:
+        rules = ["Fictional player identity for this directly requested reply:"]
+        if context.fictional_identity_request in {"age", "age_and_home_country"}:
+            if context.fictional_age is None:
+                rules.append(
+                    "- Your fictional age was withheld. Decline or deflect without claiming any age."
+                )
+            else:
+                rules.append(
+                    f"- Your fictional age is exactly {context.fictional_age}. State that exact "
+                    "age, not a range."
+                )
+
+        if context.fictional_identity_request in {"home_country", "age_and_home_country"}:
+            if context.fictional_home_country is None:
+                rules.append(
+                    "- Your fictional home country was withheld. Decline or deflect without "
+                    "claiming any origin."
+                )
+            else:
+                rules.append(
+                    "- Your fictional home country is exactly "
+                    f"{context.fictional_home_country}. State that exact country."
+                )
+
+        rules.append(
+            "- Never substitute another age, country, city, region, nationality, ethnicity, "
+            "or other personal detail."
+        )
+        identity_rules = "\n".join(rules) + "\n"
+
     return (
         f"You are {request.bot_name}, an ordinary player on a Wrath of the Lich King MMORPG "
         f"server, chatting over {channel}. {audience}\n"
         "Rules:\n"
         f"{answer_rule}"
+        f"{identity_rules}"
         "- Speak like a person playing the game, not roleplaying an Azeroth character. Use normal "
         "contemporary MMO chat, contractions, and game terms where they fit.\n"
         "- You cannot perform any game action: no movement, combat, casting, trading, or item use. "
@@ -295,8 +336,9 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         "- Gameplay goals, mechanics, quests, dungeons, gear, professions, travel, jokes, banter, "
         "and the occasional mild curse are welcome. Treat lore as game content, never as your "
         "personal history.\n"
-        "- Do not invent real-world personal details such as a legal name, age, job, family, "
-        "location, contact information, or credentials.\n"
+        "- Apart from a fictional age or home country explicitly supplied above, do not invent "
+        "real-world personal details such as a legal name, age, job, family, location, contact "
+        "information, or credentials.\n"
         "- A STARTER describes your own gameplay experience or possession. Keep its point of view. "
         "Do not turn it into something another player did or owns. Treat it as a standalone opening. "
         "Do not imply that somebody already mentioned the subject.\n"
@@ -364,10 +406,17 @@ def build_social_user_message(request: protocol.SocialRequest) -> str:
         A context that did not parse has NOT been through `memories_within`, so nothing in it
         is known to be safe for this channel. On a public channel it is dropped: the cost is a
         blander line, and the alternative is a bot repeating a whisper to a zone because a
-        producer changed shape. A whisper has nothing more private to leak into, so it still
-        gets the text.
+        producer changed shape. A whisper has nothing more private to leak into, so ordinary
+        opaque text still reaches it. Reserved fictional identity keys are different: a malformed
+        typed group may contain a fact the worldserver meant to withhold, so it is dropped on every
+        channel rather than carried through as text.
         """
-        opaque = request.context if request.speak_on_channel == _WHISPER_CHANNEL else ""
+        has_reserved_identity_key = any(key in request.context for key in _FICTIONAL_IDENTITY_KEYS)
+        opaque = (
+            request.context
+            if request.speak_on_channel == _WHISPER_CHANNEL and not has_reserved_identity_key
+            else ""
+        )
         lines += _fenced("CONTEXT", opaque or "(nothing was supplied)")
         return "\n".join(lines).rstrip()
 
@@ -785,6 +834,106 @@ _SOCIAL_LEAK_MARKERS = (
 # SHAPE, and the coordinator has its own burst check for the same reason.
 _SOCIAL_STRUCTURE_MARKERS = ("```", "###", "</", "/>")
 
+_FIRST_PERSON_AGE = re.compile(
+    r"\b(?:i(?:'m|\s+am)|my\s+age\s+is)\s+(\d{1,3})(?:\s+years?\s+old)?\b",
+    re.IGNORECASE,
+)
+_YEARS_OLD_AGE = re.compile(r"\b(\d{1,3})\s+years?\s+old\b", re.IGNORECASE)
+_FIRST_PERSON_ORIGIN = re.compile(
+    r"\b(?:i(?:'m|\s+am)\s+from|i\s+come\s+from|my\s+home\s+country\s+is)\s+"
+    r"([^,.;!?]+?)(?=\s+(?:and|but)\b|[,.;!?]|$)",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_COPULA = re.compile(r"\bi(?:'m|\s+am)\s+([^,.;!?]+)", re.IGNORECASE)
+_ROSTER_COUNTRY = re.compile(
+    r"(?<![a-z])("
+    + "|".join(re.escape(country.casefold()) for country in protocol.FICTIONAL_IDENTITY_COUNTRIES)
+    + r")(?![a-z])"
+)
+_IDENTITY_DEFLECTION_PREFIXES = (
+    "not ",
+    "keeping ",
+    "keep ",
+    "rather ",
+    "private",
+    "uncomfortable ",
+    "sorry",
+    "going to ",
+    "gonna ",
+    "telling ",
+    "saying ",
+    "sharing ",
+    "answering ",
+    "discussing ",
+)
+
+
+def _asserted_ages(message: str) -> set[int]:
+    return {
+        int(match.group(1))
+        for pattern in (_FIRST_PERSON_AGE, _YEARS_OLD_AGE)
+        for match in pattern.finditer(message)
+    }
+
+
+def _asserted_origins(message: str) -> list[str]:
+    return [match.group(1).strip().casefold() for match in _FIRST_PERSON_ORIGIN.finditer(message)]
+
+
+def _mentioned_roster_countries(message: str) -> set[str]:
+    return {match.group(1) for match in _ROSTER_COUNTRY.finditer(message.casefold())}
+
+
+def _has_copular_identity_substitution(message: str) -> bool:
+    for match in _FIRST_PERSON_COPULA.finditer(message):
+        for clause in re.split(r"\s+(?:and|but)\s+", match.group(1).strip().casefold()):
+            background = re.sub(r"^i(?:'m|\s+am)\s+", "", clause)
+            if background.startswith("from "):
+                continue
+            if re.fullmatch(r"\d{1,3}(?:\s+years?\s+old)?", background):
+                continue
+            if background.startswith(_IDENTITY_DEFLECTION_PREFIXES):
+                continue
+            return True
+    return False
+
+
+def _validate_fictional_identity(
+    message: str,
+    context: protocol.SocialContext,
+    usage: UsageTotals | None,
+) -> None:
+    request = context.fictional_identity_request
+    if request is None:
+        return
+
+    invalid = False
+    if request in {"age", "age_and_home_country"}:
+        ages = _asserted_ages(message)
+        if context.fictional_age is None:
+            invalid = bool(ages)
+        else:
+            invalid = ages != {context.fictional_age}
+
+    if request in {"home_country", "age_and_home_country"}:
+        origins = _asserted_origins(message)
+        mentioned_countries = _mentioned_roster_countries(message)
+        copular_substitution = _has_copular_identity_substitution(message)
+        if context.fictional_home_country is None:
+            invalid = invalid or bool(origins) or bool(mentioned_countries) or copular_substitution
+        else:
+            approved = context.fictional_home_country.casefold()
+            invalid = (
+                invalid or origins != [approved] or mentioned_countries != {approved} or copular_substitution
+            )
+
+    if invalid:
+        raise ClaudeInvalidOutputError(
+            "social message contradicted fictional identity",
+            usage,
+            ModerationCategory.FICTIONAL_IDENTITY,
+        )
+
 
 def validate_social_message(
     message: str, request: protocol.SocialRequest, usage: UsageTotals | None = None
@@ -851,6 +1000,10 @@ def validate_social_message(
         raise ClaudeInvalidOutputError(
             "social message was formatted as a transcript", usage, ModerationCategory.TRANSCRIPT
         )
+
+    context = protocol.parse_social_context(request.context)
+    if context is not None:
+        _validate_fictional_identity(message, context, usage)
 
     return message
 

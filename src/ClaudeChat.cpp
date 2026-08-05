@@ -900,7 +900,7 @@ bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string
     if (!BridgeTokenIsUsable(token))
         return false;
 
-    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot))
+    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot) || request.bot.human)
         return false;
 
     /*
@@ -1074,6 +1074,50 @@ namespace
         }
         out += ']';
     }
+
+    std::optional<std::string> EncodeFictionalIdentity(
+        PlayerbotFictionalIdentityPromptContext const& identity)
+    {
+        bool const hasAge = identity.age.has_value();
+        bool const hasCountry = identity.homeCountry.has_value();
+        std::string requestName;
+
+        switch (identity.request)
+        {
+            case PlayerbotFictionalIdentityRequest::None:
+                return hasAge || hasCountry ? std::nullopt : std::optional<std::string>(std::string());
+            case PlayerbotFictionalIdentityRequest::Age:
+                if (hasCountry)
+                    return std::nullopt;
+                requestName = "age";
+                break;
+            case PlayerbotFictionalIdentityRequest::HomeCountry:
+                if (hasAge)
+                    return std::nullopt;
+                requestName = "home_country";
+                break;
+            case PlayerbotFictionalIdentityRequest::AgeAndHomeCountry:
+                requestName = "age_and_home_country";
+                break;
+            default:
+                return std::nullopt;
+        }
+
+        if (hasAge && (*identity.age < PLAYERBOT_FICTIONAL_IDENTITY_MIN_AGE ||
+                       *identity.age > PLAYERBOT_FICTIONAL_IDENTITY_MAX_AGE))
+            return std::nullopt;
+
+        if (hasCountry && !PlayerbotFictionalIdentity::IsApprovedCountry(*identity.homeCountry))
+            return std::nullopt;
+
+        std::string encoded;
+        AppendJsonField(encoded, "fictional_identity_request", requestName, true);
+        if (hasAge)
+            AppendJsonField(encoded, "fictional_age", static_cast<uint64>(*identity.age));
+        if (hasCountry)
+            AppendJsonField(encoded, "fictional_home_country", *identity.homeCountry);
+        return encoded;
+    }
 }
 
 std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
@@ -1099,6 +1143,16 @@ std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const&
     };
 
     appendEntry("persona", context.persona);
+
+    std::optional<std::string> const identity = EncodeFictionalIdentity(context.fictionalIdentity);
+    if (identity && !identity->empty())
+    {
+        if (!first)
+            out += ',';
+        out += *identity;
+        first = false;
+    }
+
     appendEntry("relationship", context.relationship);
     appendEntry("starter", context.starter);
 

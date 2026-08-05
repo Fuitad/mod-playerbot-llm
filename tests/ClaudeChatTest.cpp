@@ -1215,6 +1215,7 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
          std::initializer_list<std::pair<char const*, void (*)(ClaudeChat::SocialRequest&)>>{
              {"no token", [](ClaudeChat::SocialRequest& r) { r.socialRequestToken = 0; }},
              {"unusable bot", [](ClaudeChat::SocialRequest& r) { r.bot.guidCounter = 0; }},
+             {"human bot", [](ClaudeChat::SocialRequest& r) { r.bot.human = true; }},
              {"unusable subject", [](ClaudeChat::SocialRequest& r) { r.subject.name = std::string(200, 'a'); }},
              {"empty thread", [](ClaudeChat::SocialRequest& r) { r.threadPublicId.clear(); }},
              {"long thread",
@@ -2449,6 +2450,116 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSide
     EXPECT_NE(encoded.find("\"scope\":\"public\""), std::string::npos);
     EXPECT_NE(encoded.find("\"scope\":\"party\""), std::string::npos);
     EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+}
+
+TEST(ClaudeChatSocialProtocolTest, FictionalIdentitySerializesAsOneCoherentApprovedOrWithheldGroup)
+{
+    PlayerbotSocialRequestContext approved;
+    approved.persona = "speaks wry, receptive toward this listener";
+    approved.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::AgeAndHomeCountry;
+    approved.fictionalIdentity.age = 29;
+    approved.fictionalIdentity.homeCountry = "Canada";
+
+    std::string const approvedJson = ClaudeChat::EncodeSocialContext(approved);
+    EXPECT_NE(approvedJson.find("\"fictional_identity_request\":\"age_and_home_country\""),
+              std::string::npos);
+    EXPECT_NE(approvedJson.find("\"fictional_age\":29"), std::string::npos);
+    EXPECT_NE(approvedJson.find("\"fictional_home_country\":\"Canada\""), std::string::npos);
+
+    PlayerbotSocialRequestContext withheld;
+    withheld.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::HomeCountry;
+
+    std::string const withheldJson = ClaudeChat::EncodeSocialContext(withheld);
+    EXPECT_NE(withheldJson.find("\"fictional_identity_request\":\"home_country\""), std::string::npos);
+    EXPECT_EQ(withheldJson.find("fictional_age"), std::string::npos);
+    EXPECT_EQ(withheldJson.find("fictional_home_country"), std::string::npos);
+}
+
+TEST(ClaudeChatSocialProtocolTest, InvalidFictionalIdentityGroupsFailClosedAtomically)
+{
+    auto expectIdentityOmitted = [](PlayerbotFictionalIdentityPromptContext identity)
+    {
+        PlayerbotSocialRequestContext context;
+        context.persona = "speaks earnest";
+        context.fictionalIdentity = std::move(identity);
+
+        std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+        EXPECT_NE(encoded.find("\"persona\":"), std::string::npos);
+        EXPECT_EQ(encoded.find("fictional_identity_request"), std::string::npos);
+        EXPECT_EQ(encoded.find("fictional_age"), std::string::npos);
+        EXPECT_EQ(encoded.find("fictional_home_country"), std::string::npos);
+    };
+
+    PlayerbotFictionalIdentityPromptContext invalidAge;
+    invalidAge.request = PlayerbotFictionalIdentityRequest::Age;
+    invalidAge.age = 17;
+    expectIdentityOmitted(invalidAge);
+    invalidAge.age = 66;
+    expectIdentityOmitted(invalidAge);
+
+    PlayerbotFictionalIdentityPromptContext invalidCountry;
+    invalidCountry.request = PlayerbotFictionalIdentityRequest::HomeCountry;
+    invalidCountry.homeCountry = "Atlantis";
+    expectIdentityOmitted(invalidCountry);
+    invalidCountry.homeCountry = "canada";
+    expectIdentityOmitted(invalidCountry);
+
+    PlayerbotFictionalIdentityPromptContext orphanCountry;
+    orphanCountry.request = PlayerbotFictionalIdentityRequest::Age;
+    orphanCountry.homeCountry = "Canada";
+    expectIdentityOmitted(orphanCountry);
+
+    PlayerbotFictionalIdentityPromptContext invalidRequest;
+    invalidRequest.request = static_cast<PlayerbotFictionalIdentityRequest>(200);
+    invalidRequest.age = 29;
+    expectIdentityOmitted(invalidRequest);
+}
+
+TEST(ClaudeChatSocialProtocolTest, CanonicalCountriesAndIdentityGroupSurviveBoundedContextTrimming)
+{
+    constexpr std::array<std::string_view, 43> COUNTRIES =
+    {
+        "United States", "Canada", "Mexico", "Australia", "New Zealand", "Singapore", "Malaysia",
+        "Thailand", "Indonesia", "Philippines", "Brazil", "Argentina", "Chile", "Colombia", "Peru",
+        "Uruguay", "Ecuador", "Costa Rica", "Panama", "Guatemala", "United Kingdom", "Germany", "France",
+        "Netherlands", "Belgium", "Ireland", "Denmark", "Sweden", "Norway", "Finland", "Iceland", "Spain",
+        "Italy", "Portugal", "Greece", "Poland", "Austria", "Switzerland", "Czechia", "Hungary", "Romania",
+        "Slovakia", "Ukraine"
+    };
+
+    for (std::string_view const country : COUNTRIES)
+    {
+        PlayerbotSocialRequestContext context;
+        context.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::HomeCountry;
+        context.fictionalIdentity.homeCountry = std::string(country);
+        EXPECT_NE(ClaudeChat::EncodeSocialContext(context).find(std::string(country)), std::string::npos)
+            << country;
+    }
+
+    PlayerbotSocialRequestContext full;
+    full.persona = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'p');
+    full.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::AgeAndHomeCountry;
+    full.fictionalIdentity.age = 29;
+    full.fictionalIdentity.homeCountry = "Canada";
+    full.relationship = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'r');
+    full.starter = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 's');
+    for (std::size_t index = 0; index < ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES; ++index)
+    {
+        full.nearby.push_back(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'n'));
+        full.thread.push_back(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 't'));
+        full.memories.push_back({std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
+                                 PlayerbotSocialPrivacyScope::Public});
+    }
+
+    std::string const encoded = ClaudeChat::EncodeSocialContext(full);
+    ASSERT_FALSE(encoded.empty());
+    EXPECT_EQ(encoded.front(), '{');
+    EXPECT_EQ(encoded.back(), '}');
+    EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+    EXPECT_NE(encoded.find("\"fictional_identity_request\":\"age_and_home_country\""),
+              std::string::npos);
+    EXPECT_NE(encoded.find("\"fictional_age\":29"), std::string::npos);
+    EXPECT_NE(encoded.find("\"fictional_home_country\":\"Canada\""), std::string::npos);
 }
 
 TEST(ClaudeChatSocialProtocolTest, AnEmptyAssembledContextEncodesToNothingRatherThanToAnEmptyObject)
