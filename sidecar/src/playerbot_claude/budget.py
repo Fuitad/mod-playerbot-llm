@@ -43,10 +43,10 @@ class RequestKind(enum.Enum):
     schema, and a value this enum can produce that the column cannot hold is a write that
     fails in production and nowhere else.
 
-    ``MODERATION_CLASSIFICATION`` has no producer in the sidecar today. Moderation is
-    decided on the worldserver side without a provider call, so nothing here reserves
-    against it. It is listed because the column accepts it, not because this process
-    writes it.
+    ``MODERATION_CLASSIFICATION`` is produced by the roleplay assessment preflight: the
+    classifier that reports what a human line is doing before the worldserver decides what
+    follows. It is classification work, never generation, which is why the assessment path
+    reserves under this kind rather than under a chat kind.
     """
 
     CHAT_RESPONSE = "chat_response"
