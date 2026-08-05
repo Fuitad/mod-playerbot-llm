@@ -236,6 +236,7 @@ namespace
              * is dropping too, so nothing is lost by forgetting them here.
              */
             _socialTransport.reset();
+            _assessmentExchange.Clear();
 
             if (_bridge)
                 _bridge->Stop();
@@ -283,8 +284,16 @@ namespace
              * does not parse is dropped on every channel but a whisper, so anything sent in another
              * shape would reach the prompt nowhere on General, which is the only surface a starter
              * speaks on.
+             *
+             * A refused encode is a refused request. The only refusal is corrupt prompt authority,
+             * and a request that travelled without its authority would be answered in ordinary
+             * voice as though the worldserver had chosen that; false here is ProviderFailed, which
+             * the coordinator turns into silence.
              */
-            request.context = ClaudeChat::EncodeSocialContext(context);
+            std::optional<std::string> encodedContext = ClaudeChat::EncodeSocialContext(context);
+            if (!encodedContext)
+                return false;
+            request.context = std::move(*encodedContext);
 
             /*
              * The subject is left fully absent when it cannot be resolved, never half described. A
@@ -408,6 +417,43 @@ namespace
                 return false;
 
             return _bridge->TryEnqueueMemory(std::move(request), SteadyNowMs() + _responseDeadlineMs);
+        }
+
+        /*
+         * The roleplay assessment seam. World thread, and deliberately blind: no character is
+         * resolved because no identity crosses this boundary. The exchange ledger is what bounds
+         * how many classifications may be in flight and what releases a slot whose request died
+         * silently.
+         */
+        bool SubmitRoleplayAssessment(uint64 assessmentToken, std::string const& threadPublicId,
+                                      PlayerbotSocialChannel channel, std::string const& currentLine,
+                                      std::vector<std::string> const& threadLines) override
+        {
+            if (!_socialTransport || !_bridge)
+                return false;
+
+            RoleplayAssessmentRequest request;
+            request.assessmentToken = assessmentToken;
+            request.threadPublicId = threadPublicId;
+            request.channel = static_cast<uint8>(channel);
+            request.currentLine = currentLine;
+            request.threadLines = threadLines;
+
+            if (!RoleplayAssessmentRequestIsUsable(request, _bridgeToken))
+                return false;
+
+            int64 const deadlineMs = SteadyNowMs() + SocialRequestDeadlineMs(_responseDeadlineMs);
+            if (!_assessmentExchange.Open(assessmentToken, deadlineMs))
+                return false;
+
+            if (!_bridge->TryEnqueueRoleplayAssessment(std::move(request), deadlineMs))
+            {
+                // Release the slot the refused enqueue would otherwise hold until its deadline.
+                _assessmentExchange.Settle(assessmentToken, deadlineMs);
+                return false;
+            }
+
+            return true;
         }
 
         // A character's display name, or empty when it cannot be resolved. Online characters only:
@@ -592,6 +638,7 @@ namespace
                 return;
 
             DrainSocial();
+            DrainRoleplayAssessments();
             DrainBiographies();
             DrainMemories();
             SweepIdleThreadsForMemories();
@@ -887,6 +934,40 @@ namespace
         }
 
         /*
+         * Hands each strict parsed assessment to the coordinator, which owns the roleplay decision.
+         * The ledger settles first, so a late or duplicate answer never reaches it, and the sweep
+         * releases slots whose requests died silently anywhere along the wire.
+         */
+        void DrainRoleplayAssessments()
+        {
+            if (!_bridge)
+                return;
+
+            int64 const nowMs = SteadyNowMs();
+            _assessmentExchange.ExpireDue(nowMs);
+
+            for (RoleplayAssessmentResponse const& response : _bridge->DrainRoleplayAssessmentResponses())
+            {
+                if (_assessmentExchange.Settle(response.assessmentToken, nowMs) !=
+                    RoleplayAssessmentOutcome::Deliver)
+                    continue;
+
+                PlayerbotSocialRoleplayAssessmentResult result;
+                result.assessmentToken = response.assessmentToken;
+                result.kind = response.kind;
+                result.capabilities = response.capabilities;
+
+                PlayerbotSocialAssessmentApplication const application =
+                    sPlayerbotSocialMgr.ApplyRoleplayAssessment(result);
+                if (application.discard != PlayerbotSocialRoleplayAssessmentDiscard::None)
+                    LOG_DEBUG("playerbot.claude",
+                              "mod-playerbot-claude: roleplay assessment {} discarded by coordinator ({})",
+                              response.assessmentToken,
+                              PlayerbotSocialRoleplayAssessmentDiscardName(application.discard));
+            }
+        }
+
+        /*
          * Hands each generated backstory to the coordinator, which owns the profile and decides
          * whether the answer may be applied.
          *
@@ -1004,6 +1085,7 @@ namespace
         // Present only while this module is the registered social provider. Holds a reference to the
         // bridge, so it is destroyed before the bridge is and never outlives it.
         std::optional<ClaudeSocialTransport> _socialTransport;
+        RoleplayAssessmentExchange _assessmentExchange;
 
         std::unordered_map<uint64, PendingDelivery> _pending;
         std::unordered_map<uint64, PendingCareerDelivery> _careerPending;

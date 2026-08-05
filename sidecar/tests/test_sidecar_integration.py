@@ -213,3 +213,166 @@ async def test_graceful_shutdown_stops_accepting_connections(tmp_path) -> None:
 
         with pytest.raises(ConnectionError):
             await asyncio.open_connection("127.0.0.1", harness.port)
+
+
+# Roleplay assessment ------------------------------------------------------------------------------
+
+
+def assessment_payload(request_token: int = 91, current_line: str = "care to share a tale?") -> bytes:
+    return json.dumps(
+        {
+            "schema_version": protocol.SCHEMA_VERSION,
+            "token": TEST_TOKEN,
+            "kind": "roleplay_assessment",
+            "roleplay_assessment_request_token": request_token,
+            "channel": 2,
+            "thread_id": "thr_00000000000000000000000000000001",
+            "current_line": current_line,
+            "thread_lines": ["Elyse: well met"],
+        }
+    ).encode()
+
+
+class AssessingAdapter(FakeAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.assessments: list[protocol.RoleplayAssessmentRequest] = []
+        self.completion = protocol.RoleplayAssessmentCompletion(
+            assessment_kind="roleplay_invitation", capabilities=["classic_content"]
+        )
+
+    def count_roleplay_assessment_input_tokens(self, request: protocol.RoleplayAssessmentRequest) -> int:
+        return self.input_tokens
+
+    def assess_roleplay(
+        self, request: protocol.RoleplayAssessmentRequest
+    ) -> tuple[protocol.RoleplayAssessmentCompletion, claude.UsageTotals]:
+        if "explode" in request.current_line:
+            raise claude.ClaudeProviderError("provider unavailable")
+        if "malformed" in request.current_line:
+            raise claude.ClaudeInvalidOutputError(
+                "model output did not match the roleplay assessment schema",
+                claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=4),
+            )
+        if "slow" in request.current_line:
+            import time
+
+            time.sleep(0.4)
+
+        self.assessments.append(request)
+        return self.completion, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=8)
+
+
+@dataclass
+class AssessmentHarness:
+    server: asyncio.Server
+    port: int
+    store: FakeState
+    adapter: AssessingAdapter
+
+
+@asynccontextmanager
+async def running_assessing_sidecar(budget: str = "1.0", deadline_ms: int = 10000):
+    adapter = AssessingAdapter()
+    config = app.SidecarConfig(
+        enable=True,
+        bridge_port=0,
+        daily_budget_usd=budget,
+        response_deadline_ms=deadline_ms,
+    )
+    store = FakeState(config.budget_nano, config.reserve_ratio)
+    service = app.SidecarService(config=config, token=TEST_TOKEN, adapter=adapter, store=store)
+    server = await asyncio.start_server(service.handle_connection, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield AssessmentHarness(server=server, port=port, store=store, adapter=adapter)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def silent_round_trip(port: int, payload: bytes) -> None:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(protocol.encode_frame(payload))
+    writer.write_eof()
+    with pytest.raises(protocol.FrameError):
+        await protocol.read_frame(reader)
+    writer.close()
+    await writer.wait_closed()
+
+
+async def test_assessment_round_trips_with_authenticated_correlation() -> None:
+    async with running_assessing_sidecar() as harness:
+        response = await round_trip(harness.port, assessment_payload())
+
+        # Correlation comes from the request and the shared secret, never from the model:
+        # the completion schema has no field that could have supplied either.
+        assert response["schema_version"] == protocol.SCHEMA_VERSION
+        assert response["token"] == TEST_TOKEN
+        assert response["kind"] == "roleplay_assessment"
+        assert response["roleplay_assessment_request_token"] == 91
+        assert response["assessment_kind"] == "roleplay_invitation"
+        assert response["capability_count"] == 1
+        assert response["capability_0"] == "classic_content"
+
+        # The classifier saw the bounded conversation and nothing else.
+        assert len(harness.adapter.assessments) == 1
+        assert harness.adapter.assessments[0].current_line == "care to share a tale?"
+
+        # Admitted as human social work, and its cost reported exactly once, as its own call.
+        from playerbot_claude import budget as budget_module
+
+        assert harness.store.reserved_priorities == [budget_module.RequestPriority.IMMEDIATE_HUMAN]
+        assert harness.store.reserved_kinds == [budget_module.RequestKind.MODERATION_CLASSIFICATION]
+        assert len(harness.store.settlements) == 1
+        assert harness.store.settled_nano > 0
+        assert harness.store.outstanding == {}
+
+
+async def test_assessment_provider_failure_is_silent_and_fails_closed_on_money() -> None:
+    async with running_assessing_sidecar() as harness:
+        await silent_round_trip(harness.port, assessment_payload(current_line="explode now"))
+
+        # No completion was produced and nothing was synthesized in its place.
+        assert harness.adapter.assessments == []
+        assert harness.store.settlements == []
+
+        # Billing could not be determined, so the reservation is left outstanding for expiry
+        # rather than refunded: the same fail-closed-on-money contract every other lane has.
+        assert len(harness.store.reservations) == 1
+        assert harness.store.outstanding != {}
+
+
+async def test_assessment_malformed_output_is_silent_never_synthesized() -> None:
+    async with running_assessing_sidecar() as harness:
+        await silent_round_trip(harness.port, assessment_payload(current_line="malformed output"))
+
+        # No fabricated "ordinary": the C++ side treats silence as its ordinary fallback.
+        assert harness.store.outstanding == {}
+        assert harness.store.settled_nano > 0
+
+
+async def test_assessment_budget_refusal_is_silent() -> None:
+    async with running_assessing_sidecar(budget="0.000001") as harness:
+        await silent_round_trip(harness.port, assessment_payload())
+
+        assert harness.adapter.assessments == []
+        assert harness.store.outstanding == {}
+
+
+async def test_assessment_circuit_breaker_refusal_is_silent() -> None:
+    async with running_assessing_sidecar() as harness:
+        harness.store.circuit_open = True
+        await silent_round_trip(harness.port, assessment_payload())
+
+        assert harness.adapter.assessments == []
+        assert harness.store.outstanding == {}
+
+
+async def test_assessment_deadline_is_silent() -> None:
+    async with running_assessing_sidecar(deadline_ms=50) as harness:
+        await silent_round_trip(harness.port, assessment_payload(current_line="slow answer please"))
+
+        # Nothing was settled or delivered. A reservation made before the cut may stay charged
+        # at maximum until expiry, which is the documented fail-closed-on-money behavior.
+        assert harness.store.settlements == []

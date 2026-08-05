@@ -382,6 +382,8 @@ class SidecarService:
             return await self._process_biography_payload(payload)
         if kind == "memory":
             return await self._process_memory_payload(payload)
+        if kind == "roleplay_assessment":
+            return await self._process_roleplay_assessment_payload(payload)
         if kind is not None:
             # Fail closed. A kind nobody here recognizes is a newer worldserver talking to an
             # older sidecar, and guessing which handler it meant is how the wrong one runs.
@@ -474,6 +476,103 @@ class SidecarService:
         except TimeoutError:
             _log(f"memory {token}: response deadline exceeded, staying silent")
             return None
+
+    async def _process_roleplay_assessment_payload(self, payload: bytes) -> bytes | None:
+        """One roleplay classification, from a coordinator that is waiting on it.
+
+        Silence is the only failure answer: the C++ side treats an unanswered assessment as
+        its ordinary fallback, and synthesizing an "ordinary" result here would dress up a
+        failure as a decision the model never made.
+        """
+
+        request = protocol.parse_roleplay_assessment_request(payload, self._token)
+        token = request.roleplay_assessment_request_token
+
+        if not self._config.generation_allowed:
+            _log(f"assessment {token}: no budget configured, staying silent")
+            return None
+
+        try:
+            async with asyncio.timeout(self._config.response_deadline_ms / 1000):
+                return await self._process_roleplay_assessment_within_deadline(request)
+        except TimeoutError:
+            _log(f"assessment {token}: response deadline exceeded, staying silent")
+            return None
+
+    async def _process_roleplay_assessment_within_deadline(
+        self, request: protocol.RoleplayAssessmentRequest
+    ) -> bytes | None:
+        token = request.roleplay_assessment_request_token
+        if self._store is None:
+            _log(f"assessment {token}: no durable state is open, staying silent")
+            return None
+
+        store = self._store
+        input_prices = self._config.price_texts
+
+        async with self._generation_lock:
+            now = self._now()
+
+            try:
+                input_tokens = await asyncio.to_thread(
+                    self._adapter.count_roleplay_assessment_input_tokens, request
+                )
+            except claude.ClaudeError as error:
+                _log(f"assessment {token}: {type(error).__name__}: {error}")
+                return None
+
+            if input_tokens > claude.MAX_INPUT_TOKENS:
+                _log(
+                    f"assessment {token}: prompt is {input_tokens} tokens "
+                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                )
+                return None
+
+            max_cost_nano = budget.conservative_max_cost_nano(
+                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+            )
+            # Human social work: a player just spoke and the coordinator is holding their reply
+            # opportunity on this answer. The kind is its own enumerator so an assessment is
+            # visible as an additional model call rather than hidden inside generation cost.
+            decision, reservation = await store.reserve(
+                request_kind=RequestKind.MODERATION_CLASSIFICATION,
+                model=claude.MODEL_ID,
+                max_cost_nano=max_cost_nano,
+                priority=RequestPriority.IMMEDIATE_HUMAN,
+                now=now,
+            )
+            if decision is not AdmissionDecision.ADMITTED or reservation is None:
+                _log(f"assessment {token}: {decision.value}, staying silent")
+                return None
+
+            try:
+                completion, usage = await asyncio.to_thread(self._adapter.assess_roleplay, request)
+            except claude.ClaudeError as error:
+                # Malformed output and provider failure land together: billed if the model ran,
+                # settled either way, and never replaced by a guessed category.
+                outcome = await self._account_for_failure(store, reservation, error)
+                _log(f"assessment {token}: {type(error).__name__}: {error} ({outcome})")
+                return None
+
+            settled_at = self._now()
+            try:
+                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+            except ValueError as error:
+                _log(f"assessment {token}: cannot price the completion: {error}")
+                return None
+
+            if not await store.settle(
+                reservation=reservation,
+                actual_cost_nano=actual_cost_nano,
+                now=settled_at,
+            ):
+                _log(f"assessment {token}: settlement refused, the reservation had already expired")
+                return None
+
+        # The framed response is built HERE, from the validated completion plus the request's
+        # correlation token and the authenticated bridge token. The completion has no field
+        # that could have supplied either.
+        return protocol.encode_roleplay_assessment_response(token, completion, self._token)
 
     async def _process_memory_within_deadline(self, request: protocol.MemoryRequest) -> bytes | None:
         token = request.memory_request_token

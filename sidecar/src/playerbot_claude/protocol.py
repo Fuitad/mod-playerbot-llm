@@ -13,7 +13,7 @@ import hmac
 import json
 import struct
 import unicodedata
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, get_args
 
 from pydantic import (
     BaseModel,
@@ -43,6 +43,19 @@ AMBIENT_EVENT_MARKER = "ambient_world"
 
 VOICES = ("reserved", "pragmatic", "earnest", "wry", "boisterous")
 SPENDING_STYLES = ("none", "minimal", "progression", "completionist")
+
+# The worldserver's trusted prompt authority, carried inside the structured social context.
+# Only these four spellings exist, and only authorized_roleplay may lift the ordinary player
+# voice; the C++ bridge refuses to serialize anything outside them. Expansions are the game's
+# own three: 0 classic, 1 burning crusade, 2 wrath.
+RoleplayPromptMode = Literal[
+    "ordinary",
+    "decline_roleplay",
+    "acknowledge_roleplay",
+    "authorized_roleplay",
+]
+ROLEPLAY_PROMPT_MODES: tuple[str, ...] = get_args(RoleplayPromptMode)
+MAX_SOCIAL_ACTIVE_EXPANSION = 2
 
 # Channels where a gesture can actually be seen, mirroring the coordinator's own rule. General
 # is zone wide and its participants are nowhere near each other, and a whisper has no physical
@@ -530,17 +543,24 @@ class SocialMemory(BaseModel):
 class SocialContext(BaseModel):
     """What the coordinator assembled for one social line.
 
-    Every field is optional because an empty one is a legitimate answer rather than a gap: a
-    reply has no starter, a bot meeting somebody for the first time has no relationship, and a
-    fresh thread has no memories. The producer omits what it did not assemble instead of
-    sending an empty value, so an absent key and an empty one never have to mean different
-    things here. A context that does not parse as this shape is not an error either, it is just
-    text, and the caller falls back to treating it as one opaque untrusted block rather than
-    going silent.
+    Every assembled field is optional because an empty one is a legitimate answer rather than
+    a gap: a reply has no starter, a bot meeting somebody for the first time has no
+    relationship, and a fresh thread has no memories. The producer omits what it did not
+    assemble instead of sending an empty value, so an absent key and an empty one never have
+    to mean different things here. A context that does not parse as this shape is not an error
+    either, it is just text, and the caller falls back to treating it as one opaque untrusted
+    block rather than going silent.
+
+    The two authority fields are the exception: `prompt_mode` and `active_expansion` are the
+    worldserver's decision, required on every structured context. A context without them is a
+    producer this sidecar does not know, so parsing fails and the caller keeps the ordinary
+    prompt; no inferred or defaulted mode exists that could quietly become roleplay.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    prompt_mode: RoleplayPromptMode
+    active_expansion: Annotated[int, Field(ge=0, le=MAX_SOCIAL_ACTIVE_EXPANSION)]
     persona: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)] = ""
     fictional_identity_request: Literal["age", "home_country", "age_and_home_country"] | None = None
     fictional_age: Annotated[int, Field(ge=18, le=65)] | None = None
@@ -556,6 +576,26 @@ class SocialContext(BaseModel):
         Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
     ] = []
     memories: Annotated[list[SocialMemory], Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES)] = []
+
+    @model_validator(mode="after")
+    def authorized_roleplay_carries_no_fictional_identity(self) -> Self:
+        """An in-character premise and ordinary fictional player facts never mix.
+
+        The fictional age and home country exist to answer direct personal questions in the
+        ordinary player voice. Inside an authorized roleplay premise the same fact would be
+        reinterpreted as an Azeroth character's biography, so a context carrying both refuses
+        outright: the caller falls back to the ordinary prompt rather than guessing which of
+        the two framings the producer meant.
+        """
+
+        if self.prompt_mode == "authorized_roleplay" and (
+            self.fictional_identity_request is not None
+            or self.fictional_age is not None
+            or self.fictional_home_country is not None
+        ):
+            raise ValueError("authorized roleplay carries no fictional player identity")
+
+        return self
 
     @model_validator(mode="after")
     def fictional_identity_is_coherent(self) -> Self:
@@ -651,6 +691,200 @@ def declared_kind(payload: bytes) -> str | None:
         raise ProtocolError("request kind must be a string")
 
     return kind
+
+
+RoleplayAssessmentKind = Literal[
+    "ordinary",
+    "roleplay_invitation",
+    "roleplay_continuation",
+    "practical",
+    "opt_out",
+    "uncertain",
+]
+
+RoleplayContentCapability = Literal[
+    "classic_content",
+    "outland",
+    "blood_elf",
+    "draenei",
+    "death_knight",
+    "burning_crusade_profession",
+    "wrath_profession",
+    "other_burning_crusade",
+    "other_wrath",
+    "unknown",
+]
+
+ROLEPLAY_ASSESSMENT_KINDS: tuple[str, ...] = get_args(RoleplayAssessmentKind)
+ROLEPLAY_CONTENT_CAPABILITIES: tuple[str, ...] = get_args(RoleplayContentCapability)
+
+
+class RoleplayAssessmentRequest(BaseModel):
+    """One roleplay classification asked for by the worldserver coordinator.
+
+    Deliberately blind: no candidates, no affinities, no GUIDs, no progression authority, and
+    no prompt mode cross this seam. The classifier sees only the bounded conversation text the
+    worldserver's privacy rules already admitted for prompting.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[4]
+    token: str
+    kind: Literal["roleplay_assessment"]
+    roleplay_assessment_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    channel: Annotated[int, Field(ge=0, le=255)]
+    thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
+    current_line: Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]
+    thread_lines: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
+        Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
+    ] = []
+
+    @field_validator("token")
+    @classmethod
+    def _validate_token(cls, value: str) -> str:
+        return _validated_token(value)
+
+    @field_validator("channel")
+    @classmethod
+    def _validate_channel(cls, value: int) -> int:
+        if value >= SOCIAL_CHANNEL_COUNT:
+            raise ValueError("channel is not a known social channel")
+
+        return value
+
+    @field_validator("thread_id")
+    @classmethod
+    def _validate_thread_id(cls, value: str) -> str:
+        if _byte_length(value) > MAX_THREAD_ID_BYTES:
+            raise ValueError(f"thread_id must be at most {MAX_THREAD_ID_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("current_line")
+    @classmethod
+    def _validate_current_line(cls, value: str) -> str:
+        # StringConstraints counts characters; the frame budget is bytes.
+        if _byte_length(value) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
+            raise ValueError(f"current_line must be at most {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("thread_lines")
+    @classmethod
+    def _validate_thread_lines(cls, value: list[str]) -> list[str]:
+        for line in value:
+            if _byte_length(line) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
+                raise ValueError(
+                    f"each thread line must be at most {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes"
+                )
+
+        return value
+
+
+class RoleplayAssessmentCompletion(BaseModel):
+    """Classifier output schema: evidence only.
+
+    There is deliberately nowhere to put a correlation token, an expansion number, or any
+    authority claim. The worldserver validates every reported capability against its own
+    active progression policy; this model can only describe what the text asked for.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    assessment_kind: RoleplayAssessmentKind
+    capabilities: Annotated[
+        list[RoleplayContentCapability], Field(max_length=len(ROLEPLAY_CONTENT_CAPABILITIES))
+    ]
+
+    @model_validator(mode="after")
+    def _shape_matches_kind(self) -> Self:
+        """The per kind cardinality contract, identical to the C++ side's."""
+
+        if self.assessment_kind in {"ordinary", "practical", "opt_out"}:
+            if self.capabilities:
+                raise ValueError("this assessment kind carries no capabilities")
+            return self
+
+        if self.assessment_kind == "uncertain":
+            if self.capabilities != ["unknown"]:
+                raise ValueError("uncertain carries exactly the unknown capability")
+            return self
+
+        if not self.capabilities:
+            raise ValueError("a roleplay premise names at least one capability")
+
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("capabilities must be unique")
+
+        if "unknown" in self.capabilities:
+            raise ValueError("unknown always refuses roleplay; report uncertain instead")
+
+        if "classic_content" in self.capabilities and len(self.capabilities) > 1:
+            raise ValueError("classic_content is valid only by itself")
+
+        return self
+
+
+def parse_roleplay_assessment_request(payload: bytes, expected_token: str) -> RoleplayAssessmentRequest:
+    """Strict parser for a roleplay assessment request. Mirrors parse_social_request."""
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProtocolError("roleplay assessment request payload is not valid UTF-8") from error
+
+    try:
+        data = json.loads(text, object_pairs_hook=_object_with_unique_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ProtocolError("roleplay assessment request payload is not valid JSON") from error
+
+    if not isinstance(data, dict):
+        raise ProtocolError("roleplay assessment request payload is not a JSON object")
+
+    try:
+        request = RoleplayAssessmentRequest.model_validate(data)
+    except ValidationError as error:
+        raise ProtocolError(
+            f"roleplay assessment request schema violation: {error.error_count()} error(s)"
+        ) from error
+
+    if not hmac.compare_digest(request.token.encode("utf-8"), expected_token.encode("utf-8")):
+        raise TokenMismatchError("bridge token mismatch")
+
+    return request
+
+
+def encode_roleplay_assessment_response(
+    roleplay_assessment_request_token: int,
+    completion: RoleplayAssessmentCompletion,
+    token: str,
+) -> bytes:
+    """Builds the exact flat payload shape the C++ assessment response parser accepts.
+
+    The correlation fields come from the REQUEST and the authenticated bridge token, never
+    from the completion: the model has nowhere to supply either, so it cannot answer a
+    different question than the one it was asked.
+    """
+
+    if not 1 <= roleplay_assessment_request_token <= _UINT64_MAX:
+        raise ProtocolError("roleplay_assessment_request_token out of range")
+
+    token = _encoder_token(token)
+
+    payload: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "token": token,
+        "kind": "roleplay_assessment",
+        "roleplay_assessment_request_token": roleplay_assessment_request_token,
+        "assessment_kind": completion.assessment_kind,
+        "capability_count": len(completion.capabilities),
+    }
+    for index, capability in enumerate(completion.capabilities):
+        payload[f"capability_{index}"] = capability
+
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 class BiographyRequest(BaseModel):

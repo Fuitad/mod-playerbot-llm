@@ -1454,7 +1454,9 @@ TEST(ClaudeChatSocialProtocolTest, AStarterSubjectTravelsAsTheTypedContextShapeN
      * agreed shape rather than as the raw string.
      */
     std::string const encoded = ClaudeChat::EncodeStarterContext("the harvest golems are out again");
-    EXPECT_EQ(encoded, "{\"starter\":\"the harvest golems are out again\"}");
+    EXPECT_EQ(encoded,
+              "{\"starter\":\"the harvest golems are out again\","
+              "\"prompt_mode\":\"ordinary\",\"active_expansion\":0}");
 
     // A reply has no subject, and an empty context is what "nothing was assembled" already means.
     EXPECT_EQ(ClaudeChat::EncodeStarterContext(""), "");
@@ -1463,7 +1465,8 @@ TEST(ClaudeChatSocialProtocolTest, AStarterSubjectTravelsAsTheTypedContextShapeN
 TEST(ClaudeChatSocialProtocolTest, AStarterSubjectIsEscapedAndBounded)
 {
     // Quotes and control characters would otherwise close the field and inject siblings into it.
-    EXPECT_EQ(ClaudeChat::EncodeStarterContext("say \"hi\"\n"), "{\"starter\":\"say \\\"hi\\\"\\n\"}");
+    EXPECT_EQ(ClaudeChat::EncodeStarterContext("say \"hi\"\n"),
+              "{\"starter\":\"say \\\"hi\\\"\\n\",\"prompt_mode\":\"ordinary\",\"active_expansion\":0}");
 
     std::string const long_subject(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 500, 'a');
     std::string const bounded = ClaudeChat::EncodeStarterContext(long_subject);
@@ -1492,9 +1495,12 @@ TEST(ClaudeChatSocialProtocolTest, ABoundedStarterSubjectIsNeverCutThroughAMulti
 
     // Strip the wrapper to weigh only the subject the sidecar will decode.
     std::string const prefix = "{\"starter\":\"";
+    std::string const suffix = "\",\"prompt_mode\":\"ordinary\",\"active_expansion\":0}";
     ASSERT_EQ(encoded.rfind(prefix, 0), 0u);
-    ASSERT_GE(encoded.size(), prefix.size() + 2);
-    std::string const carried = encoded.substr(prefix.size(), encoded.size() - prefix.size() - 2);
+    ASSERT_GE(encoded.size(), prefix.size() + suffix.size());
+    ASSERT_EQ(encoded.rfind(suffix), encoded.size() - suffix.size());
+    std::string const carried =
+        encoded.substr(prefix.size(), encoded.size() - prefix.size() - suffix.size());
 
     EXPECT_LE(carried.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES);
     EXPECT_FALSE(carried.empty());
@@ -2441,7 +2447,7 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSide
     context.memories.push_back({"runs the same dungeon every night", PlayerbotSocialPrivacyScope::Public});
     context.memories.push_back({"asked about the auction house", PlayerbotSocialPrivacyScope::Party});
 
-    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context).value();
 
     EXPECT_NE(encoded.find("\"persona\":\"speaks wry, reserved toward this listener\""), std::string::npos);
     EXPECT_NE(encoded.find("\"relationship\":\"familiarity 0.80, affinity 0.60, trust 0.40\""), std::string::npos);
@@ -2449,6 +2455,8 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSide
     EXPECT_NE(encoded.find("\"memories\":["), std::string::npos);
     EXPECT_NE(encoded.find("\"scope\":\"public\""), std::string::npos);
     EXPECT_NE(encoded.find("\"scope\":\"party\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"prompt_mode\":\"ordinary\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"active_expansion\":0"), std::string::npos);
     EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
 }
 
@@ -2460,7 +2468,7 @@ TEST(ClaudeChatSocialProtocolTest, FictionalIdentitySerializesAsOneCoherentAppro
     approved.fictionalIdentity.age = 29;
     approved.fictionalIdentity.homeCountry = "Canada";
 
-    std::string const approvedJson = ClaudeChat::EncodeSocialContext(approved);
+    std::string const approvedJson = ClaudeChat::EncodeSocialContext(approved).value();
     EXPECT_NE(approvedJson.find("\"fictional_identity_request\":\"age_and_home_country\""),
               std::string::npos);
     EXPECT_NE(approvedJson.find("\"fictional_age\":29"), std::string::npos);
@@ -2469,7 +2477,7 @@ TEST(ClaudeChatSocialProtocolTest, FictionalIdentitySerializesAsOneCoherentAppro
     PlayerbotSocialRequestContext withheld;
     withheld.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::HomeCountry;
 
-    std::string const withheldJson = ClaudeChat::EncodeSocialContext(withheld);
+    std::string const withheldJson = ClaudeChat::EncodeSocialContext(withheld).value();
     EXPECT_NE(withheldJson.find("\"fictional_identity_request\":\"home_country\""), std::string::npos);
     EXPECT_EQ(withheldJson.find("fictional_age"), std::string::npos);
     EXPECT_EQ(withheldJson.find("fictional_home_country"), std::string::npos);
@@ -2483,7 +2491,7 @@ TEST(ClaudeChatSocialProtocolTest, InvalidFictionalIdentityGroupsFailClosedAtomi
         context.persona = "speaks earnest";
         context.fictionalIdentity = std::move(identity);
 
-        std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+        std::string const encoded = ClaudeChat::EncodeSocialContext(context).value();
         EXPECT_NE(encoded.find("\"persona\":"), std::string::npos);
         EXPECT_EQ(encoded.find("fictional_identity_request"), std::string::npos);
         EXPECT_EQ(encoded.find("fictional_age"), std::string::npos);
@@ -2532,7 +2540,8 @@ TEST(ClaudeChatSocialProtocolTest, CanonicalCountriesAndIdentityGroupSurviveBoun
         PlayerbotSocialRequestContext context;
         context.fictionalIdentity.request = PlayerbotFictionalIdentityRequest::HomeCountry;
         context.fictionalIdentity.homeCountry = std::string(country);
-        EXPECT_NE(ClaudeChat::EncodeSocialContext(context).find(std::string(country)), std::string::npos)
+        EXPECT_NE(ClaudeChat::EncodeSocialContext(context).value().find(std::string(country)),
+                  std::string::npos)
             << country;
     }
 
@@ -2551,7 +2560,7 @@ TEST(ClaudeChatSocialProtocolTest, CanonicalCountriesAndIdentityGroupSurviveBoun
                                  PlayerbotSocialPrivacyScope::Public});
     }
 
-    std::string const encoded = ClaudeChat::EncodeSocialContext(full);
+    std::string const encoded = ClaudeChat::EncodeSocialContext(full).value();
     ASSERT_FALSE(encoded.empty());
     EXPECT_EQ(encoded.front(), '{');
     EXPECT_EQ(encoded.back(), '}');
@@ -2570,7 +2579,7 @@ TEST(ClaudeChatSocialProtocolTest, AnEmptyAssembledContextEncodesToNothingRather
      * spend bytes to say the same thing and would make an unfilled context indistinguishable from
      * one that parsed to no fields.
      */
-    EXPECT_EQ(ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext()), "");
+    EXPECT_EQ(ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext()).value(), "");
 }
 
 TEST(ClaudeChatSocialProtocolTest, AnAssembledContextOmitsTheFieldsThatHaveNothingInThem)
@@ -2583,7 +2592,7 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextOmitsTheFieldsThatHaveNothi
     PlayerbotSocialRequestContext context;
     context.persona = "speaks earnest, neutral toward this listener";
 
-    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context).value();
 
     EXPECT_NE(encoded.find("\"persona\":"), std::string::npos);
     EXPECT_EQ(encoded.find("\"relationship\":"), std::string::npos);
@@ -2607,7 +2616,7 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextStaysWithinTheWholeContextB
         context.memories.push_back({std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
                                     PlayerbotSocialPrivacyScope::Public});
 
-    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context).value();
 
     EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
     EXPECT_NE(encoded.find("\"persona\":"), std::string::npos) << "the persona is never the field dropped";
@@ -2629,7 +2638,7 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextNeverEmitsMoreEntriesThanTh
         context.memories.push_back({"detail " + std::to_string(index), PlayerbotSocialPrivacyScope::Public});
     }
 
-    std::string const encoded = ClaudeChat::EncodeSocialContext(context);
+    std::string const encoded = ClaudeChat::EncodeSocialContext(context).value();
 
     auto count = [&encoded](std::string const& needle)
     {
@@ -2643,4 +2652,380 @@ TEST(ClaudeChatSocialProtocolTest, AnAssembledContextNeverEmitsMoreEntriesThanTh
     EXPECT_EQ(count("\"bystander "), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES);
     EXPECT_EQ(count("\"scope\":"), ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES);
     EXPECT_LE(encoded.size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+}
+
+// Task 9: trusted prompt authority on the social wire ---------------------------------------------
+
+TEST(ClaudeChatSocialProtocolTest, EveryWorldserverPromptModeAndExpansionSerializesExactly)
+{
+    /*
+     * The mode and the expansion are the worldserver's authority, not assembled context, so they
+     * ride every non-empty context under exactly the wire names the sidecar declares. Every valid
+     * combination is enumerated because the sidecar treats an unknown spelling as malformed and
+     * falls back to ordinary voice: a misspelt authorized mode would not be a bug report, it would
+     * be a feature that silently never runs.
+     */
+    constexpr std::array<std::pair<PlayerbotRoleplayPromptMode, char const*>, 4> MODES = {{
+        {PlayerbotRoleplayPromptMode::Ordinary, "ordinary"},
+        {PlayerbotRoleplayPromptMode::DeclineRoleplay, "decline_roleplay"},
+        {PlayerbotRoleplayPromptMode::AcknowledgeRoleplay, "acknowledge_roleplay"},
+        {PlayerbotRoleplayPromptMode::AuthorizedRoleplay, "authorized_roleplay"},
+    }};
+
+    for (auto const& [mode, wire] : MODES)
+        for (uint8 expansion = 0; expansion <= ClaudeChat::MAX_SOCIAL_ACTIVE_EXPANSION; ++expansion)
+        {
+            PlayerbotSocialRequestContext context;
+            context.persona = "speaks wry, reserved toward this listener";
+            context.promptMode = mode;
+            context.activeContentExpansion = expansion;
+
+            std::optional<std::string> const encoded = ClaudeChat::EncodeSocialContext(context);
+            ASSERT_TRUE(encoded.has_value()) << wire << " at expansion " << static_cast<int>(expansion);
+            EXPECT_NE(encoded->find(std::string("\"prompt_mode\":\"") + wire + "\""), std::string::npos)
+                << *encoded;
+            EXPECT_NE(encoded->find("\"active_expansion\":" + std::to_string(expansion)), std::string::npos)
+                << *encoded;
+        }
+}
+
+TEST(ClaudeChatSocialProtocolTest, InvalidPromptAuthorityRefusesTheContextBeforeTheWire)
+{
+    /*
+     * An invalid mode or expansion is refused outright rather than omitted. Omitting would let the
+     * request travel without authority and the sidecar would answer it in ordinary voice, which
+     * turns corrupted state into a silent behaviour change; refusing turns it into a provider
+     * failure the coordinator already knows how to keep quiet about.
+     */
+    PlayerbotSocialRequestContext badMode;
+    badMode.persona = "speaks wry, reserved toward this listener";
+    badMode.promptMode = static_cast<PlayerbotRoleplayPromptMode>(200);
+    EXPECT_FALSE(ClaudeChat::EncodeSocialContext(badMode).has_value());
+
+    badMode.promptMode = static_cast<PlayerbotRoleplayPromptMode>(4);
+    EXPECT_FALSE(ClaudeChat::EncodeSocialContext(badMode).has_value());
+
+    PlayerbotSocialRequestContext badExpansion;
+    badExpansion.persona = "speaks wry, reserved toward this listener";
+    badExpansion.activeContentExpansion = ClaudeChat::MAX_SOCIAL_ACTIVE_EXPANSION + 1;
+    EXPECT_FALSE(ClaudeChat::EncodeSocialContext(badExpansion).has_value());
+
+    badExpansion.activeContentExpansion = 255;
+    EXPECT_FALSE(ClaudeChat::EncodeSocialContext(badExpansion).has_value());
+
+    // Refused even when nothing else was assembled: "no context" is a legal thing to send, but not
+    // on behalf of a request whose authority bytes are corrupt.
+    PlayerbotSocialRequestContext emptyBadMode;
+    emptyBadMode.promptMode = static_cast<PlayerbotRoleplayPromptMode>(4);
+    EXPECT_FALSE(ClaudeChat::EncodeSocialContext(emptyBadMode).has_value());
+}
+
+TEST(ClaudeChatSocialProtocolTest, PromptAuthoritySurvivesBoundedContextTrimming)
+{
+    /*
+     * Trimming to the whole-context bound sheds assembled blocks, never the authority: a context
+     * that arrives without its mode is read by the sidecar as malformed and the whole assembly is
+     * lost with it.
+     */
+    PlayerbotSocialRequestContext full;
+    full.promptMode = PlayerbotRoleplayPromptMode::AuthorizedRoleplay;
+    full.activeContentExpansion = 0;
+    full.persona = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'p');
+    full.relationship = std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'r');
+    for (std::size_t index = 0; index < ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES; ++index)
+    {
+        full.nearby.push_back(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'n'));
+        full.thread.push_back(std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 't'));
+        full.memories.push_back({std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
+                                 PlayerbotSocialPrivacyScope::Public});
+    }
+
+    std::optional<std::string> const encoded = ClaudeChat::EncodeSocialContext(full);
+    ASSERT_TRUE(encoded.has_value());
+    EXPECT_LE(encoded->size(), ClaudeChat::MAX_SOCIAL_CONTEXT_BYTES);
+    EXPECT_NE(encoded->find("\"prompt_mode\":\"authorized_roleplay\""), std::string::npos);
+    EXPECT_NE(encoded->find("\"active_expansion\":0"), std::string::npos);
+}
+
+// Roleplay assessment protocol ---------------------------------------------------------------------
+
+namespace
+{
+    ClaudeChat::RoleplayAssessmentRequest AssessmentRequest()
+    {
+        ClaudeChat::RoleplayAssessmentRequest request;
+        request.assessmentToken = 91;
+        request.threadPublicId = "thr_00000000000000000000000000000001";
+        request.channel = 2;
+        request.currentLine = "care to share a tale, traveler?";
+        request.threadLines = {"Elyse: well met", "Grimbold: aye"};
+        return request;
+    }
+
+    std::string AssessmentPayload(std::string kind = "roleplay_assessment", uint64 requestToken = 91,
+                                  std::string assessmentKind = "ordinary",
+                                  std::vector<std::string> capabilities = {},
+                                  uint64 schema = ClaudeChat::SCHEMA_VERSION)
+    {
+        std::string out = "{\"schema_version\":" + std::to_string(schema);
+        out += ",\"token\":\"" + SOCIAL_TOKEN + "\"";
+        out += ",\"kind\":\"" + kind + "\"";
+        out += ",\"roleplay_assessment_request_token\":" + std::to_string(requestToken);
+        out += ",\"assessment_kind\":\"" + assessmentKind + "\"";
+        out += ",\"capability_count\":" + std::to_string(capabilities.size());
+        for (std::size_t index = 0; index < capabilities.size(); ++index)
+            out += ",\"capability_" + std::to_string(index) + "\":\"" + capabilities[index] + "\"";
+        out += "}";
+        return out;
+    }
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, RequestSerializesToExactContractJson)
+{
+    std::optional<std::string> const serialized =
+        ClaudeChat::SerializeRoleplayAssessmentRequest(AssessmentRequest(), SOCIAL_TOKEN);
+    ASSERT_TRUE(serialized.has_value());
+
+    std::string const expected = std::string("{\"schema_version\":") +
+                                 std::to_string(ClaudeChat::SCHEMA_VERSION) + ",\"token\":\"" + SOCIAL_TOKEN +
+                                 "\",\"kind\":\"roleplay_assessment\",\"roleplay_assessment_request_token\":91,"
+                                 "\"channel\":2,\"thread_id\":\"thr_00000000000000000000000000000001\","
+                                 "\"current_line\":\"care to share a tale, traveler?\","
+                                 "\"thread_lines\":[\"Elyse: well met\",\"Grimbold: aye\"]}";
+    EXPECT_EQ(*serialized, expected);
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, RequestSerializationEscapesUntrustedText)
+{
+    ClaudeChat::RoleplayAssessmentRequest request = AssessmentRequest();
+    request.currentLine = "say \"hi\"\nplease";
+    request.threadLines = {"Elyse: back\\slash"};
+
+    std::optional<std::string> const serialized =
+        ClaudeChat::SerializeRoleplayAssessmentRequest(request, SOCIAL_TOKEN);
+    ASSERT_TRUE(serialized.has_value());
+
+    EXPECT_NE(serialized->find("say \\\"hi\\\"\\nplease"), std::string::npos);
+    EXPECT_NE(serialized->find("back\\\\slash"), std::string::npos);
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, UnusableRequestsAreRefusedBeforeSerialization)
+{
+    ClaudeChat::RoleplayAssessmentRequest const usable = AssessmentRequest();
+    EXPECT_TRUE(ClaudeChat::RoleplayAssessmentRequestIsUsable(usable, SOCIAL_TOKEN));
+
+    ClaudeChat::RoleplayAssessmentRequest broken = usable;
+    broken.assessmentToken = 0;
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.threadPublicId.clear();
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.threadPublicId.assign(ClaudeChat::MAX_THREAD_ID_BYTES + 1, 't');
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.currentLine.clear();
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.currentLine.assign(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 1, 'a');
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.threadLines.assign(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES + 1, "line");
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    broken = usable;
+    broken.threadLines = {std::string(ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES + 1, 'a')};
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(broken, SOCIAL_TOKEN));
+
+    EXPECT_FALSE(ClaudeChat::RoleplayAssessmentRequestIsUsable(usable, std::string(4, 'x')));
+    EXPECT_FALSE(ClaudeChat::SerializeRoleplayAssessmentRequest(broken, SOCIAL_TOKEN).has_value());
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, EveryValidAssessmentShapeRoundTrips)
+{
+    using Kind = PlayerbotRoleplayAssessmentKind;
+    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+
+    struct Case
+    {
+        std::string kindName;
+        Kind kind;
+        std::vector<std::string> capabilityNames;
+        std::vector<Capability> capabilities;
+    };
+
+    std::vector<Case> const cases = {
+        {"ordinary", Kind::Ordinary, {}, {}},
+        {"practical", Kind::Practical, {}, {}},
+        {"opt_out", Kind::OptOut, {}, {}},
+        {"uncertain", Kind::Uncertain, {"unknown"}, {Capability::Unknown}},
+        {"roleplay_invitation", Kind::RoleplayInvitation, {"classic_content"}, {Capability::ClassicContent}},
+        {"roleplay_invitation",
+         Kind::RoleplayInvitation,
+         {"outland", "death_knight"},
+         {Capability::Outland, Capability::DeathKnight}},
+        {"roleplay_continuation",
+         Kind::RoleplayContinuation,
+         {"blood_elf", "draenei", "burning_crusade_profession", "wrath_profession", "other_burning_crusade",
+          "other_wrath"},
+         {Capability::BloodElf, Capability::Draenei, Capability::BurningCrusadeProfession,
+          Capability::WrathProfession, Capability::OtherBurningCrusade, Capability::OtherWrath}},
+    };
+
+    for (Case const& testCase : cases)
+    {
+        std::optional<ClaudeChat::RoleplayAssessmentResponse> const parsed =
+            ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                AssessmentPayload("roleplay_assessment", 91, testCase.kindName, testCase.capabilityNames),
+                SOCIAL_TOKEN, 91);
+
+        ASSERT_TRUE(parsed.has_value()) << "kind: " << testCase.kindName;
+        EXPECT_EQ(parsed->assessmentToken, 91u);
+        EXPECT_EQ(parsed->kind, testCase.kind) << "kind: " << testCase.kindName;
+        EXPECT_EQ(parsed->capabilities, testCase.capabilities) << "kind: " << testCase.kindName;
+    }
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, CorrelationAndAuthorityMismatchesAreRefused)
+{
+    // A well formed answer to a different request.
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(AssessmentPayload(), SOCIAL_TOKEN, 92).has_value());
+
+    // A mismatched bridge token, and a mismatched schema version.
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(AssessmentPayload(), std::string(40, 'z'), 91)
+            .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "ordinary", {}, 3), SOCIAL_TOKEN, 91)
+                     .has_value());
+
+    // A declared kind that is not this lane's, including near misses.
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(AssessmentPayload("social"), SOCIAL_TOKEN, 91)
+                     .has_value());
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(AssessmentPayload("Roleplay_assessment"), SOCIAL_TOKEN, 91)
+            .has_value());
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, MalformedAssessmentPayloadsAreRefused)
+{
+    // Unknown assessment kind, and an unknown capability value.
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "roleplay_now"), SOCIAL_TOKEN, 91)
+                     .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"naaru"}),
+                     SOCIAL_TOKEN, 91)
+                     .has_value());
+
+    // The per kind cardinality contract: duplicates, classic mixed, unknown in an invitation,
+    // capabilities on an ordinary result, and an empty invitation.
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"outland", "outland"}),
+                     SOCIAL_TOKEN, 91)
+                     .has_value());
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+            AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"classic_content", "outland"}),
+            SOCIAL_TOKEN, 91)
+            .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"unknown"}),
+                     SOCIAL_TOKEN, 91)
+                     .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "ordinary", {"classic_content"}),
+                     SOCIAL_TOKEN, 91)
+                     .has_value());
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+                     AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {}), SOCIAL_TOKEN, 91)
+                     .has_value());
+
+    // A count that disagrees with the slots, in both directions.
+    std::string overCounted = AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"outland"});
+    overCounted.replace(overCounted.find("\"capability_count\":1"), 20, "\"capability_count\":2");
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(overCounted, SOCIAL_TOKEN, 91).has_value());
+
+    std::string underCounted = AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"outland"});
+    underCounted.replace(underCounted.find("\"capability_count\":1"), 20, "\"capability_count\":0");
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(underCounted, SOCIAL_TOKEN, 91).has_value());
+
+    // Unknown extra fields, trailing bytes, and a capability carried as a number.
+    std::string extra = AssessmentPayload();
+    extra.insert(extra.size() - 1, ",\"note\":\"hi\"");
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(extra, SOCIAL_TOKEN, 91).has_value());
+
+    EXPECT_FALSE(
+        ClaudeChat::ParseRoleplayAssessmentResponsePayload(AssessmentPayload() + "x", SOCIAL_TOKEN, 91)
+            .has_value());
+
+    std::string numeric = AssessmentPayload("roleplay_assessment", 91, "roleplay_invitation", {"outland"});
+    numeric.replace(numeric.find("\"capability_0\":\"outland\""), 24, "\"capability_0\":1");
+    EXPECT_FALSE(ClaudeChat::ParseRoleplayAssessmentResponsePayload(numeric, SOCIAL_TOKEN, 91).has_value());
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, ExchangeLedgerBoundsDedupesAndExpires)
+{
+    ClaudeChat::RoleplayAssessmentExchange exchange;
+
+    EXPECT_TRUE(exchange.Open(91, 5000));
+    EXPECT_FALSE(exchange.Open(91, 5000)) << "one token, one outstanding exchange";
+    EXPECT_EQ(exchange.OutstandingCount(), 1u);
+
+    // Deliver exactly once, and only for a token that is actually outstanding.
+    EXPECT_EQ(exchange.Settle(91, 4000), ClaudeChat::RoleplayAssessmentOutcome::Deliver);
+    EXPECT_EQ(exchange.Settle(91, 4000), ClaudeChat::RoleplayAssessmentOutcome::Abandon);
+    EXPECT_EQ(exchange.Settle(92, 4000), ClaudeChat::RoleplayAssessmentOutcome::Abandon);
+    EXPECT_EQ(exchange.OutstandingCount(), 0u);
+
+    // A late answer is abandoned and its slot is released.
+    EXPECT_TRUE(exchange.Open(93, 5000));
+    EXPECT_EQ(exchange.Settle(93, 5001), ClaudeChat::RoleplayAssessmentOutcome::Abandon);
+    EXPECT_EQ(exchange.OutstandingCount(), 0u);
+
+    // The sweep drops overdue entries so silent deaths cannot hold slots forever.
+    EXPECT_TRUE(exchange.Open(94, 5000));
+    EXPECT_TRUE(exchange.Open(95, 9000));
+    EXPECT_EQ(exchange.ExpireDue(6000), std::vector<uint64>{94});
+    EXPECT_EQ(exchange.OutstandingCount(), 1u);
+
+    // Shutdown drains everything at once.
+    EXPECT_EQ(exchange.Clear(), std::vector<uint64>{95});
+    EXPECT_EQ(exchange.OutstandingCount(), 0u);
+
+    // The ledger is bounded: a full ledger refuses new exchanges rather than evicting.
+    for (uint64 token = 1000; token < 1000 + ClaudeChat::MAX_OUTSTANDING_ROLEPLAY_ASSESSMENTS; ++token)
+        ASSERT_TRUE(exchange.Open(token, 5000));
+    EXPECT_FALSE(exchange.Open(5000, 5000));
+}
+
+TEST(ClaudeChatRoleplayProtocolTest, StoppedBridgeAndExpiredDeadlineRefuseAssessmentEnqueue)
+{
+    ClaudeChat::BridgeConfig config;
+    config.port = 65535;
+    config.token = SOCIAL_TOKEN;
+    config.queueCapacity = 1;
+
+    ClaudeChat::ClaudeBridge bridge(config);
+
+    // Not started: the queue accepts within capacity and refuses past it.
+    EXPECT_TRUE(bridge.TryEnqueueRoleplayAssessment(AssessmentRequest(), 1'000'000'000'000));
+    EXPECT_FALSE(bridge.TryEnqueueRoleplayAssessment(AssessmentRequest(), 1'000'000'000'000))
+        << "a full queue refuses immediately";
+
+    // Already expired at enqueue time.
+    EXPECT_FALSE(bridge.TryEnqueueRoleplayAssessment(AssessmentRequest(), 0));
+
+    bridge.Stop();
+    EXPECT_FALSE(bridge.TryEnqueueRoleplayAssessment(AssessmentRequest(), 1'000'000'000'000));
+
+    EXPECT_TRUE(bridge.DrainRoleplayAssessmentResponses().empty());
 }

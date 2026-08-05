@@ -85,7 +85,8 @@ namespace ClaudeChat
         Career,
         Social,
         Biography,
-        Memory
+        Memory,
+        RoleplayAssessment
     };
 
     [[nodiscard]] bool ResponseKindIsValid(ResponseKind kind);
@@ -165,6 +166,14 @@ namespace ClaudeChat
      * MAX_SOCIAL_CONTEXT_ENTRIES. A longer list is refused there rather than trimmed.
      */
     inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRIES = 12;
+
+    /*
+     * The highest active_expansion value the wire defines: 0 classic, 1 burning crusade, 2 wrath.
+     * The worldserver chooses the value; this bound is what makes a byte outside those three a
+     * refusal here rather than a number the sidecar has to guess a meaning for. Checked against the
+     * game's own expansion enum where SharedDefines is visible (ClaudeChat.cpp).
+     */
+    inline constexpr uint8 MAX_SOCIAL_ACTIVE_EXPANSION = 2;
 
     /*
      * The producer in mod-playerbots bounds every value it assembles, and this encoder bounds every
@@ -377,8 +386,15 @@ namespace ClaudeChat
      * When the total has to give, the least specific block goes first and the persona goes last: a
      * line generated without a remembered detail is still in character, and one generated without a
      * character is the failure this whole path exists to remove.
+     *
+     * Every non-empty context also carries the worldserver's prompt authority: the trusted prompt
+     * mode and the active expansion, under the wire names the sidecar requires. They are authority
+     * rather than assembled content, so trimming never sheds them. Corrupt authority refuses the
+     * whole encode (nullopt) instead of omitting the fields: an omitted mode would be read on the
+     * far side as ordinary, which turns a corrupted byte into a silent behaviour change, while a
+     * refusal is a provider failure the coordinator already answers with silence.
      */
-    [[nodiscard]] std::string EncodeSocialContext(PlayerbotSocialRequestContext const& context);
+    [[nodiscard]] std::optional<std::string> EncodeSocialContext(PlayerbotSocialRequestContext const& context);
 
     /*
      * A request for one bot's backstory.
@@ -793,6 +809,95 @@ namespace ClaudeChat
         std::map<uint64, int64> _lastBeginMs;
     };
 
+    // Roleplay assessment lane ---------------------------------------------------------------------
+
+    /*
+     * One classification request: does this observed human line invite, continue, leave, or ignore
+     * roleplay. Deliberately blind: no candidates, no affinities, no GUIDs, no progression
+     * authority, and no prompt mode. The classifier reads bounded conversation text the privacy
+     * rules already admitted, and nothing more.
+     */
+    struct RoleplayAssessmentRequest
+    {
+        uint64 assessmentToken = 0;
+        std::string threadPublicId;
+        uint8 channel = 0;  // The worldserver's PlayerbotSocialChannel value, context only.
+        std::string currentLine;
+        std::vector<std::string> threadLines;
+    };
+
+    // One strict parsed assessment answer. Evidence, never authority: the worldserver validates the
+    // capabilities against the active progression policy before anything follows from this.
+    struct RoleplayAssessmentResponse
+    {
+        uint64 assessmentToken = 0;
+        PlayerbotRoleplayAssessmentKind kind = PlayerbotRoleplayAssessmentKind::Ordinary;
+        std::vector<VanillaOnlyRules::RoleplayContentCapability> capabilities;
+    };
+
+    // Wire spellings of the ten capability values, shared with the sidecar's Literal.
+    [[nodiscard]] char const* RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability);
+    [[nodiscard]] std::optional<VanillaOnlyRules::RoleplayContentCapability> RoleplayContentCapabilityFromName(
+        std::string const& name);
+
+    // Wire spellings of the six assessment kinds, parsed strictly: anything else is malformed.
+    [[nodiscard]] std::optional<PlayerbotRoleplayAssessmentKind> RoleplayAssessmentKindFromName(
+        std::string const& name);
+
+    // Whether an assessment request can be serialized at all: token usable, identity and every text
+    // bounded. One definition, used by the provider and the serializer alike.
+    [[nodiscard]] bool RoleplayAssessmentRequestIsUsable(RoleplayAssessmentRequest const& request,
+                                                         std::string const& token);
+
+    std::optional<std::string> SerializeRoleplayAssessmentRequest(RoleplayAssessmentRequest const& request,
+                                                                  std::string const& token);
+
+    /*
+     * Parses one framed assessment answer, or refuses it. Strict on every axis: schema, bridge
+     * token, declared kind, correlation token, the six kind spellings, the ten capability
+     * spellings, and the per kind cardinality contract, before any result reaches the coordinator.
+     */
+    [[nodiscard]] std::optional<RoleplayAssessmentResponse> ParseRoleplayAssessmentResponsePayload(
+        std::string const& payload, std::string const& expectedToken, uint64 expectedAssessmentToken);
+
+    // What settling one outstanding assessment produced. There is no regeneration for a
+    // classification: it is answered once, abandoned, or expired.
+    enum class RoleplayAssessmentOutcome : uint8
+    {
+        Deliver = 0,
+        Abandon
+    };
+
+    inline constexpr std::size_t MAX_OUTSTANDING_ROLEPLAY_ASSESSMENTS = PLAYERBOT_SOCIAL_MAX_PENDING_BOTS;
+
+    /*
+     * Bounded bookkeeping for every assessment in flight, mirroring the social transport's
+     * outstanding rules: one entry per token, a deadline that releases requests that died silently,
+     * deliver-exactly-once settling, and a shutdown drain. Pure state, so every rule is testable
+     * without a socket or a coordinator.
+     */
+    class RoleplayAssessmentExchange
+    {
+    public:
+        // False when the token is already outstanding or the ledger is full. Full refuses rather
+        // than evicts: an evicted exchange would abandon an answer someone is still waiting on.
+        bool Open(uint64 assessmentToken, int64 expiresAtSteadyMs);
+
+        // Deliver exactly once, for a known token, before its deadline. Consumes the entry.
+        RoleplayAssessmentOutcome Settle(uint64 assessmentToken, int64 nowMs);
+
+        // Drops overdue entries so silent deaths cannot hold slots for the rest of the uptime.
+        std::vector<uint64> ExpireDue(int64 nowMs);
+
+        // Shutdown: drops everything at once and reports what was outstanding.
+        std::vector<uint64> Clear();
+
+        [[nodiscard]] std::size_t OutstandingCount() const { return _deadlines.size(); }
+
+    private:
+        std::map<uint64, int64> _deadlines;
+    };
+
     struct BridgeConfig
     {
         std::string host = "127.0.0.1";
@@ -847,6 +952,14 @@ namespace ClaudeChat
 
         bool TryEnqueueMemory(MemoryRequest request, int64 expiresAtSteadyMs);
         std::vector<MemoryResponse> DrainMemoryResponses();
+
+        /*
+         * World thread: the roleplay assessment lane, on the same socket and worker. Parsed in the
+         * worker like a biography, because everything needed to judge an answer is there: the
+         * authenticated token and the assessment token of the very request that was sent.
+         */
+        bool TryEnqueueRoleplayAssessment(RoleplayAssessmentRequest request, int64 expiresAtSteadyMs);
+        std::vector<RoleplayAssessmentResponse> DrainRoleplayAssessmentResponses();
 
     private:
         struct Impl;

@@ -4,6 +4,7 @@
 
 #include "ClaudeChat.h"
 
+#include "SharedDefines.h"
 #include "utf8.h"
 
 #include <boost/asio.hpp>
@@ -16,6 +17,11 @@
 #include <variant>
 
 using boost::asio::ip::tcp;
+
+// The wire's expansion ceiling is the game's, stated once in SharedDefines. Two spellings of "the
+// last expansion" would drift exactly when a later core bump made the difference matter.
+static_assert(ClaudeChat::MAX_SOCIAL_ACTIVE_EXPANSION == EXPANSION_WRATH_OF_THE_LICH_KING,
+              "the wire's active_expansion ceiling must match the game's last expansion");
 
 namespace
 {
@@ -570,6 +576,7 @@ bool ClaudeChat::ResponseKindIsValid(ResponseKind kind)
         case ResponseKind::Social:
         case ResponseKind::Biography:
         case ResponseKind::Memory:
+        case ResponseKind::RoleplayAssessment:
             return true;
         default:
             break;
@@ -592,6 +599,8 @@ char const* ClaudeChat::ResponseKindName(ResponseKind kind)
             return "biography";
         case ResponseKind::Memory:
             return "memory";
+        case ResponseKind::RoleplayAssessment:
+            return "roleplay_assessment";
         default:
             break;
     }
@@ -613,6 +622,8 @@ std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::st
         return ResponseKind::Biography;
     if (name == "memory")
         return ResponseKind::Memory;
+    if (name == "roleplay_assessment")
+        return ResponseKind::RoleplayAssessment;
 
     return std::nullopt;
 }
@@ -1120,8 +1131,18 @@ namespace
     }
 }
 
-std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
+std::optional<std::string> ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
 {
+    /*
+     * The authority gate comes before any assembly. A mode or expansion outside the wire's
+     * vocabulary refuses the whole context rather than travelling as a spelling the sidecar would
+     * treat as malformed, and refusing here is what keeps "reject an invalid value" and "omit an
+     * invalid value" from ever being the same behaviour.
+     */
+    if (!PlayerbotRoleplayPromptModeIsValid(context.promptMode) ||
+        context.activeContentExpansion > MAX_SOCIAL_ACTIVE_EXPANSION)
+        return std::nullopt;
+
     /*
      * Assembled most specific last, so that dropping from the end to fit the total bound sheds the
      * least useful block first. The persona is written first for the same reason: whatever else has
@@ -1208,6 +1229,15 @@ std::string ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const&
     if (first)
         return std::string();
 
+    /*
+     * Authority last, after the check above: an entirely empty assembly still encodes to the empty
+     * string, because "nothing was assembled" already has that spelling and the far side answers an
+     * absent context in ordinary voice, which is the fail-closed floor this feature stands on.
+     * Written by re-encoding on every trim below, so no amount of shedding removes it.
+     */
+    AppendJsonField(out, "prompt_mode", std::string(PlayerbotRoleplayPromptModeName(context.promptMode)));
+    AppendJsonField(out, "active_expansion", static_cast<uint64>(context.activeContentExpansion));
+
     out += '}';
 
     /*
@@ -1247,10 +1277,16 @@ std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
     if (subject.empty())
         return std::string();
 
+    /*
+     * A starter is bot-initiated ordinary chat, so its authority is the ordinary floor by
+     * definition: bot-initiated roleplay does not exist, and the expansion is unread under the
+     * ordinary mode. The fields still have to be present, because the sidecar requires them on
+     * every structured context and would otherwise drop the starter on the only surface it uses.
+     */
     std::string out;
     out += "{\"starter\":";
     AppendEscapedJsonString(out, subject.substr(0, Utf8PrefixLength(subject, MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
-    out += '}';
+    out += ",\"prompt_mode\":\"ordinary\",\"active_expansion\":0}";
     return out;
 }
 
@@ -1757,7 +1793,7 @@ struct ClaudeChat::ClaudeBridge::Impl
     explicit Impl(BridgeConfig bridgeConfig)
         : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity),
           socialResponses(config.queueCapacity), biographyResponses(config.queueCapacity),
-          memoryResponses(config.queueCapacity)
+          memoryResponses(config.queueCapacity), assessmentResponses(config.queueCapacity)
     {
     }
 
@@ -1771,7 +1807,8 @@ struct ClaudeChat::ClaudeBridge::Impl
      */
     struct QueuedRequest
     {
-        std::variant<ChatRequest, SocialRequest, BiographyRequest, MemoryRequest> payload;
+        std::variant<ChatRequest, SocialRequest, BiographyRequest, MemoryRequest, RoleplayAssessmentRequest>
+            payload;
         int64 expiresAtSteadyMs = 0;
     };
 
@@ -1791,6 +1828,10 @@ struct ClaudeChat::ClaudeBridge::Impl
      */
     BoundedQueue<BiographyResponse> biographyResponses;
     BoundedQueue<MemoryResponse> memoryResponses;
+
+    // Parsed in the worker for the reason a biography is: the assessment token of the very request
+    // that was sent is in scope, so an answer to anything else never reaches the world thread.
+    BoundedQueue<RoleplayAssessmentResponse> assessmentResponses;
     std::atomic<bool> started{false};
     std::atomic<bool> stopped{false};
 
@@ -1936,6 +1977,8 @@ struct ClaudeChat::ClaudeBridge::Impl
             SocialRequest const* const social = std::get_if<SocialRequest>(&request.payload);
             BiographyRequest const* const biography = std::get_if<BiographyRequest>(&request.payload);
             MemoryRequest const* const memory = std::get_if<MemoryRequest>(&request.payload);
+            RoleplayAssessmentRequest const* const assessment =
+                std::get_if<RoleplayAssessmentRequest>(&request.payload);
 
             // A request that cannot be serialized within its budgets is discarded here rather than
             // sent for the far side to reject. Same fail closed posture as an expired one above.
@@ -1946,6 +1989,8 @@ struct ClaudeChat::ClaudeBridge::Impl
                 payload = SerializeBiographyRequest(*biography, config.token);
             else if (memory)
                 payload = SerializeMemoryRequest(*memory, config.token);
+            else if (assessment)
+                payload = SerializeRoleplayAssessmentRequest(*assessment, config.token);
             else
                 payload = SerializeRequest(std::get<ChatRequest>(request.payload), config.token);
 
@@ -2020,6 +2065,17 @@ struct ClaudeChat::ClaudeBridge::Impl
                     if (std::optional<MemoryResponse> parsed = ParseMemoryResponsePayload(
                             *answer, config.token, memory->memoryRequestToken, memory->botGuidCounter))
                         memoryResponses.TryPush(std::move(*parsed));
+                }
+                else if (assessment)
+                {
+                    /*
+                     * Parsed here for the reason a biography is. There is no lateness judgement
+                     * either: the coordinator's own staleness fences decide whether the assessed
+                     * line is still worth acting on.
+                     */
+                    if (std::optional<RoleplayAssessmentResponse> parsed = ParseRoleplayAssessmentResponsePayload(
+                            *answer, config.token, assessment->assessmentToken))
+                        assessmentResponses.TryPush(std::move(*parsed));
                 }
                 else if (std::optional<ChatResponse> response = ParseResponsePayload(*answer, config.token))
                 {
@@ -2364,4 +2420,298 @@ std::optional<ClaudeChat::MemoryResponse> ClaudeChat::ParseMemoryResponsePayload
     }
 
     return response;
+}
+
+// --- Roleplay assessment lane ---
+
+char const* ClaudeChat::RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability)
+{
+    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+
+    switch (capability)
+    {
+        case Capability::ClassicContent:
+            return "classic_content";
+        case Capability::Outland:
+            return "outland";
+        case Capability::BloodElf:
+            return "blood_elf";
+        case Capability::Draenei:
+            return "draenei";
+        case Capability::DeathKnight:
+            return "death_knight";
+        case Capability::BurningCrusadeProfession:
+            return "burning_crusade_profession";
+        case Capability::WrathProfession:
+            return "wrath_profession";
+        case Capability::OtherBurningCrusade:
+            return "other_burning_crusade";
+        case Capability::OtherWrath:
+            return "other_wrath";
+        case Capability::Unknown:
+            return "unknown";
+    }
+
+    return "invalid";
+}
+
+std::optional<VanillaOnlyRules::RoleplayContentCapability> ClaudeChat::RoleplayContentCapabilityFromName(
+    std::string const& name)
+{
+    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+
+    // Exact match only, same as every other wire spelling in this protocol.
+    if (name == "classic_content")
+        return Capability::ClassicContent;
+    if (name == "outland")
+        return Capability::Outland;
+    if (name == "blood_elf")
+        return Capability::BloodElf;
+    if (name == "draenei")
+        return Capability::Draenei;
+    if (name == "death_knight")
+        return Capability::DeathKnight;
+    if (name == "burning_crusade_profession")
+        return Capability::BurningCrusadeProfession;
+    if (name == "wrath_profession")
+        return Capability::WrathProfession;
+    if (name == "other_burning_crusade")
+        return Capability::OtherBurningCrusade;
+    if (name == "other_wrath")
+        return Capability::OtherWrath;
+    if (name == "unknown")
+        return Capability::Unknown;
+
+    return std::nullopt;
+}
+
+std::optional<PlayerbotRoleplayAssessmentKind> ClaudeChat::RoleplayAssessmentKindFromName(std::string const& name)
+{
+    if (name == "ordinary")
+        return PlayerbotRoleplayAssessmentKind::Ordinary;
+    if (name == "roleplay_invitation")
+        return PlayerbotRoleplayAssessmentKind::RoleplayInvitation;
+    if (name == "roleplay_continuation")
+        return PlayerbotRoleplayAssessmentKind::RoleplayContinuation;
+    if (name == "practical")
+        return PlayerbotRoleplayAssessmentKind::Practical;
+    if (name == "opt_out")
+        return PlayerbotRoleplayAssessmentKind::OptOut;
+    if (name == "uncertain")
+        return PlayerbotRoleplayAssessmentKind::Uncertain;
+
+    return std::nullopt;
+}
+
+bool ClaudeChat::RoleplayAssessmentRequestIsUsable(RoleplayAssessmentRequest const& request,
+                                                   std::string const& token)
+{
+    if (!BridgeTokenIsUsable(token) || request.assessmentToken == 0)
+        return false;
+
+    if (request.threadPublicId.empty() || request.threadPublicId.size() > MAX_THREAD_ID_BYTES)
+        return false;
+
+    // Nothing to classify is not a request. The provider refuses it and the coordinator falls back
+    // to ordinary activation rather than paying a round trip for an empty question.
+    if (request.currentLine.empty() || request.currentLine.size() > MAX_SOCIAL_CONTEXT_ENTRY_BYTES)
+        return false;
+
+    if (request.threadLines.size() > MAX_SOCIAL_CONTEXT_ENTRIES)
+        return false;
+
+    for (std::string const& line : request.threadLines)
+        if (line.empty() || line.size() > MAX_SOCIAL_CONTEXT_ENTRY_BYTES)
+            return false;
+
+    return true;
+}
+
+std::optional<std::string> ClaudeChat::SerializeRoleplayAssessmentRequest(RoleplayAssessmentRequest const& request,
+                                                                          std::string const& token)
+{
+    if (!RoleplayAssessmentRequestIsUsable(request, token))
+        return std::nullopt;
+
+    std::string out;
+    out.reserve(512 + request.currentLine.size() + request.threadLines.size() * 64);
+    out += '{';
+    AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
+    AppendJsonField(out, "token", token);
+    AppendJsonField(out, "kind", std::string(ResponseKindName(ResponseKind::RoleplayAssessment)));
+    AppendJsonField(out, "roleplay_assessment_request_token", request.assessmentToken);
+    AppendJsonField(out, "channel", static_cast<uint64>(request.channel));
+    AppendJsonField(out, "thread_id", request.threadPublicId);
+    AppendJsonField(out, "current_line", request.currentLine);
+
+    // Nested here, like the memory thread: this direction is only written by the worldserver and
+    // read by a schema validating parser on the far side.
+    out += ",\"thread_lines\":[";
+    for (std::size_t index = 0; index < request.threadLines.size(); ++index)
+    {
+        if (index != 0)
+            out += ',';
+
+        AppendEscapedJsonString(out, request.threadLines[index]);
+    }
+    out += "]}";
+
+    return out;
+}
+
+std::optional<ClaudeChat::RoleplayAssessmentResponse> ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+    std::string const& payload, std::string const& expectedToken, uint64 expectedAssessmentToken)
+{
+    std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
+    if (!fields)
+        return std::nullopt;
+
+    auto const schemaIt = fields->find("schema_version");
+    auto const tokenIt = fields->find("token");
+    auto const kindIt = fields->find("kind");
+    auto const requestIt = fields->find("roleplay_assessment_request_token");
+    auto const assessmentKindIt = fields->find("assessment_kind");
+    auto const countIt = fields->find("capability_count");
+
+    if (schemaIt == fields->end() || tokenIt == fields->end() || kindIt == fields->end() ||
+        requestIt == fields->end() || assessmentKindIt == fields->end() || countIt == fields->end())
+        return std::nullopt;
+
+    if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
+        return std::nullopt;
+
+    if (!BridgeTokenIsUsable(expectedToken))
+        return std::nullopt;
+
+    if (!tokenIt->second.isString || !BridgeTokenIsUsable(tokenIt->second.text) ||
+        !ConstantTimeEquals(tokenIt->second.text, expectedToken))
+        return std::nullopt;
+
+    if (!kindIt->second.isString)
+        return std::nullopt;
+
+    std::optional<ResponseKind> const kind = ResponseKindFromName(kindIt->second.text);
+    if (!kind || *kind != ResponseKind::RoleplayAssessment)
+        return std::nullopt;
+
+    // Identity before content: a well formed answer to a different assessment is refused.
+    if (requestIt->second.isString || requestIt->second.number != expectedAssessmentToken)
+        return std::nullopt;
+
+    if (!assessmentKindIt->second.isString)
+        return std::nullopt;
+
+    std::optional<PlayerbotRoleplayAssessmentKind> const assessmentKind =
+        RoleplayAssessmentKindFromName(assessmentKindIt->second.text);
+    if (!assessmentKind)
+        return std::nullopt;
+
+    // Ten values is the whole vocabulary, so any larger count is malformed before its slots are read.
+    if (countIt->second.isString || countIt->second.number > 10)
+        return std::nullopt;
+
+    std::size_t const count = static_cast<std::size_t>(countIt->second.number);
+
+    // Six protocol keys plus one per capability, counted exactly: the parser already refuses
+    // duplicate keys, so the exact count is what refuses unknown fields and mismatched slots.
+    if (fields->size() != 6 + count)
+        return std::nullopt;
+
+    RoleplayAssessmentResponse response;
+    response.assessmentToken = expectedAssessmentToken;
+    response.kind = *assessmentKind;
+    response.capabilities.reserve(count);
+
+    for (std::size_t index = 0; index < count; ++index)
+    {
+        auto const capabilityIt = fields->find("capability_" + std::to_string(index));
+        if (capabilityIt == fields->end() || !capabilityIt->second.isString)
+            return std::nullopt;
+
+        std::optional<VanillaOnlyRules::RoleplayContentCapability> const capability =
+            RoleplayContentCapabilityFromName(capabilityIt->second.text);
+        if (!capability)
+            return std::nullopt;
+
+        response.capabilities.push_back(*capability);
+    }
+
+    // The per kind cardinality contract, enforced before any result reaches the coordinator.
+    if (!PlayerbotSocialRoleplayAssessmentShapeIsValid(response.kind, response.capabilities))
+        return std::nullopt;
+
+    return response;
+}
+
+bool ClaudeChat::RoleplayAssessmentExchange::Open(uint64 assessmentToken, int64 expiresAtSteadyMs)
+{
+    if (assessmentToken == 0 || _deadlines.size() >= MAX_OUTSTANDING_ROLEPLAY_ASSESSMENTS)
+        return false;
+
+    return _deadlines.emplace(assessmentToken, expiresAtSteadyMs).second;
+}
+
+ClaudeChat::RoleplayAssessmentOutcome ClaudeChat::RoleplayAssessmentExchange::Settle(uint64 assessmentToken,
+                                                                                    int64 nowMs)
+{
+    auto const found = _deadlines.find(assessmentToken);
+    if (found == _deadlines.end())
+        return RoleplayAssessmentOutcome::Abandon;
+
+    int64 const expiresAtMs = found->second;
+    _deadlines.erase(found);
+
+    return nowMs <= expiresAtMs ? RoleplayAssessmentOutcome::Deliver : RoleplayAssessmentOutcome::Abandon;
+}
+
+std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::ExpireDue(int64 nowMs)
+{
+    std::vector<uint64> expired;
+    for (auto it = _deadlines.begin(); it != _deadlines.end();)
+    {
+        if (nowMs > it->second)
+        {
+            expired.push_back(it->first);
+            it = _deadlines.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    return expired;
+}
+
+std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::Clear()
+{
+    std::vector<uint64> outstanding;
+    outstanding.reserve(_deadlines.size());
+    for (auto const& [token, deadline] : _deadlines)
+        outstanding.push_back(token);
+
+    _deadlines.clear();
+    return outstanding;
+}
+
+bool ClaudeChat::ClaudeBridge::TryEnqueueRoleplayAssessment(RoleplayAssessmentRequest request,
+                                                            int64 expiresAtSteadyMs)
+{
+    if (_impl->stopped.load())
+        return false;
+
+    if (SteadyNowMs() > expiresAtSteadyMs)
+        return false;
+
+    return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
+}
+
+std::vector<ClaudeChat::RoleplayAssessmentResponse> ClaudeChat::ClaudeBridge::DrainRoleplayAssessmentResponses()
+{
+    std::vector<RoleplayAssessmentResponse> drained;
+    RoleplayAssessmentResponse response;
+    while (_impl->assessmentResponses.TryPop(response))
+        drained.push_back(std::move(response));
+
+    return drained;
 }

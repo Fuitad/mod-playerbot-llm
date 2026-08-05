@@ -104,6 +104,14 @@ This module's own whisper, party, and ambient hooks stand down completely in thi
 
 See the interactive social chat section of the mod-playerbots README for the surfaces, the opt out commands, retention, and moderation.
 
+#### Roleplay affinity
+
+When a human line inside an established conversation may be inviting or continuing in-character roleplay, the coordinator first asks this module to classify it. That preflight is classification only: the model reports one of six results (ordinary, roleplay invitation, roleplay continuation, practical, opt out, uncertain) plus the game content the premise depends on, and the worldserver alone decides what follows. The classifier sees the channel, the opaque thread identity, the current line, and a bounded set of recent thread lines, consent filtered like every other social surface. It is admitted under the same daily budget as every other request, with the same human priority as the reply it precedes.
+
+Whether a bot plays along is the worldserver's decision, never the model's. Each bot has a deterministic roleplay affinity derived from its identity: averse bots decline in their ordinary voice, neutral bots acknowledge without joining in, and receptive bots may be authorized to answer in character for that one reply. The authorization travels to this module as one of four trusted prompt modes (ordinary, decline, acknowledge, authorized), and only the authorized mode lifts the ordinary player voice. The premise is held to the realm's active progression content (Classic): the worldserver checks it before authorizing, and checks the finished line again before it is spoken, so content from a later expansion is refused even when the classifier missed it. A player who asks to stop is not invited again in that conversation, and `.playerbots social off` still opts a character out of the feature entirely.
+
+Every failure in this path (no provider, refusal, budget, timeout, malformed output) falls back to the ordinary social behavior described above. Bots never start roleplay on their own and never roleplay among themselves; only an observed human line can begin this path. Bot initiated and idle roleplay are not implemented.
+
 ### With interactive social chat disabled (`AiPlayerbot.SocialChat.Enable = 0`)
 
 Legacy compatibility only. This is what a realm that has not turned interactive social chat on still gets, described so an operator upgrading from it knows what changes. It is not the intended configuration and nothing below is part of Social.
@@ -137,7 +145,9 @@ For a direct conversation or milestone, the sidecar sends the following to the A
 
 An ambient request sends only the selected bot's name, personality numbers, voice, and a fixed instruction to offer one brief World observation. It sends no human identity, human text, or conversation history. Ambient input and output are never appended to conversation memory.
 
-A social request, when `AiPlayerbot.SocialChat.Enable = 1`, sends the speaking bot's name, the other character's name, which of the four channels the answer will be spoken on, an opaque thread identity, and a bounded context the coordinator assembled: the bot's persona, its relationship with that character, who is nearby, recent lines from the thread, the subject when it is opening a conversation, and the memories it is allowed to draw on. Everything in it is bounded per field and in total, and all of it is marked untrusted.
+A social request, when `AiPlayerbot.SocialChat.Enable = 1`, sends the speaking bot's name, the other character's name, which of the four channels the answer will be spoken on, an opaque thread identity, and a bounded context the coordinator assembled: the bot's persona, its relationship with that character, who is nearby, recent lines from the thread, the subject when it is opening a conversation, and the memories it is allowed to draw on. Everything in it is bounded per field and in total, and all of it is marked untrusted. The context also carries two trusted values the worldserver chose, never the player: the prompt mode (ordinary, decline, acknowledge, or authorized roleplay) and the active progression expansion.
+
+A roleplay assessment request, sent before an eligible social reply, carries the channel, the opaque thread identity, the current line, and a bounded set of recent thread lines, all marked untrusted. It sends no character GUIDs, no personality values, and no memories.
 
 Memories are filtered by the channel's privacy scope, twice. The coordinator filters before sending and the sidecar filters again on arrival, so something a bot learned in a whisper cannot be repeated in a zone even if the producer has a bug. Identity in a social prompt is the character name the coordinator supplied, and the answer is validated against that name rather than against anything the model wrote.
 
