@@ -19,6 +19,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 
+#include "Bot/Personality/PlayerbotPersonalityMgr.h"
 #include "Bot/Social/PlayerbotSocialMgr.h"
 #include "Bot/Social/PlayerbotSocialRoute.h"
 #include "ExternalEventHelper.h"
@@ -595,8 +596,12 @@ namespace
                     continue;
 
                 uint64 const counter = member->GetGUID().GetCounter();
-                PlayerbotPersonalityProfile const profile = PlayerbotPersonality::DeriveProfile(counter);
-                candidates.push_back({counter, profile.sociability});
+                std::optional<PlayerbotPersonalityProfile> const profile =
+                    sPlayerbotPersonalityMgr.GetOrCreate(counter);
+                if (!profile.has_value())
+                    continue;
+
+                candidates.push_back({counter, profile->sociability});
                 byCounter[counter] = member;
             }
 
@@ -624,12 +629,15 @@ namespace
             if (!bot)
                 return;
 
-            ChatRequest request = BuildRequestBase(ChatChannel::Party, bot, actor);
-            request.message = BoundedText(std::move(context));
-            request.eventKind = eventId.kind;
-            request.subjectId = eventId.subjectId;
-            request.occurrence = eventId.occurrence;
-            Enqueue(std::move(request), bot, actor, ChatChannel::Party);
+            std::optional<ChatRequest> request = BuildRequestBase(ChatChannel::Party, bot, actor);
+            if (!request.has_value())
+                return;
+
+            request->message = BoundedText(std::move(context));
+            request->eventKind = eventId.kind;
+            request->subjectId = eventId.subjectId;
+            request->occurrence = eventId.occurrence;
+            Enqueue(std::move(*request), bot, actor, ChatChannel::Party);
         }
 
         void Update()
@@ -835,8 +843,12 @@ namespace
                     continue;
 
                 uint64 const counter = bot->GetGUID().GetCounter();
-                PlayerbotPersonalityProfile const profile = PlayerbotPersonality::DeriveProfile(counter);
-                candidates.push_back({counter, profile.sociability});
+                std::optional<PlayerbotPersonalityProfile> const profile =
+                    sPlayerbotPersonalityMgr.GetOrCreate(counter);
+                if (!profile.has_value())
+                    continue;
+
+                candidates.push_back({counter, profile->sociability});
                 byCounter[counter] = bot;
             }
 
@@ -860,7 +872,11 @@ namespace
             request.speakerGuidCounter = 0;
             request.botName = bot->GetName();
             request.speakerName.clear();
-            request.profile = PlayerbotPersonality::DeriveProfile(request.botGuidCounter);
+            std::optional<PlayerbotPersonalityProfile> const profile =
+                sPlayerbotPersonalityMgr.GetOrCreate(request.botGuidCounter);
+            if (!profile.has_value())
+                return;
+            request.profile = *profile;
             request.message = AMBIENT_EVENT_MARKER;
             request.eventKind = AMBIENT_EVENT_KIND;
             request.occurrence = occurrence;
@@ -868,9 +884,13 @@ namespace
             Enqueue(std::move(request), bot, nullptr, ChatChannel::World);
         }
 
-        ChatRequest BuildRequestBase(ChatChannel channel, Player* bot, Player* speaker)
+        std::optional<ChatRequest> BuildRequestBase(ChatChannel channel, Player* bot, Player* speaker)
         {
             uint64 const botCounter = bot->GetGUID().GetCounter();
+            std::optional<PlayerbotPersonalityProfile> const profile =
+                sPlayerbotPersonalityMgr.GetOrCreate(botCounter);
+            if (!profile.has_value())
+                return std::nullopt;
 
             ChatRequest request;
             request.requestId = _nextRequestId++;
@@ -879,17 +899,20 @@ namespace
             request.speakerGuidCounter = speaker->GetGUID().GetCounter();
             request.botName = bot->GetName();
             request.speakerName = speaker->GetName();
-            request.profile = PlayerbotPersonality::DeriveProfile(botCounter);
+            request.profile = *profile;
             request.expiresAtSteadyMs = SteadyNowMs() + _responseDeadlineMs;
             return request;
         }
 
         void EnqueueConversation(ChatChannel channel, Player* bot, Player* speaker, std::string text)
         {
-            ChatRequest request = BuildRequestBase(channel, bot, speaker);
-            request.message = std::move(text);
-            request.eventKind = 0;
-            Enqueue(std::move(request), bot, speaker, channel);
+            std::optional<ChatRequest> request = BuildRequestBase(channel, bot, speaker);
+            if (!request.has_value())
+                return;
+
+            request->message = std::move(text);
+            request->eventKind = 0;
+            Enqueue(std::move(*request), bot, speaker, channel);
         }
 
         /*

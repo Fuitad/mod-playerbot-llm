@@ -4,11 +4,11 @@
 
 #include "PlayerbotPersonality.h"
 
-// The module is compiled only against personality contract version 2. A newer private
+// The module is compiled only against personality contract version 3. A newer private
 // playerbots revision that bumps the version must ship a matching module update; failing
 // the build here is the compatibility guarantee.
-static_assert(PLAYERBOT_PERSONALITY_API_VERSION == 2,
-              "mod-playerbot-claude requires playerbot personality API version 2");
+static_assert(PLAYERBOT_PERSONALITY_API_VERSION == 3,
+              "mod-playerbot-claude requires playerbot personality API version 3");
 
 void AddClaudeChatScripts();
 
