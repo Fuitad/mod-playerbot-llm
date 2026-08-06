@@ -92,10 +92,16 @@ namespace
         ~FakeSidecarServer()
         {
             _stopping = true;
+
+            boost::asio::io_context wakeIo;
+            boost::asio::ip::tcp::socket wakeSocket(wakeIo);
             boost::system::error_code ec;
-            _acceptor.close(ec);
+            wakeSocket.connect(
+                boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), _port), ec);
             if (_thread.joinable())
                 _thread.join();
+
+            _acceptor.close(ec);
         }
 
         uint16_t Port() const { return _port; }
