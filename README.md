@@ -50,6 +50,7 @@ All keys live in `mod_playerbot_claude.conf` and are read by both worldserver an
 | `PlayerbotClaude.InputUsdPerMTok` | `1.00` | Price per million input tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.OutputUsdPerMTok` | `5.00` | Price per million output tokens (Claude Haiku 4.5). |
 | `PlayerbotClaude.ResponseDeadlineMs` | `10000` | How long a pending conversation or career choice waits. |
+| `PlayerbotClaude.LogModelIO` | `0` | Logs complete model prompts and raw replies for temporary local diagnostics. |
 | `PlayerbotClaude.QueueSize` | `16` | Bounded queue between the world thread and the bridge worker. |
 | `PlayerbotClaude.GroupCooldownSeconds` | `120` | Minimum seconds between milestone reactions per group. |
 

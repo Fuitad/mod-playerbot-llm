@@ -140,6 +140,15 @@ PlayerbotClaude.OutputUsdPerMTok = 5.00
 PlayerbotClaude.ResponseDeadlineMs = 10000
 
 #
+#    PlayerbotClaude.LogModelIO
+#        Logs the complete system prompt, user messages, output schema, and raw provider reply for
+#        every generation. This includes player conversation content and generated memories. Enable
+#        it only for temporary local diagnostics, then delete the captured log.
+#        Default: 0
+
+PlayerbotClaude.LogModelIO = 0
+
+#
 #    PlayerbotClaude.QueueSize
 #        Description: Maximum pending requests between the world thread and the bridge worker.
 #                     A full queue rejects new requests immediately.

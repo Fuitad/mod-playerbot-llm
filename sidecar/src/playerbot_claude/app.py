@@ -128,6 +128,7 @@ class SidecarConfig:
     input_usd_per_mtok: str = "1.00"
     output_usd_per_mtok: str = "5.00"
     response_deadline_ms: int = 10000
+    log_model_io: bool = False
     queue_size: int = 16
     group_cooldown_seconds: int = 120
 
@@ -155,6 +156,7 @@ class SidecarConfig:
             input_usd_per_mtok=option("InputUsdPerMTok", "1.00"),
             output_usd_per_mtok=option("OutputUsdPerMTok", "5.00"),
             response_deadline_ms=int(option("ResponseDeadlineMs", "10000")),
+            log_model_io=option("LogModelIO", "0") == "1",
             queue_size=int(option("QueueSize", "16")),
             group_cooldown_seconds=int(option("GroupCooldownSeconds", "120")),
         )
@@ -359,7 +361,10 @@ class SidecarService:
         self._token = token
         # The default SDK client's own timeout is capped at the response deadline so
         # a provider call cannot outlive the request that paid for it.
-        self._adapter = adapter or claude.ClaudeAdapter(timeout_seconds=config.response_deadline_ms / 1000)
+        self._adapter = adapter or claude.ClaudeAdapter(
+            timeout_seconds=config.response_deadline_ms / 1000,
+            model_io_logger=_log if config.log_model_io else None,
+        )
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
         self._generation_lock = asyncio.Lock()

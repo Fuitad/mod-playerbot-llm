@@ -444,6 +444,30 @@ def messages_response(message_text: str, usage: dict[str, int] | None = None) ->
     return httpx.Response(200, json=body)
 
 
+def social_messages_response(message_text: str, emote: str = "") -> httpx.Response:
+    body = {
+        "id": "msg_social_01",
+        "type": "message",
+        "role": "assistant",
+        "model": claude.MODEL_ID,
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps({"message": message_text, "emote": emote}),
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 300,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+    return httpx.Response(200, json=body)
+
+
 def career_messages_response(candidate_token: str, spending_style: str) -> httpx.Response:
     body = {
         "id": "msg_career_01",
@@ -530,6 +554,74 @@ def test_generate_reply_includes_bounded_history() -> None:
 
     roles = [m["role"] for m in captured["body"]["messages"]]
     assert roles == ["user", "assistant", "user"]
+
+
+def test_model_io_trace_records_the_exact_prompt_and_social_reply() -> None:
+    trace: list[str] = []
+    social_reply = "I'm 29 years old and from Canada."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return social_messages_response(social_reply)
+
+    request = protocol.parse_social_request(
+        _social_request_payload(
+            context=_context(
+                fictional_identity_request="age_and_home_country",
+                fictional_age=29,
+                fictional_home_country="Canada",
+            )
+        ),
+        TEST_TOKEN,
+    )
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler), model_io_logger=trace.append)
+
+    message, emote, _ = adapter.generate_social_reply(request)
+
+    assert message == social_reply
+    assert emote == 0
+
+    assert len(trace) == 2
+    prompt = json.loads(trace[0])
+    assert prompt == {
+        "phase": "request",
+        "kind": "social",
+        "correlation_id": request.social_request_token,
+        "model": claude.MODEL_ID,
+        "max_tokens": claude.MAX_OUTPUT_TOKENS,
+        "system": claude.build_social_system_prompt(request),
+        "messages": claude._social_messages(request),
+        "output_schema": claude.SocialReply.model_json_schema(),
+    }
+
+    response = json.loads(trace[1])
+    assert response["phase"] == "response"
+    assert response["kind"] == "social"
+    assert response["correlation_id"] == request.social_request_token
+    assert response["provider_message"]["content"][0]["text"] == json.dumps(
+        {"message": social_reply, "emote": ""}
+    )
+
+
+def test_model_io_trace_records_raw_social_reply_before_schema_parsing() -> None:
+    trace: list[str] = []
+    raw_reply = "{not valid json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = social_messages_response("")
+        body = json.loads(response.content)
+        body["content"][0]["text"] = raw_reply
+        return httpx.Response(200, json=body)
+
+    request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
+    adapter = claude.ClaudeAdapter(client=make_mock_client(handler), model_io_logger=trace.append)
+
+    with pytest.raises(claude.ClaudeInvalidOutputError):
+        adapter.generate_social_reply(request)
+
+    assert len(trace) == 2
+    response = json.loads(trace[1])
+    assert response["phase"] == "response"
+    assert response["provider_message"]["content"][0]["text"] == raw_reply
 
 
 def test_ambient_provider_payload_uses_only_bot_personality() -> None:
@@ -720,6 +812,7 @@ PlayerbotClaude.AmbientWorldEnable = 1
 PlayerbotClaude.AmbientMaxMessagesPerHour = 6
 PlayerbotClaude.DailyBudgetUsd = 5.0
 PlayerbotClaude.ResponseDeadlineMs = 10000
+PlayerbotClaude.LogModelIO = 1
 PlayerbotClaude.QueueSize = 16
 PlayerbotClaude.GroupCooldownSeconds = 120
 """
@@ -738,6 +831,7 @@ def test_config_parses_worldserver_conf(tmp_path) -> None:
     assert config.ambient_world_enable is True
     assert config.ambient_max_messages_per_hour == 6
     assert config.budget_nano == budget.usd_to_nano("5")
+    assert config.log_model_io is True
 
 
 def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
@@ -1470,14 +1564,21 @@ def test_the_default_adapter_client_timeout_is_capped_at_the_deadline(tmp_path, 
     captured: dict[str, object] = {}
 
     class RecordingAdapter(claude.ClaudeAdapter):
-        def __init__(self, client=None, timeout_seconds: float = claude.REQUEST_TIMEOUT_SECONDS) -> None:
+        def __init__(
+            self,
+            client=None,
+            timeout_seconds: float = claude.REQUEST_TIMEOUT_SECONDS,
+            model_io_logger=None,
+        ) -> None:
             captured["timeout_seconds"] = timeout_seconds
+            captured["model_io_logger"] = model_io_logger
 
     monkeypatch.setattr(claude, "ClaudeAdapter", RecordingAdapter)
     config = app.SidecarConfig.load(write_conf(tmp_path))
     app.SidecarService(config=config, token=TEST_TOKEN, store=FakeState(config.budget_nano))
 
     assert captured["timeout_seconds"] == config.response_deadline_ms / 1000
+    assert captured["model_io_logger"] is app._log
 
 
 async def test_the_response_deadline_stops_a_slow_request_without_charging_it_free(tmp_path) -> None:
@@ -2007,7 +2108,7 @@ async def test_rejected_output_asks_for_a_regeneration_rather_than_going_silent(
     assert store.outstanding == {}
 
 
-async def test_contradictory_identity_output_uses_the_existing_regeneration_path(tmp_path) -> None:
+async def test_identity_output_is_delivered_without_semantic_regeneration(tmp_path) -> None:
     service, _, adapter = make_stored_service(tmp_path)
     adapter.social_reply = "I'm 30."
     context = _context(fictional_identity_request="age", fictional_age=29)
@@ -2016,8 +2117,8 @@ async def test_contradictory_identity_output_uses_the_existing_regeneration_path
 
     assert answer is not None
     decoded = json.loads(answer)
-    assert decoded["regenerate"] == 1
-    assert decoded["message"] == ""
+    assert decoded["regenerate"] == 0
+    assert decoded["message"] == "I'm 30."
     assert len(adapter.social_requests) == 1
 
 
@@ -2419,64 +2520,26 @@ def test_malformed_reserved_identity_context_is_dropped_on_every_channel() -> No
             assert "Atlantis" not in system + user
 
 
-def test_identity_output_gate_requires_approved_facts_and_rejects_substitutions() -> None:
+def test_identity_output_is_not_grammar_or_fact_validated() -> None:
     def request_for(**identity: object) -> protocol.SocialRequest:
         return protocol.parse_social_request(
             _social_request_payload(context=_context(**identity)), TEST_TOKEN
         )
 
-    approved_age = request_for(fictional_identity_request="age", fictional_age=29)
-    assert claude.validate_social_message("I'm 29.", approved_age) == "I'm 29."
-    assert claude.validate_social_message("I am 29 years old.", approved_age) == "I am 29 years old."
-
-    approved_country = request_for(fictional_identity_request="home_country", fictional_home_country="Canada")
-    assert claude.validate_social_message("I'm from Canada.", approved_country) == "I'm from Canada."
-
-    age_withheld = request_for(fictional_identity_request="age")
-    country_withheld = request_for(fictional_identity_request="home_country")
-    both_withheld = request_for(fictional_identity_request="age_and_home_country")
-    for request in (age_withheld, country_withheld, both_withheld):
-        assert claude.validate_social_message("I'd rather keep that private.", request) == (
-            "I'd rather keep that private."
-        )
-
-    mixed = request_for(fictional_identity_request="age_and_home_country", fictional_age=29)
-    assert claude.validate_social_message("I'm 29, but I'm not saying where.", mixed) == (
-        "I'm 29, but I'm not saying where."
-    )
-    assert claude.validate_social_message("I'm 29 and I'm not saying where.", mixed) == (
-        "I'm 29 and I'm not saying where."
-    )
-
-    both_approved = request_for(
+    identity_request = request_for(
         fictional_identity_request="age_and_home_country",
-        fictional_age=29,
-        fictional_home_country="Canada",
+        fictional_age=36,
+        fictional_home_country="Slovakia",
     )
-    assert claude.validate_social_message("I'm 29 and I'm from Canada.", both_approved) == (
-        "I'm 29 and I'm from Canada."
+    captured_replies = (
+        "hey! i'm 36 from slovakia. what's up?",
+        "Hey! I'm 36 and from Slovakia. What's up?",
     )
+    for message in captured_replies:
+        assert claude.validate_social_message(message, identity_request) == message
 
-    rejected = (
-        ("I'm 30.", approved_age),
-        ("Not telling you.", approved_age),
-        ("I'm from France.", approved_country),
-        ("I'm from Canada, not France.", approved_country),
-        ("I'm from Toronto.", approved_country),
-        ("I'm Canadian.", approved_country),
-        ("Keeping that private.", approved_country),
-        ("I'm 29.", age_withheld),
-        ("I'm from Canada.", country_withheld),
-        ("Not Canada.", country_withheld),
-        ("I'm 29 and I'm from Canada.", both_withheld),
-        ("I'm 29 and I'm from Toronto.", mixed),
-        ("I'm 29 and Canadian.", mixed),
-        ("I'm 29.", both_approved),
-    )
-    for message, request in rejected:
-        with pytest.raises(claude.ClaudeInvalidOutputError) as caught:
-            claude.validate_social_message(message, request)
-        assert caught.value.category == claude.ModerationCategory.FICTIONAL_IDENTITY
+    contradictory = "I'm 30 and from France."
+    assert claude.validate_social_message(contradictory, identity_request) == contradictory
 
 
 def test_a_public_channel_never_sees_a_private_memory() -> None:
@@ -2996,7 +3059,6 @@ def test_a_rejection_names_an_objective_category() -> None:
         "emote_channel_illegal",
         "unknown_subject",
         "scope_mismatch",
-        "fictional_identity",
     }
 
 
@@ -3071,12 +3133,6 @@ def test_every_moderation_category_is_reachable() -> None:
 
     record(lambda: claude.validate_social_message("kill yourself", request))
     record(lambda: claude.validate_social_message("Deszy Deszy Deszy Deszy", request))
-    identity_request = protocol.parse_social_request(
-        _social_request_payload(context=_context(fictional_identity_request="age", fictional_age=29)),
-        TEST_TOKEN,
-    )
-    record(lambda: claude.validate_social_message("I'm 30.", identity_request))
-
     # BOTH_ANSWERS is raised inside generate_social_reply, which needs a provider, so it is
     # named here rather than exercised: the parametrized adapter tests cover that path.
     seen.add(claude.ModerationCategory.BOTH_ANSWERS)

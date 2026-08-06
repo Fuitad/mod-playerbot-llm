@@ -10,14 +10,16 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 import anthropic
 import httpx
-from anthropic.types import MessageParam
+from anthropic.lib._parse._response import parse_response
+from anthropic.lib._parse._transform import transform_schema
+from anthropic.types import MessageParam, ParsedMessage
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from playerbot_claude import protocol
@@ -83,6 +85,8 @@ _FICTIONAL_IDENTITY_KEYS = (
     "fictional_age",
     "fictional_home_country",
 )
+
+_ResponseModelT = TypeVar("_ResponseModelT", bound=BaseModel)
 
 
 @dataclass(frozen=True)
@@ -162,7 +166,6 @@ class ModerationCategory(StrEnum):
     EMOTE_CHANNEL_ILLEGAL = "emote_channel_illegal"
     UNKNOWN_SUBJECT = "unknown_subject"
     SCOPE_MISMATCH = "scope_mismatch"
-    FICTIONAL_IDENTITY = "fictional_identity"
 
 
 class ClaudeInvalidOutputError(ClaudeError):
@@ -662,6 +665,7 @@ class ClaudeAdapter:
         self,
         client: anthropic.Anthropic | None = None,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        model_io_logger: Callable[[str], None] | None = None,
     ) -> None:
         # api_key is always passed explicitly: an empty value fails authentication
         # instead of silently falling back to the SDK's ANTHROPIC_API_KEY lookup.
@@ -669,6 +673,86 @@ class ClaudeAdapter:
             api_key=os.environ.get(API_KEY_ENV_VAR, ""),
             timeout=timeout_seconds,
             max_retries=1,
+        )
+        self._model_io_logger = model_io_logger
+
+    def _trace_request(
+        self,
+        kind: str,
+        correlation_id: int,
+        system: str,
+        messages: list[MessageParam],
+        output_format: type[BaseModel],
+        max_tokens: int,
+    ) -> None:
+        if self._model_io_logger is None:
+            return
+
+        self._model_io_logger(
+            json.dumps(
+                {
+                    "phase": "request",
+                    "kind": kind,
+                    "correlation_id": correlation_id,
+                    "model": MODEL_ID,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": messages,
+                    "output_schema": output_format.model_json_schema(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    def _trace_response(self, kind: str, correlation_id: int, response: BaseModel) -> None:
+        if self._model_io_logger is None:
+            return
+
+        provider_message = response.model_dump(
+            mode="json",
+            exclude={"parsed_output": True, "content": {"__all__": {"parsed_output"}}},
+            warnings=False,
+        )
+        self._model_io_logger(
+            json.dumps(
+                {
+                    "phase": "response",
+                    "kind": kind,
+                    "correlation_id": correlation_id,
+                    "provider_message": provider_message,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    def _generate_structured(
+        self,
+        kind: str,
+        correlation_id: int,
+        system: str,
+        messages: list[MessageParam],
+        output_format: type[_ResponseModelT],
+        max_tokens: int,
+    ) -> ParsedMessage[_ResponseModelT]:
+        self._trace_request(kind, correlation_id, system, messages, output_format, max_tokens)
+        response = self._client.messages.create(
+            model=MODEL_ID,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": transform_schema(output_format),
+                }
+            },
+        )
+        self._trace_response(kind, correlation_id, response)
+        return cast(
+            ParsedMessage[_ResponseModelT],
+            parse_response(response=response, output_format=output_format),
         )
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
@@ -708,13 +792,11 @@ class ClaudeAdapter:
         return result.input_tokens
 
     def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, int, UsageTotals]:
+        system = build_social_system_prompt(request)
+        messages = _social_messages(request)
         try:
-            response = self._client.messages.parse(
-                model=MODEL_ID,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=build_social_system_prompt(request),
-                messages=_social_messages(request),
-                output_format=SocialReply,
+            response = self._generate_structured(
+                "social", request.social_request_token, system, messages, SocialReply, MAX_OUTPUT_TOKENS
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -784,13 +866,16 @@ class ClaudeAdapter:
         fabricated ordinary result.
         """
 
+        system = build_roleplay_assessment_system_prompt(request)
+        messages = _roleplay_assessment_messages(request)
         try:
-            response = self._client.messages.parse(
-                model=MODEL_ID,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=build_roleplay_assessment_system_prompt(request),
-                messages=_roleplay_assessment_messages(request),
-                output_format=protocol.RoleplayAssessmentCompletion,
+            response = self._generate_structured(
+                "roleplay_assessment",
+                request.roleplay_assessment_request_token,
+                system,
+                messages,
+                protocol.RoleplayAssessmentCompletion,
+                MAX_OUTPUT_TOKENS,
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -839,13 +924,16 @@ class ClaudeAdapter:
         return result.input_tokens
 
     def generate_biography(self, request: protocol.BiographyRequest) -> tuple[dict[str, str], UsageTotals]:
+        system = build_biography_system_prompt(request)
+        messages = _biography_messages(request)
         try:
-            response = self._client.messages.parse(
-                model=MODEL_ID,
-                max_tokens=BIOGRAPHY_MAX_OUTPUT_TOKENS,
-                system=build_biography_system_prompt(request),
-                messages=_biography_messages(request),
-                output_format=BiographyReply,
+            response = self._generate_structured(
+                "biography",
+                request.biography_request_token,
+                system,
+                messages,
+                BiographyReply,
+                BIOGRAPHY_MAX_OUTPUT_TOKENS,
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -893,13 +981,11 @@ class ClaudeAdapter:
     def generate_memories(
         self, request: protocol.MemoryRequest
     ) -> tuple[list[dict[str, object]], UsageTotals]:
+        system = build_memory_system_prompt(request)
+        messages = _memory_messages(request)
         try:
-            response = self._client.messages.parse(
-                model=MODEL_ID,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=build_memory_system_prompt(request),
-                messages=_memory_messages(request),
-                output_format=MemoryReply,
+            response = self._generate_structured(
+                "memory", request.memory_request_token, system, messages, MemoryReply, MAX_OUTPUT_TOKENS
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -934,13 +1020,12 @@ class ClaudeAdapter:
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
     ) -> tuple[str, UsageTotals]:
         output_format = CareerReply if request.is_career else ChatReply
+        kind = "career" if request.is_career else "chat"
+        system = build_system_prompt(request)
+        messages = _build_messages(request, history)
         try:
-            response = self._client.messages.parse(
-                model=MODEL_ID,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=build_system_prompt(request),
-                messages=_build_messages(request, history),
-                output_format=output_format,
+            response = self._generate_structured(
+                kind, request.request_id, system, messages, output_format, MAX_OUTPUT_TOKENS
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error
@@ -1016,106 +1101,6 @@ _SOCIAL_LEAK_MARKERS = (
 # SHAPE, and the coordinator has its own burst check for the same reason.
 _SOCIAL_STRUCTURE_MARKERS = ("```", "###", "</", "/>")
 
-_FIRST_PERSON_AGE = re.compile(
-    r"\b(?:i(?:'m|\s+am)|my\s+age\s+is)\s+(\d{1,3})(?:\s+years?\s+old)?\b",
-    re.IGNORECASE,
-)
-_YEARS_OLD_AGE = re.compile(r"\b(\d{1,3})\s+years?\s+old\b", re.IGNORECASE)
-_FIRST_PERSON_ORIGIN = re.compile(
-    r"\b(?:i(?:'m|\s+am)\s+from|i\s+come\s+from|my\s+home\s+country\s+is)\s+"
-    r"([^,.;!?]+?)(?=\s+(?:and|but)\b|[,.;!?]|$)",
-    re.IGNORECASE,
-)
-_FIRST_PERSON_COPULA = re.compile(r"\bi(?:'m|\s+am)\s+([^,.;!?]+)", re.IGNORECASE)
-_ROSTER_COUNTRY = re.compile(
-    r"(?<![a-z])("
-    + "|".join(re.escape(country.casefold()) for country in protocol.FICTIONAL_IDENTITY_COUNTRIES)
-    + r")(?![a-z])"
-)
-_IDENTITY_DEFLECTION_PREFIXES = (
-    "not ",
-    "keeping ",
-    "keep ",
-    "rather ",
-    "private",
-    "uncomfortable ",
-    "sorry",
-    "going to ",
-    "gonna ",
-    "telling ",
-    "saying ",
-    "sharing ",
-    "answering ",
-    "discussing ",
-)
-
-
-def _asserted_ages(message: str) -> set[int]:
-    return {
-        int(match.group(1))
-        for pattern in (_FIRST_PERSON_AGE, _YEARS_OLD_AGE)
-        for match in pattern.finditer(message)
-    }
-
-
-def _asserted_origins(message: str) -> list[str]:
-    return [match.group(1).strip().casefold() for match in _FIRST_PERSON_ORIGIN.finditer(message)]
-
-
-def _mentioned_roster_countries(message: str) -> set[str]:
-    return {match.group(1) for match in _ROSTER_COUNTRY.finditer(message.casefold())}
-
-
-def _has_copular_identity_substitution(message: str) -> bool:
-    for match in _FIRST_PERSON_COPULA.finditer(message):
-        for clause in re.split(r"\s+(?:and|but)\s+", match.group(1).strip().casefold()):
-            background = re.sub(r"^i(?:'m|\s+am)\s+", "", clause)
-            if background.startswith("from "):
-                continue
-            if re.fullmatch(r"\d{1,3}(?:\s+years?\s+old)?", background):
-                continue
-            if background.startswith(_IDENTITY_DEFLECTION_PREFIXES):
-                continue
-            return True
-    return False
-
-
-def _validate_fictional_identity(
-    message: str,
-    context: protocol.SocialContext,
-    usage: UsageTotals | None,
-) -> None:
-    request = context.fictional_identity_request
-    if request is None:
-        return
-
-    invalid = False
-    if request in {"age", "age_and_home_country"}:
-        ages = _asserted_ages(message)
-        if context.fictional_age is None:
-            invalid = bool(ages)
-        else:
-            invalid = ages != {context.fictional_age}
-
-    if request in {"home_country", "age_and_home_country"}:
-        origins = _asserted_origins(message)
-        mentioned_countries = _mentioned_roster_countries(message)
-        copular_substitution = _has_copular_identity_substitution(message)
-        if context.fictional_home_country is None:
-            invalid = invalid or bool(origins) or bool(mentioned_countries) or copular_substitution
-        else:
-            approved = context.fictional_home_country.casefold()
-            invalid = (
-                invalid or origins != [approved] or mentioned_countries != {approved} or copular_substitution
-            )
-
-    if invalid:
-        raise ClaudeInvalidOutputError(
-            "social message contradicted fictional identity",
-            usage,
-            ModerationCategory.FICTIONAL_IDENTITY,
-        )
-
 
 def validate_social_message(
     message: str, request: protocol.SocialRequest, usage: UsageTotals | None = None
@@ -1182,10 +1167,6 @@ def validate_social_message(
         raise ClaudeInvalidOutputError(
             "social message was formatted as a transcript", usage, ModerationCategory.TRANSCRIPT
         )
-
-    context = protocol.parse_social_context(request.context)
-    if context is not None:
-        _validate_fictional_identity(message, context, usage)
 
     return message
 
