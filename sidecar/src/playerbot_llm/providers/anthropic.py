@@ -87,6 +87,10 @@ class AnthropicProvider:
         )
         self._model_io_logger = model_io_logger
 
+    @property
+    def configured(self) -> bool:
+        return bool(os.environ.get(API_KEY_ENV_VAR))
+
     def _trace_request(
         self,
         kind: str,

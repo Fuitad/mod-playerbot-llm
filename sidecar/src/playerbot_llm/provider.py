@@ -98,6 +98,9 @@ class GenerationProvider(Protocol):
 
     metadata: GenerationProviderMetadata
 
+    @property
+    def configured(self) -> bool: ...
+
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int: ...
 
     def generate_reply(

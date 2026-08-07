@@ -22,9 +22,6 @@ from playerbot_llm import budget, generation, ledger, protocol, provider, state
 from playerbot_llm import store as store_module
 from playerbot_llm.budget import AdmissionDecision, RequestKind, RequestPriority
 from playerbot_llm.providers.anthropic import (
-    API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR,
-)
-from playerbot_llm.providers.anthropic import (
     AnthropicProvider,
 )
 
@@ -32,7 +29,6 @@ CONFIG_SECTION = "worldserver"
 CONFIG_PREFIX = "PlayerbotLLM."
 # Environment variable *names*, not secret values.
 TOKEN_ENV_VAR = "PLAYERBOT_LLM_BRIDGE_TOKEN"  # noqa: S105
-API_KEY_ENV_VAR = ANTHROPIC_API_KEY_ENV_VAR
 
 # There is deliberately no maximum above the configured ceiling. A second limit in the
 # code silently ignores what the operator asked for, and PlayerbotLLM.DailyBudgetUsd
@@ -245,11 +241,14 @@ def bridge_token_from_environment() -> str | None:
     return token
 
 
-def doctor_report(config: SidecarConfig, budget_state: budget.BudgetState | None = None) -> dict[str, object]:
+def doctor_report(
+    config: SidecarConfig,
+    generation_provider: provider.GenerationProvider,
+    budget_state: budget.BudgetState | None = None,
+) -> dict[str, object]:
     """Health summary as JSON-safe data. Never contains a secret value."""
 
     token_present = bridge_token_from_environment() is not None
-    provider_configured = bool(os.environ.get(API_KEY_ENV_VAR))
     ok = config.enable and config.bridge_port > 0 and config.generation_allowed and token_present
 
     report: dict[str, object] = {
@@ -260,8 +259,8 @@ def doctor_report(config: SidecarConfig, budget_state: budget.BudgetState | None
         "human_budget_reserve_ratio": config.human_budget_reserve_ratio,
         "response_deadline_ms": config.response_deadline_ms,
         "bridge_token_present": token_present,
-        "provider_name": AnthropicProvider.metadata.name,
-        "provider_configured": provider_configured,
+        "provider_name": generation_provider.metadata.name,
+        "provider_configured": generation_provider.configured,
     }
 
     if budget_state is not None:
@@ -379,10 +378,7 @@ class SidecarService:
         self._token = token
         # The default SDK client's own timeout is capped at the response deadline so
         # a provider call cannot outlive the request that paid for it.
-        self._adapter = adapter or AnthropicProvider(
-            timeout_seconds=config.response_deadline_ms / 1000,
-            model_io_logger=_log if config.log_model_io else None,
-        )
+        self._adapter = adapter or _default_provider(config)
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
         self._generation_lock = asyncio.Lock()
@@ -1081,6 +1077,13 @@ def _log(message: str) -> None:
     print(f"playerbot-llm: {message}", file=sys.stderr, flush=True)
 
 
+def _default_provider(config: SidecarConfig) -> provider.GenerationProvider:
+    return AnthropicProvider(
+        timeout_seconds=config.response_deadline_ms / 1000,
+        model_io_logger=_log if config.log_model_io else None,
+    )
+
+
 async def _with_state(config: SidecarConfig, database: PlayerbotsDatabaseSettings, work):
     """Runs one coroutine against an open state, and always closes the pool."""
 
@@ -1120,6 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if arguments.command == "doctor":
+        generation_provider = _default_provider(config)
         try:
             budget_state = asyncio.run(
                 _with_state(config, database, lambda store: store.budget_state(now=datetime.now(UTC)))
@@ -1130,7 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
             # being safe to paste into a bug report.
             _log(f"cannot reach the Playerbots database: {type(error).__name__}")
             budget_state = None
-        report = doctor_report(config, budget_state=budget_state)
+        report = doctor_report(config, generation_provider, budget_state=budget_state)
         report["database_reachable"] = budget_state is not None
         if budget_state is None:
             report["ok"] = False
@@ -1164,8 +1168,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if not os.environ.get(API_KEY_ENV_VAR):
-        _log(f"{API_KEY_ENV_VAR} is not set; refusing to start")
+    generation_provider = _default_provider(config)
+    if not generation_provider.configured:
+        _log("generation provider is not configured; refusing to start")
         return 1
 
     if not config.enable or config.bridge_port <= 0:
@@ -1173,7 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        asyncio.run(serve(config, token, database=database))
+        asyncio.run(serve(config, token, adapter=generation_provider, database=database))
     except state.DatabaseUnavailable as error:
         # Refusing to start is the point. A sidecar that came up without its ledger would
         # answer requests with no way to record what they cost.

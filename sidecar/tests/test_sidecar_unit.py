@@ -943,7 +943,7 @@ def test_config_bounds_ambient_rate_without_disabling_direct_chat(tmp_path) -> N
 def test_doctor_reports_status_without_secrets(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", TEST_TOKEN)
     monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
-    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     serialized = json.dumps(report)
     assert TEST_TOKEN not in serialized
     assert "sk-ant-super-secret" not in serialized
@@ -958,16 +958,30 @@ def test_doctor_ignores_global_anthropic_api_key(tmp_path, monkeypatch) -> None:
     # The module never uses a machine-wide key: only MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY counts.
     monkeypatch.delenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-global-key")
-    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     assert report["provider_name"] == "anthropic"
     assert report["provider_configured"] is False
 
 
 def test_doctor_flags_missing_token(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("PLAYERBOT_LLM_BRIDGE_TOKEN", raising=False)
-    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)))
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     assert report["bridge_token_present"] is False
     assert report["ok"] is False
+
+
+def test_doctor_reads_provider_identity_through_the_neutral_contract(tmp_path) -> None:
+    adapter = FakeAdapter()
+    adapter.metadata = provider.GenerationProviderMetadata(
+        name="test-provider",
+        model="test-model",
+        max_input_tokens=4095,
+        output_token_limits={"chat": 96},
+    )
+
+    report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), adapter)
+
+    assert report["provider_name"] == "test-provider"
 
 
 def test_no_module_in_the_package_can_open_sqlite() -> None:
@@ -1345,6 +1359,7 @@ def test_the_doctor_reports_budget_numbers_without_secrets(tmp_path, monkeypatch
 
     report = app.doctor_report(
         config,
+        FakeAdapter(),
         budget_state=budget.BudgetState(
             settled_nano=budget.usd_to_nano("1.25"), outstanding_nano=budget.usd_to_nano("0.25")
         ),
@@ -1367,6 +1382,7 @@ def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -
     monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
     report = app.doctor_report(
         app.SidecarConfig.load(write_conf(tmp_path)),
+        FakeAdapter(),
         budget_state=budget.BudgetState(circuit_open=True),
     )
     assert report["ok"] is False
