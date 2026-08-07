@@ -956,6 +956,7 @@ TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
     request.subject = SocialActor(900, "Deszy", true);
+    request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.speakOnChannel = 2;
     request.threadPublicId = "thr_00000000000000000000000000000001";
     request.context = "party pull";
@@ -971,7 +972,15 @@ TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     EXPECT_NE(payload.find("\"subject_guid\":900"), std::string::npos);
     EXPECT_NE(payload.find("\"subject_name\":\"Deszy\""), std::string::npos);
     EXPECT_NE(payload.find("\"subject_human\":1"), std::string::npos);
+    EXPECT_NE(payload.find("\"admission_lane\":\"immediate_human\""), std::string::npos);
     EXPECT_NE(payload.find("\"kind\":\"social\""), std::string::npos);
+
+    ClaudeChat::SocialRequest background = request;
+    background.admissionLane = ClaudeChat::SocialAdmissionLane::Background;
+    std::optional<std::string> const backgroundPayload =
+        ClaudeChat::SerializeSocialRequest(background, SOCIAL_TOKEN);
+    ASSERT_TRUE(backgroundPayload.has_value());
+    EXPECT_NE(backgroundPayload->find("\"admission_lane\":\"background\""), std::string::npos);
 }
 
 TEST(ClaudeChatSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialized)
@@ -1208,6 +1217,7 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
     good.socialRequestToken = 77;
     good.bot = SocialActor(500, "Grimbold", false);
     good.subject = SocialActor(900, "Deszy", true);
+    good.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     good.threadPublicId = "thr_00000000000000000000000000000001";
     good.context = "party pull";
     ASSERT_TRUE(ClaudeChat::SerializeSocialRequest(good, SOCIAL_TOKEN).has_value());
@@ -1222,6 +1232,8 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
              {"no token", [](ClaudeChat::SocialRequest& r) { r.socialRequestToken = 0; }},
              {"unusable bot", [](ClaudeChat::SocialRequest& r) { r.bot.guidCounter = 0; }},
              {"human bot", [](ClaudeChat::SocialRequest& r) { r.bot.human = true; }},
+             {"unknown admission lane",
+              [](ClaudeChat::SocialRequest& r) { r.admissionLane = ClaudeChat::SocialAdmissionLane::Unknown; }},
              {"unusable subject", [](ClaudeChat::SocialRequest& r) { r.subject.name = std::string(200, 'a'); }},
              {"empty thread", [](ClaudeChat::SocialRequest& r) { r.threadPublicId.clear(); }},
              {"long thread",
@@ -1539,6 +1551,7 @@ TEST(ClaudeChatSocialProtocolTest, ASubjectIsEitherFullyPresentOrFullyAbsent)
     ClaudeChat::SocialRequest request;
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
+    request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.threadPublicId = "thr_00000000000000000000000000000001";
 
     // Fully absent is legal.
@@ -1565,6 +1578,7 @@ TEST(ClaudeChatSocialProtocolTest, AnUnusableBridgeTokenRefusesTheRequest)
     ClaudeChat::SocialRequest request;
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
+    request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.threadPublicId = "thr_00000000000000000000000000000001";
 
     EXPECT_FALSE(ClaudeChat::SerializeSocialRequest(request, "short").has_value());
@@ -1650,6 +1664,7 @@ namespace
         request.socialRequestToken = requestToken;
         request.bot = SocialActor(botGuid, "Grimbold", false);
         request.subject = SocialActor(900, "Deszy", true);
+        request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
         request.speakOnChannel = static_cast<uint8>(PlayerbotSocialChannel::Party);
         request.threadPublicId = "thr_00000000000000000000000000000001";
         request.context = "party pull";

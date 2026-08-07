@@ -291,6 +291,17 @@ def _priority_for(request: protocol.ChatRequest) -> RequestPriority:
     return RequestPriority.IMMEDIATE_HUMAN
 
 
+def _social_priority_for(request: protocol.SocialRequest) -> RequestPriority:
+    """Map the worldserver's validated social lane without inferring from content."""
+
+    if request.admission_lane == "immediate_human":
+        return RequestPriority.IMMEDIATE_HUMAN
+    if request.admission_lane == "background":
+        return RequestPriority.BACKGROUND
+
+    raise AssertionError("unvalidated social admission lane")
+
+
 def _request_kind_for(request: protocol.ChatRequest) -> RequestKind:
     """What the ledger row says this request was paying for.
 
@@ -760,13 +771,11 @@ class SidecarService:
             max_cost_nano = budget.conservative_max_cost_nano(
                 input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
             )
-            # A social line always has somebody waiting on it, which is the reserve's whole
-            # purpose. The coordinator already decided this conversation was worth having.
             decision, reservation = await store.reserve(
                 request_kind=RequestKind.CHAT_RESPONSE,
                 model=claude.MODEL_ID,
                 max_cost_nano=max_cost_nano,
-                priority=RequestPriority.IMMEDIATE_HUMAN,
+                priority=_social_priority_for(request),
                 now=now,
             )
             if decision is not AdmissionDecision.ADMITTED or reservation is None:

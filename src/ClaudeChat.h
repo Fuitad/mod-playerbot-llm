@@ -134,6 +134,16 @@ namespace ClaudeChat
     // reaches the sidecar.
     [[nodiscard]] bool ActorIsUsable(Actor const& actor);
 
+    enum class SocialAdmissionLane : uint8
+    {
+        Unknown = 0,
+        ImmediateHuman,
+        Background
+    };
+
+    [[nodiscard]] bool SocialAdmissionLaneIsValid(SocialAdmissionLane lane);
+    [[nodiscard]] char const* SocialAdmissionLaneName(SocialAdmissionLane lane);
+
     /*
      * A social generation, requested by the worldserver's coordinator.
      *
@@ -146,6 +156,7 @@ namespace ClaudeChat
         uint64 socialRequestToken = 0;
         Actor bot;
         Actor subject;
+        SocialAdmissionLane admissionLane = SocialAdmissionLane::Unknown;
         uint8 speakOnChannel = 0;
         std::string threadPublicId;
         std::string context;

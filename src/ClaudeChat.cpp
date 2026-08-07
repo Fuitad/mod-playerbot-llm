@@ -901,6 +901,26 @@ int64 ClaudeChat::SocialRequestDeadlineMs(int64 configuredDeadlineMs)
                            static_cast<int64>(PLAYERBOT_SOCIAL_PROVIDER_TIMEOUT_SECONDS) * 1000);
 }
 
+bool ClaudeChat::SocialAdmissionLaneIsValid(SocialAdmissionLane lane)
+{
+    return lane == SocialAdmissionLane::ImmediateHuman || lane == SocialAdmissionLane::Background;
+}
+
+char const* ClaudeChat::SocialAdmissionLaneName(SocialAdmissionLane lane)
+{
+    switch (lane)
+    {
+        case SocialAdmissionLane::ImmediateHuman:
+            return "immediate_human";
+        case SocialAdmissionLane::Background:
+            return "background";
+        case SocialAdmissionLane::Unknown:
+            break;
+    }
+
+    return "unknown";
+}
+
 bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
 {
     /*
@@ -911,7 +931,8 @@ bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string
     if (!BridgeTokenIsUsable(token))
         return false;
 
-    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot) || request.bot.human)
+    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot) || request.bot.human ||
+        !SocialAdmissionLaneIsValid(request.admissionLane))
         return false;
 
     /*
@@ -1315,6 +1336,7 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
     AppendJsonField(out, "subject_guid", request.subject.guidCounter);
     AppendJsonField(out, "subject_name", request.subject.name);
     AppendJsonField(out, "subject_human", request.subject.human ? uint64{1} : uint64{0});
+    AppendJsonField(out, "admission_lane", std::string(SocialAdmissionLaneName(request.admissionLane)));
     AppendJsonField(out, "speak_on_channel", static_cast<uint64>(request.speakOnChannel));
     AppendJsonField(out, "thread_id", request.threadPublicId);
     AppendJsonField(out, "context", request.context);

@@ -259,6 +259,7 @@ namespace
          */
         bool Submit(uint64 requestToken, uint64 botGuidCounter, uint64 targetGuidCounter,
                     PlayerbotSocialChannel channel, std::string const& threadPublicId,
+                    PlayerbotSocialRequestPriority priority,
                     PlayerbotSocialRequestContext const& context) override
         {
             if (!_socialTransport || !_bridge)
@@ -273,6 +274,19 @@ namespace
             request.bot.guidCounter = botGuidCounter;
             request.bot.name = bot->GetName();
             request.bot.human = !GET_PLAYERBOT_AI(bot);
+            switch (priority)
+            {
+                case PlayerbotSocialRequestPriority::DirectHumanEngagement:
+                case PlayerbotSocialRequestPriority::MixedThread:
+                    request.admissionLane = SocialAdmissionLane::ImmediateHuman;
+                    break;
+                case PlayerbotSocialRequestPriority::BotContinuation:
+                case PlayerbotSocialRequestPriority::Starter:
+                    request.admissionLane = SocialAdmissionLane::Background;
+                    break;
+                default:
+                    return false;
+            }
             request.speakOnChannel = static_cast<uint8>(channel);
             request.threadPublicId = threadPublicId;
 

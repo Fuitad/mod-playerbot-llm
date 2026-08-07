@@ -1677,6 +1677,7 @@ def _social_request_payload(**overrides: object) -> bytes:
         "subject_guid": 900,
         "subject_name": "Deszy",
         "subject_human": 1,
+        "admission_lane": "immediate_human",
         "speak_on_channel": 2,
         "thread_id": "thr_00000000000000000000000000000001",
         "context": "party pull",
@@ -1752,6 +1753,18 @@ def test_social_request_round_trips() -> None:
     assert request.bot_guid == 500
     assert request.bot_human == 0
     assert request.subject_human == 1
+    assert request.admission_lane == "immediate_human"
+
+
+def test_social_request_requires_a_known_admission_lane() -> None:
+    missing = json.loads(_social_request_payload())
+    del missing["admission_lane"]
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(json.dumps(missing).encode("utf-8"), TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(admission_lane="unknown"), TEST_TOKEN)
 
 
 def test_social_request_rejects_unknown_fields_and_bad_kind() -> None:
@@ -3632,6 +3645,23 @@ async def test_extraction_never_takes_the_lane_a_player_is_waiting_on(tmp_path) 
     await service.process_payload(_memory_request_payload())
 
     assert store.reserved_priorities == [app.RequestPriority.BACKGROUND]
+
+
+async def test_social_admission_preserves_the_human_reserve(tmp_path) -> None:
+    service, store, adapter = make_stored_service(tmp_path)
+    store.settled_nano = budget.usd_to_nano("4")
+
+    assert await service.process_payload(_social_request_payload(admission_lane="background")) is None
+    assert adapter.social_requests == []
+
+    payload = await service.process_payload(_social_request_payload(admission_lane="immediate_human"))
+
+    assert payload is not None
+    assert len(adapter.social_requests) == 1
+    assert store.reserved_priorities == [
+        app.RequestPriority.BACKGROUND,
+        app.RequestPriority.IMMEDIATE_HUMAN,
+    ]
 
 
 async def test_a_refused_extraction_is_still_paid_for_and_answers_nothing(tmp_path) -> None:

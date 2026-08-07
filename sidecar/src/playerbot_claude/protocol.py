@@ -56,6 +56,7 @@ RoleplayPromptMode = Literal[
 ]
 ROLEPLAY_PROMPT_MODES: tuple[str, ...] = get_args(RoleplayPromptMode)
 MAX_SOCIAL_ACTIVE_EXPANSION = 2
+SocialAdmissionLane = Literal["immediate_human", "background"]
 
 # Channels where a gesture can actually be seen, mirroring the coordinator's own rule. General
 # is zone wide and its participants are nowhere near each other, and a whisper has no physical
@@ -465,6 +466,7 @@ class SocialRequest(BaseModel):
     subject_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     subject_name: Annotated[str, StringConstraints(max_length=MAX_ACTOR_NAME_BYTES)]
     subject_human: Literal[0, 1]
+    admission_lane: SocialAdmissionLane
     speak_on_channel: Annotated[int, Field(ge=0, le=255)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
     context: str
