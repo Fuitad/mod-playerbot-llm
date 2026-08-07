@@ -26,6 +26,7 @@ from pydantic import (
 )
 
 SCHEMA_VERSION = 5
+SOCIAL_SCHEMA_VERSION = 6
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -33,6 +34,7 @@ MAX_RESPONSE_MESSAGE_BYTES = 240
 MAX_ACTOR_NAME_BYTES = 48
 MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024
 MAX_THREAD_ID_BYTES = 64
+MAX_SOCIAL_MODEL_BYTES = 64
 MAX_CAREER_TOKEN_BYTES = 64
 MAX_CAREER_SUMMARY_BYTES = 160
 MIN_BRIDGE_TOKEN_BYTES = 32
@@ -456,7 +458,7 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -531,6 +533,27 @@ class SocialRequest(BaseModel):
         if _byte_length(value) > MAX_SOCIAL_CONTEXT_BYTES:
             raise ValueError(f"context must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
 
+        return value
+
+
+class SocialCallMetadata(BaseModel):
+    """Provider facts attached only to one accepted Social completion."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    model: Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_MODEL_BYTES)]
+    provider_latency_ms: Annotated[int, Field(ge=0)]
+    input_tokens: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    cache_creation_input_tokens: Annotated[int, Field(ge=0)]
+    cache_read_input_tokens: Annotated[int, Field(ge=0)]
+    cost_usd: Annotated[str, StringConstraints(pattern=r"^(0|[1-9][0-9]{0,5})\.[0-9]{6}$")]
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_bytes(cls, value: str) -> str:
+        if _byte_length(value) > MAX_SOCIAL_MODEL_BYTES:
+            raise ValueError(f"model must be at most {MAX_SOCIAL_MODEL_BYTES} UTF-8 bytes")
         return value
 
 
@@ -1001,6 +1024,7 @@ def encode_social_response(
     token: str,
     regenerate: bool = False,
     emote_id: int = 0,
+    metadata: SocialCallMetadata | None = None,
 ) -> bytes:
     """Builds the exact payload shape the C++ social response parser accepts.
 
@@ -1022,6 +1046,8 @@ def encode_social_response(
     token = _encoder_token(token)
 
     if regenerate:
+        if metadata is not None:
+            raise ProtocolError("a social regeneration carries no call metadata")
         message = ""
         emote_id = 0
     elif emote_id:
@@ -1039,8 +1065,11 @@ def encode_social_response(
     else:
         _validate_response_message(message)
 
+    if not regenerate and metadata is None:
+        raise ProtocolError("a deliverable social response requires call metadata")
+
     payload = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SOCIAL_SCHEMA_VERSION,
         "token": token,
         "kind": "social",
         "social_request_token": social_request_token,
@@ -1050,6 +1079,8 @@ def encode_social_response(
         "emote_id": emote_id,
         "regenerate": 1 if regenerate else 0,
     }
+    if metadata is not None:
+        payload.update(metadata.model_dump())
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 

@@ -278,3 +278,13 @@ def test_an_unstorable_cost_is_clamped_so_the_breaker_can_still_fire() -> None:
     # Both still open the circuit, which is the point of clamping rather than rejecting.
     assert budget.circuit_should_open(1000, -5) is True
     assert budget.circuit_should_open(1000, budget.MAX_STORABLE_NANO + 1) is True
+
+
+def test_a_stored_cost_has_one_exact_six_decimal_display() -> None:
+    assert budget.nano_to_fixed_usd_string(0) == "0.000000"
+    assert budget.nano_to_fixed_usd_string(budget.quantize_storable_nano(1)) == "0.000001"
+    assert budget.nano_to_fixed_usd_string(budget.MAX_STORABLE_NANO) == "999999.999999"
+
+    for invalid in (-1, 1, budget.MAX_STORABLE_NANO + budget.STORAGE_SCALE_NANO):
+        with pytest.raises(ValueError, match="stored microdollar"):
+            budget.nano_to_fixed_usd_string(invalid)

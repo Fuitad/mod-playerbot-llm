@@ -928,7 +928,7 @@ namespace
 
     std::string SocialPayload(std::string kind = "social", uint64 requestToken = 77, uint64 botGuid = 500,
                               std::string message = "Aye, that pack hits hard.", uint64 regenerate = 0,
-                              uint64 schema = PlayerbotLLM::SCHEMA_VERSION, uint64 emoteId = 0,
+                              uint64 schema = PlayerbotLLM::SOCIAL_SCHEMA_VERSION, uint64 emoteId = 0,
                               uint64 channel = 2)
     {
         std::string out = "{\"schema_version\":" + std::to_string(schema);
@@ -940,6 +940,16 @@ namespace
         out += ",\"message\":\"" + message + "\"";
         out += ",\"emote_id\":" + std::to_string(emoteId);
         out += ",\"regenerate\":" + std::to_string(regenerate);
+        if (regenerate == 0)
+        {
+            out += ",\"model\":\"fixture-social-model\"";
+            out += ",\"provider_latency_ms\":42";
+            out += ",\"input_tokens\":100";
+            out += ",\"output_tokens\":50";
+            out += ",\"cache_creation_input_tokens\":20";
+            out += ",\"cache_read_input_tokens\":30";
+            out += ",\"cost_usd\":\"0.000400\"";
+        }
         out += "}";
         return out;
     }
@@ -997,6 +1007,8 @@ TEST(PlayerbotLLMSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialize
 
 TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
 {
+    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 6u);
+
     std::optional<PlayerbotLLM::SocialResponse> const parsed =
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 500);
 
@@ -1006,6 +1018,14 @@ TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
     EXPECT_EQ(parsed->speakOnChannel, 2u);
     EXPECT_EQ(parsed->message, "Aye, that pack hits hard.");
     EXPECT_FALSE(parsed->regenerate);
+    ASSERT_TRUE(parsed->callMetadata.has_value());
+    EXPECT_EQ(parsed->callMetadata->model, "fixture-social-model");
+    EXPECT_EQ(parsed->callMetadata->providerLatencyMs, 42u);
+    EXPECT_EQ(parsed->callMetadata->inputTokens, 100u);
+    EXPECT_EQ(parsed->callMetadata->outputTokens, 50u);
+    EXPECT_EQ(parsed->callMetadata->cacheCreationInputTokens, 20u);
+    EXPECT_EQ(parsed->callMetadata->cacheReadInputTokens, 30u);
+    EXPECT_EQ(parsed->callMetadata->costUsd, "0.000400");
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, ACareerDecisionCannotArriveAsASocialLine)
@@ -1035,6 +1055,9 @@ TEST(PlayerbotLLMSocialProtocolTest, AMismatchedSchemaOrTokenIsRefused)
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(SocialPayload("social", 77, 500, "hi", 0, 2), SOCIAL_TOKEN,
                                                         77, 500)
                      .has_value());
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(SocialPayload("social", 77, 500, "hi", 0, 5), SOCIAL_TOKEN,
+                                                        77, 500)
+                     .has_value());
     EXPECT_FALSE(
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), std::string(40, 'z'), 77, 500).has_value());
 }
@@ -1055,6 +1078,40 @@ TEST(PlayerbotLLMSocialProtocolTest, UnknownFieldsAndOversizeMessagesAreRefused)
     EXPECT_FALSE(
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload("social", 77, 500, ""), SOCIAL_TOKEN, 77, 500)
             .has_value());
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, IncompleteOrMalformedCallMetadataIsRefused)
+{
+    auto replaceField = [](std::string const& field, std::string const& replacement)
+    {
+        std::string payload = SocialPayload();
+        std::size_t const position = payload.find(field);
+        EXPECT_NE(position, std::string::npos);
+        if (position != std::string::npos)
+            payload.replace(position, field.size(), replacement);
+        return payload;
+    };
+
+    std::string const missingModel = replaceField(",\"model\":\"fixture-social-model\"", "");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(missingModel, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const numericModel = replaceField("\"model\":\"fixture-social-model\"", "\"model\":42");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(numericModel, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const stringLatency =
+        replaceField("\"provider_latency_ms\":42", "\"provider_latency_ms\":\"42\"");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(stringLatency, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const negativeTokens = replaceField("\"input_tokens\":100", "\"input_tokens\":-1");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(negativeTokens, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const oversizeModel = replaceField(
+        "\"model\":\"fixture-social-model\"", "\"model\":\"" +
+                                                  std::string(PLAYERBOT_SOCIAL_MODEL_BYTES + 1, 'm') + "\"");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(oversizeModel, SOCIAL_TOKEN, 77, 500).has_value());
+
+    std::string const malformedCost = replaceField("\"cost_usd\":\"0.000400\"", "\"cost_usd\":\"0.0004\"");
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(malformedCost, SOCIAL_TOKEN, 77, 500).has_value());
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, ARegenerationMayCarryNoMessage)
@@ -1774,7 +1831,7 @@ TEST(PlayerbotLLMSocialTransportTest, AUsableLineIsDrainedAsAMessageForTheCoordi
 TEST(PlayerbotLLMSocialTransportTest, ScheduleThreeCannotExpressSilenceSoAnEmptyLineIsAbandoned)
 {
     /*
-     * The coordinator names Silence a legitimate answer, but schema 3's social response has no way
+     * The coordinator names Silence a legitimate answer, but Social schema 6 has no way
      * to SAY it: a payload that is not a regeneration must carry one clean line, so an empty message
      * is an invalid response rather than a quiet bot.
      *
@@ -2176,7 +2233,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AGestureIsCarriedAsAnEmoteRatherThanAsALine
      * gesture the sidecar chose could never arrive at all.
      */
     std::optional<PlayerbotLLM::SocialResponse> const parsed = PlayerbotLLM::ParseSocialResponsePayload(
-        SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SCHEMA_VERSION, 21), SOCIAL_TOKEN, 77, 500);
+        SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 21), SOCIAL_TOKEN, 77, 500);
 
     ASSERT_TRUE(parsed.has_value());
     EXPECT_EQ(parsed->emoteId, 21u);
@@ -2188,17 +2245,17 @@ TEST(PlayerbotLLMSocialProtocolTest, AGestureAndALineTogetherAreTwoAnswersToOneQ
     // The coordinator drops text attached to a gesture. Refusing the whole frame is stricter and
     // says which answer was at fault, rather than silently keeping half of one.
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
-                     SocialPayload("social", 77, 500, "Aye.", 0, PlayerbotLLM::SCHEMA_VERSION, 21),
+                     SocialPayload("social", 77, 500, "Aye.", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 21),
                      SOCIAL_TOKEN, 77, 500)
                      .has_value());
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, AnAnswerWithNeitherALineNorAGestureIsRefused)
 {
-    // Schema 3 cannot express silence, so an empty non-regeneration is a malformed answer rather
+    // Social schema 6 cannot express silence, so an empty non-regeneration is a malformed answer rather
     // than a decision not to speak.
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
-                     SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SCHEMA_VERSION, 0), SOCIAL_TOKEN,
+                     SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0), SOCIAL_TOKEN,
                      77, 500)
                      .has_value());
 }
@@ -2214,7 +2271,7 @@ TEST(PlayerbotLLMSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResu
     ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
 
     std::vector<PlayerbotLLM::SocialRawResponse> const answered{PlayerbotLLM::SocialRawResponse{
-        77, SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SCHEMA_VERSION, 21), submittedAtMs + 10}};
+        77, SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 21), submittedAtMs + 10}};
 
     std::vector<PlayerbotLLM::SocialTransport::Completed> const resolved =
         transport.Resolve(answered, submittedAtMs + 20);
@@ -2224,6 +2281,14 @@ TEST(PlayerbotLLMSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResu
     EXPECT_EQ(resolved[0].result.kind, PlayerbotSocialOutputKind::Emote);
     EXPECT_EQ(resolved[0].result.emoteId, 21u);
     EXPECT_TRUE(resolved[0].result.text.empty());
+    ASSERT_TRUE(resolved[0].result.callMetadata.has_value());
+    EXPECT_EQ(resolved[0].result.callMetadata->model, "fixture-social-model");
+    EXPECT_EQ(resolved[0].result.callMetadata->providerLatencyMs, 42u);
+    EXPECT_EQ(resolved[0].result.callMetadata->inputTokens, 100u);
+    EXPECT_EQ(resolved[0].result.callMetadata->outputTokens, 50u);
+    EXPECT_EQ(resolved[0].result.callMetadata->cacheCreationInputTokens, 20u);
+    EXPECT_EQ(resolved[0].result.callMetadata->cacheReadInputTokens, 30u);
+    EXPECT_EQ(resolved[0].result.callMetadata->costUsd, "0.000400");
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
@@ -2235,7 +2300,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
      * claimed it. The allowlist is enforced where the value is read, not only where it is chosen.
      */
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
-                     SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SCHEMA_VERSION, 4242),
+                     SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 4242),
                      SOCIAL_TOKEN, 77, 500)
                      .has_value());
 
@@ -2243,7 +2308,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
     for (uint32 emoteId : PlayerbotLLM::SOCIAL_EMOTE_IDS)
     {
         EXPECT_TRUE(PlayerbotLLM::ParseSocialResponsePayload(
-                        SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SCHEMA_VERSION, emoteId),
+                        SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, emoteId),
                         SOCIAL_TOKEN, 77, 500)
                         .has_value())
             << "emote " << emoteId << " should be accepted";

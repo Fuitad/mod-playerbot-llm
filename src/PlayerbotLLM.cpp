@@ -408,6 +408,26 @@ namespace
 
         return utf8::is_valid(text.begin(), text.end());
     }
+
+    bool FixedMicrodollarUsdIsValid(std::string const& value)
+    {
+        std::size_t const dot = value.find('.');
+        if (dot == std::string::npos || dot == 0 || dot > 6 || value.size() != dot + 7)
+            return false;
+
+        if (dot > 1 && value.front() == '0')
+            return false;
+
+        for (std::size_t index = 0; index < value.size(); ++index)
+        {
+            if (index == dot)
+                continue;
+            if (value[index] < '0' || value[index] > '9')
+                return false;
+        }
+
+        return true;
+    }
 }
 
 std::string PlayerbotLLM::TruncateUtf8Bytes(std::string text, size_t maxBytes)
@@ -846,7 +866,7 @@ std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransp
          *
          * The parser has already refused an answer carrying both and one carrying neither, so the
          * branch below is a read of which one arrived rather than a decision. Silence stays
-         * unreachable: schema 3 has no way to say "chose not to speak", and an empty answer is
+         * unreachable: Social schema 6 has no way to say "chose not to speak", and an empty answer is
          * refused as malformed rather than quietly becoming one. That gap belongs to the response
          * models, not here.
          */
@@ -861,6 +881,7 @@ std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransp
             result.text = response.message;
         }
         result.channel = channel;
+        result.callMetadata = response.callMetadata;
 
         // Consumed either way: a result is delivered once or not at all, never retried into a
         // conversation that has already moved on.
@@ -1329,7 +1350,7 @@ std::optional<std::string> PlayerbotLLM::SerializeSocialRequest(SocialRequest co
     std::string out;
     out.reserve(512 + request.context.size());
     out += '{';
-    AppendJsonField(out, "schema_version", SCHEMA_VERSION, true);
+    AppendJsonField(out, "schema_version", SOCIAL_SCHEMA_VERSION, true);
     AppendJsonField(out, "token", token);
     AppendJsonField(out, "kind", std::string(ResponseKindName(ResponseKind::Social)));
     AppendJsonField(out, "social_request_token", request.socialRequestToken);
@@ -1434,9 +1455,9 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     if (!fields)
         return std::nullopt;
 
-    // Exactly the contract fields. The parser already refuses duplicate keys, and an exact count
-    // refuses unknown ones, so nothing can ride along unnoticed.
-    if (fields->size() != 9)
+    // A regeneration has the nine control fields. A deliverable answer has those nine plus the
+    // complete seven field call document. Any partial or extended shape is malformed.
+    if (fields->size() != 9 && fields->size() != 16)
         return std::nullopt;
 
     auto const schemaIt = fields->find("schema_version");
@@ -1454,7 +1475,7 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
         messageIt == fields->end() || emoteIt == fields->end() || regenerateIt == fields->end())
         return std::nullopt;
 
-    if (schemaIt->second.isString || schemaIt->second.number != SCHEMA_VERSION)
+    if (schemaIt->second.isString || schemaIt->second.number != SOCIAL_SCHEMA_VERSION)
         return std::nullopt;
 
     if (!BridgeTokenIsUsable(expectedToken))
@@ -1511,14 +1532,54 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
      * carry neither a line nor a gesture. Anything claiming to be deliverable is not.
      */
     if (response.regenerate)
+    {
+        if (fields->size() != 9)
+            return std::nullopt;
         return response;
+    }
+
+    if (fields->size() != 16)
+        return std::nullopt;
+
+    auto const modelIt = fields->find("model");
+    auto const latencyIt = fields->find("provider_latency_ms");
+    auto const inputIt = fields->find("input_tokens");
+    auto const outputIt = fields->find("output_tokens");
+    auto const cacheCreationIt = fields->find("cache_creation_input_tokens");
+    auto const cacheReadIt = fields->find("cache_read_input_tokens");
+    auto const costIt = fields->find("cost_usd");
+    if (modelIt == fields->end() || latencyIt == fields->end() || inputIt == fields->end() ||
+        outputIt == fields->end() || cacheCreationIt == fields->end() || cacheReadIt == fields->end() ||
+        costIt == fields->end())
+        return std::nullopt;
+
+    if (!modelIt->second.isString || modelIt->second.text.empty() ||
+        modelIt->second.text.size() > PLAYERBOT_SOCIAL_MODEL_BYTES || !IsSingleCleanLine(modelIt->second.text))
+        return std::nullopt;
+
+    if (latencyIt->second.isString || inputIt->second.isString || outputIt->second.isString ||
+        cacheCreationIt->second.isString || cacheReadIt->second.isString)
+        return std::nullopt;
+
+    if (!costIt->second.isString || !FixedMicrodollarUsdIsValid(costIt->second.text))
+        return std::nullopt;
+
+    response.callMetadata = PlayerbotSocialCallMetadata{
+        modelIt->second.text,
+        latencyIt->second.number,
+        inputIt->second.number,
+        outputIt->second.number,
+        cacheCreationIt->second.number,
+        cacheReadIt->second.number,
+        costIt->second.text,
+    };
 
     /*
      * Exactly one answer. Both is the sidecar hedging, and choosing one here would be inventing an
      * intention it did not express; the coordinator would drop the text anyway, so a frame carrying
      * both is refused where the caller can still be told which request was at fault.
      *
-     * Neither is not silence either. Schema 3 has no way to say "chose not to speak", so an empty
+     * Neither is not silence either. Social schema 6 has no way to say "chose not to speak", so an empty
      * answer is a malformed one.
      */
     if (response.emoteId != 0)

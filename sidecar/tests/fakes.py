@@ -129,18 +129,20 @@ class FakeState:
         self.reservations.append(reservation)
         return decision, reservation
 
-    async def settle(self, *, reservation, actual_cost_nano: int, now: datetime) -> bool:
+    async def settle(self, *, reservation, actual_cost_nano: int, now: datetime) -> ledger.SettlementReceipt:
         self.calls.append("settle")
         # Mirrors the ledger: a reservation expiry has already reclaimed is no longer in
         # the reserved state, so settling it is refused rather than charged twice.
         if self.outstanding.pop(reservation.reservation_id, None) is None:
-            return False
+            return ledger.SettlementReceipt(False, None, False, False)
 
-        if budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano):
+        breach = budget.circuit_should_open(reservation.max_cost_nano, actual_cost_nano)
+        if breach:
             self.circuit_open = True
-        self.settled_nano += budget.storable_actual_cost_nano(actual_cost_nano)
+        stored_cost_nano = budget.storable_actual_cost_nano(actual_cost_nano)
+        self.settled_nano += stored_cost_nano
         self.settlements.append((reservation, actual_cost_nano))
-        return True
+        return ledger.SettlementReceipt(True, stored_cost_nano, breach, False)
 
     async def release(self, *, reservation) -> bool:
         self.calls.append("release")

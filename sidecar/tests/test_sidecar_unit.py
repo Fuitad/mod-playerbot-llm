@@ -22,7 +22,7 @@ import pytest
 from fakes import FakeState
 from pydantic import ValidationError
 
-from playerbot_llm import app, budget, generation, protocol, provider
+from playerbot_llm import app, budget, generation, ledger, protocol, provider
 from playerbot_llm.providers import anthropic as anthropic_provider
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
@@ -1397,24 +1397,19 @@ def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -
 async def test_a_reply_whose_reservation_expired_is_dropped_rather_than_spoken(tmp_path) -> None:
     """The ledger refusing to charge a completion must stop it being delivered.
 
-    settle returns False when expiry has already reclaimed the reservation, which happens
-    when a request outlives the expiry window. Speaking the line anyway would put a
-    delivered reply outside the enforced ceiling, and the worldserver has long since given
-    up on the request in any case. Ignoring that return value was the defect: the ledger
-    said no and the service spoke regardless.
+    A settlement receipt is deliberately truthy as an object even when ``completed`` is
+    false. Every caller must read the named field rather than accidentally treating the
+    receipt itself as the old boolean return value.
     """
     service, store, adapter = make_stored_service(tmp_path)
 
-    # Reclaim the reservation the instant it is made, exactly as expiry would.
-    original_reserve = store.reserve
+    class RefusedSettlement:
+        completed = False
 
-    async def reserve_then_expire(**kwargs):
-        decision, reservation = await original_reserve(**kwargs)
-        if reservation is not None:
-            store.outstanding.pop(reservation.reservation_id, None)
-        return decision, reservation
+    async def refuse_settlement(**kwargs):
+        return RefusedSettlement()
 
-    store.reserve = reserve_then_expire  # type: ignore[method-assign]
+    store.settle = refuse_settlement  # type: ignore[method-assign]
 
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None
 
@@ -1751,7 +1746,7 @@ def _memory_request_payload(**overrides: object) -> bytes:
 
 def _social_request_payload(**overrides: object) -> bytes:
     payload = {
-        "schema_version": protocol.SCHEMA_VERSION,
+        "schema_version": protocol.SOCIAL_SCHEMA_VERSION,
         "token": TEST_TOKEN,
         "kind": "social",
         "social_request_token": 77,
@@ -1769,6 +1764,10 @@ def _social_request_payload(**overrides: object) -> bytes:
     }
     payload.update(overrides)
     return json.dumps(payload).encode("utf-8")
+
+
+def test_social_protocol_has_an_independent_version() -> None:
+    assert protocol.SOCIAL_SCHEMA_VERSION == 6
 
 
 def _biography_request_payload(**overrides: object) -> bytes:
@@ -1891,7 +1890,9 @@ def test_social_request_rejects_unknown_fields_and_bad_kind() -> None:
 
 def test_social_request_rejects_an_old_schema() -> None:
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_social_request(_social_request_payload(schema_version=2), TEST_TOKEN)
+        protocol.parse_social_request(
+            _social_request_payload(schema_version=protocol.SCHEMA_VERSION), TEST_TOKEN
+        )
 
 
 def test_social_request_bounds_the_context_in_bytes() -> None:
@@ -1909,11 +1910,25 @@ def test_social_request_rejects_a_mismatched_token() -> None:
         protocol.parse_social_request(_social_request_payload(), "z" * 40)
 
 
+def _social_call_metadata() -> protocol.SocialCallMetadata:
+    return protocol.SocialCallMetadata(
+        model="fixture-social-model",
+        provider_latency_ms=42,
+        input_tokens=100,
+        output_tokens=50,
+        cache_creation_input_tokens=20,
+        cache_read_input_tokens=30,
+        cost_usd="0.000400",
+    )
+
+
 def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
-    encoded = json.loads(protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN))
+    encoded = json.loads(
+        protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN, metadata=_social_call_metadata())
+    )
 
     assert encoded == {
-        "schema_version": protocol.SCHEMA_VERSION,
+        "schema_version": protocol.SOCIAL_SCHEMA_VERSION,
         "token": TEST_TOKEN,
         "kind": "social",
         "social_request_token": 77,
@@ -1922,6 +1937,13 @@ def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
         "message": "Aye.",
         "emote_id": 0,
         "regenerate": 0,
+        "model": "fixture-social-model",
+        "provider_latency_ms": 42,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_creation_input_tokens": 20,
+        "cache_read_input_tokens": 30,
+        "cost_usd": "0.000400",
     }
 
 
@@ -1930,6 +1952,38 @@ def test_a_regeneration_carries_no_message() -> None:
 
     assert encoded["regenerate"] == 1
     assert encoded["message"] == ""
+    assert "model" not in encoded
+
+
+def test_social_call_metadata_is_complete_and_bounded() -> None:
+    with pytest.raises(ValidationError):
+        protocol.SocialCallMetadata.model_validate(
+            {**_social_call_metadata().model_dump(), "model": "é" * 33}
+        )
+
+    for field in (
+        "provider_latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        with pytest.raises(ValidationError):
+            protocol.SocialCallMetadata.model_validate({**_social_call_metadata().model_dump(), field: -1})
+
+    for cost in ("0", "0.00000", "0.0000000", "1000000.000000"):
+        with pytest.raises(ValidationError):
+            protocol.SocialCallMetadata.model_validate(
+                {**_social_call_metadata().model_dump(), "cost_usd": cost}
+            )
+
+    with pytest.raises(protocol.ProtocolError, match="requires call metadata"):
+        protocol.encode_social_response(77, 500, 2, "Aye.", TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError, match="regeneration carries no call metadata"):
+        protocol.encode_social_response(
+            77, 500, 2, "", TEST_TOKEN, regenerate=True, metadata=_social_call_metadata()
+        )
 
 
 def test_a_deliverable_social_line_is_still_held_to_the_response_rules() -> None:
@@ -2100,6 +2154,101 @@ async def test_a_social_frame_is_answered_rather_than_treated_as_malformed(tmp_p
     assert decoded["kind"] == "social"
     assert decoded["social_request_token"] == 77
     assert decoded["bot_guid"] == 500
+
+
+async def test_a_social_answer_carries_exact_provider_call_metadata(tmp_path, monkeypatch) -> None:
+    class MetadataAdapter(FakeAdapter):
+        def generate_social_reply(
+            self, request: protocol.SocialRequest
+        ) -> tuple[str, int, provider.GenerationUsage]:
+            self.social_requests.append(request)
+            return (
+                self.social_reply,
+                0,
+                provider.GenerationUsage(
+                    input_tokens=100,
+                    output_tokens=50,
+                    cache_creation_input_tokens=20,
+                    cache_read_input_tokens=30,
+                ),
+            )
+
+    ticks = iter((2_000_000_000, 2_042_999_999))
+    monkeypatch.setattr(time, "monotonic_ns", lambda: next(ticks))
+    service, _, adapter = make_stored_service(tmp_path, adapter=MetadataAdapter())
+
+    answer = await service.process_payload(_social_request_payload())
+
+    assert answer is not None
+    decoded = json.loads(answer)
+    assert decoded["schema_version"] == protocol.SOCIAL_SCHEMA_VERSION
+    assert decoded["model"] == adapter.metadata.model
+    assert decoded["provider_latency_ms"] == 42
+    assert decoded["input_tokens"] == 100
+    assert decoded["output_tokens"] == 50
+    assert decoded["cache_creation_input_tokens"] == 20
+    assert decoded["cache_read_input_tokens"] == 30
+    assert decoded["cost_usd"] == "0.000400"
+
+
+async def test_a_social_cost_breach_settles_but_produces_no_response(tmp_path) -> None:
+    class BreachingAdapter(FakeAdapter):
+        def generate_social_reply(
+            self, request: protocol.SocialRequest
+        ) -> tuple[str, int, provider.GenerationUsage]:
+            return self.social_reply, 0, provider.GenerationUsage(input_tokens=1_000_000, output_tokens=10)
+
+    service, store, _ = make_stored_service(tmp_path, adapter=BreachingAdapter())
+
+    assert await service.process_payload(_social_request_payload()) is None
+    assert len(store.settlements) == 1
+    assert store.circuit_open is True
+
+
+async def test_a_social_day_saturation_settles_but_produces_no_response(tmp_path) -> None:
+    class SaturatingState(FakeState):
+        async def settle(
+            self, *, reservation, actual_cost_nano: int, now: datetime
+        ) -> ledger.SettlementReceipt:
+            receipt = await super().settle(
+                reservation=reservation, actual_cost_nano=actual_cost_nano, now=now
+            )
+            self.circuit_open = True
+            return ledger.SettlementReceipt(
+                receipt.completed,
+                receipt.stored_cost_nano,
+                receipt.breach,
+                True,
+            )
+
+    config = app.SidecarConfig.load(write_conf(tmp_path))
+    store = SaturatingState(config.budget_nano, config.reserve_ratio)
+    service, store, _ = make_stored_service(tmp_path, state_double=store)
+
+    assert await service.process_payload(_social_request_payload()) is None
+    assert len(store.settlements) == 1
+    assert store.circuit_open is True
+
+
+async def test_invalid_social_provider_metadata_fails_closed(tmp_path) -> None:
+    adapter = FakeAdapter()
+    adapter.metadata = provider.GenerationProviderMetadata(
+        name="test-provider",
+        model="é" * 33,
+        max_input_tokens=200,
+        output_token_limits={
+            "chat": 7,
+            "career": 8,
+            "social": 96,
+            "biography": 10,
+            "memory": 11,
+            "roleplay_assessment": 12,
+        },
+    )
+    service, store, _ = make_stored_service(tmp_path, adapter=adapter)
+
+    assert await service.process_payload(_social_request_payload()) is None
+    assert len(store.settlements) == 1
 
 
 def test_the_social_system_prompt_carries_no_untrusted_text() -> None:
@@ -2285,7 +2434,11 @@ def test_an_emote_is_refused_where_nobody_could_see_it() -> None:
 
 
 def test_the_wire_carries_an_emote_instead_of_a_line_never_both() -> None:
-    encoded = json.loads(protocol.encode_social_response(77, 500, 2, "", TEST_TOKEN, emote_id=21))
+    encoded = json.loads(
+        protocol.encode_social_response(
+            77, 500, 2, "", TEST_TOKEN, emote_id=21, metadata=_social_call_metadata()
+        )
+    )
     assert encoded["emote_id"] == 21
     assert encoded["message"] == ""
 
@@ -3668,7 +3821,9 @@ def test_a_biography_response_is_never_confused_with_a_social_line() -> None:
     """
     fields = {name: "something plausible" for name in generation.BiographyReply.model_fields}
     biography = json.loads(protocol.encode_biography_response(4242, 500, fields, TEST_TOKEN))
-    social = json.loads(protocol.encode_social_response(4242, 500, 2, "Aye.", TEST_TOKEN))
+    social = json.loads(
+        protocol.encode_social_response(4242, 500, 2, "Aye.", TEST_TOKEN, metadata=_social_call_metadata())
+    )
 
     assert biography["kind"] != social["kind"]
     assert "message" not in biography

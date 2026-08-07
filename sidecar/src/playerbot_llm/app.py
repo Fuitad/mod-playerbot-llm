@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -580,11 +581,12 @@ class SidecarService:
                 _log(f"assessment {token}: cannot price the completion: {error}")
                 return None
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            ):
+            )
+            if not settlement.completed:
                 _log(f"assessment {token}: settlement refused, the reservation had already expired")
                 return None
 
@@ -652,11 +654,12 @@ class SidecarService:
                 _log(f"memory {token}: cannot price the completion: {error}")
                 return None
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            ):
+            )
+            if not settlement.completed:
                 _log(f"memory {token}: settlement refused, the reservation had already expired")
                 return None
 
@@ -731,11 +734,12 @@ class SidecarService:
                 _log(f"biography {token}: cannot price the completion: {error}")
                 return None
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            ):
+            )
+            if not settlement.completed:
                 _log(f"biography {token}: settlement refused, the reservation had already expired")
                 return None
 
@@ -786,7 +790,9 @@ class SidecarService:
                 return None
 
             try:
+                provider_started_at = time.monotonic_ns()
                 reply, emote_id, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
+                provider_latency_ms = (time.monotonic_ns() - provider_started_at) // 1_000_000
             except provider.GenerationInvalidOutputError as error:
                 # Generated, billed, and refused by the gate. The money is settled from the
                 # usage the provider reported when it is available, exactly as a rejected
@@ -813,14 +819,35 @@ class SidecarService:
                 _log(f"social {token}: cannot price the completion: {error}")
                 return None
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            ):
+            )
+            if not settlement.completed:
                 # Expiry already reclaimed it, so the ledger declined to charge this line.
                 # Speaking it anyway would spend outside the ceiling.
                 _log(f"social {token}: settlement refused, the reservation had already expired")
+                return None
+            if settlement.breach or settlement.saturated:
+                _log(f"social {token}: unsafe settlement opened the budget circuit, staying silent")
+                return None
+            if settlement.stored_cost_nano is None:
+                _log(f"social {token}: completed settlement returned no stored cost, staying silent")
+                return None
+
+            try:
+                metadata = protocol.SocialCallMetadata(
+                    model=self._adapter.metadata.model,
+                    provider_latency_ms=provider_latency_ms,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_creation_input_tokens=usage.cache_creation_input_tokens,
+                    cache_read_input_tokens=usage.cache_read_input_tokens,
+                    cost_usd=budget.nano_to_fixed_usd_string(settlement.stored_cost_nano),
+                )
+            except ValueError:
+                _log(f"social {token}: invalid provider call metadata, staying silent")
                 return None
 
         return protocol.encode_social_response(
@@ -830,6 +857,7 @@ class SidecarService:
             message=reply,
             token=self._token,
             emote_id=emote_id,
+            metadata=metadata,
         )
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:
@@ -899,11 +927,12 @@ class SidecarService:
                 _log(f"request {request.request_id}: cannot price the completion: {error}")
                 return None
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=settled_at,
-            ):
+            )
+            if not settlement.completed:
                 # The reservation was no longer reserved, which means expiry already
                 # reclaimed it: this request took longer than the expiry window and the
                 # ledger has refused to charge it rather than charge it twice.
@@ -978,11 +1007,12 @@ class SidecarService:
                 # into a connection handler that only understands protocol errors.
                 return "reservation left outstanding for expiry, the reported cost was unusable"
 
-            if not await store.settle(
+            settlement = await store.settle(
                 reservation=reservation,
                 actual_cost_nano=actual_cost_nano,
                 now=self._now(),
-            ):
+            )
+            if not settlement.completed:
                 return "settlement refused, the reservation had already expired"
 
             return "settled at the reported cost, the completion was billed"

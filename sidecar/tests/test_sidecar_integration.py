@@ -47,6 +47,28 @@ def request_payload(request_id: int = 7, message: str = "What do you enjoy doing
     ).encode()
 
 
+def social_request_payload(schema_version: int = protocol.SOCIAL_SCHEMA_VERSION) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": schema_version,
+            "token": TEST_TOKEN,
+            "kind": "social",
+            "social_request_token": 77,
+            "bot_guid": 500,
+            "bot_name": "Grimbold",
+            "bot_human": 0,
+            "bot_level": 6,
+            "subject_guid": 900,
+            "subject_name": "Deszy",
+            "subject_human": 1,
+            "admission_lane": "immediate_human",
+            "speak_on_channel": 2,
+            "thread_id": "thr_00000000000000000000000000000001",
+            "context": "party pull",
+        }
+    ).encode()
+
+
 class FakeAdapter(anthropic_provider.AnthropicProvider):
     def __init__(self) -> None:
         # Deliberately no super().__init__(): the fake never builds a real client.
@@ -54,6 +76,7 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
         self.input_tokens = 100
         self.requests: list[protocol.ChatRequest] = []
         self.histories: list[list[tuple[str, str]]] = []
+        self.social_requests: list[protocol.SocialRequest] = []
 
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         # Content-driven so concurrent server processing cannot race test state.
@@ -68,6 +91,15 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
         self.requests.append(request)
         self.histories.append(list(history))
         return self.reply, provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10)
+
+    def count_social_input_tokens(self, request: protocol.SocialRequest) -> int:
+        return self.input_tokens
+
+    def generate_social_reply(
+        self, request: protocol.SocialRequest
+    ) -> tuple[str, int, provider.GenerationUsage]:
+        self.social_requests.append(request)
+        return self.reply, 0, provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10)
 
 
 @dataclass
@@ -132,6 +164,25 @@ async def test_authenticated_request_round_trips_over_real_socket(tmp_path) -> N
         assert len(harness.store.turns[42]) == 2
         assert harness.store.settled_nano > 0
         assert harness.store.outstanding == {}
+
+
+async def test_social_v6_round_trips_while_social_v5_fails_closed(tmp_path) -> None:
+    async with running_sidecar(tmp_path) as harness:
+        response = await round_trip(harness.port, social_request_payload())
+
+        assert response["schema_version"] == protocol.SOCIAL_SCHEMA_VERSION
+        assert response["kind"] == "social"
+        assert response["model"] == harness.adapter.metadata.model
+        assert response["input_tokens"] == 100
+        assert response["output_tokens"] == 10
+        assert response["cache_creation_input_tokens"] == 0
+        assert response["cache_read_input_tokens"] == 0
+        assert response["cost_usd"] == "0.000150"
+
+        await silent_round_trip(
+            harness.port,
+            social_request_payload(schema_version=protocol.SCHEMA_VERSION),
+        )
 
 
 async def test_wrong_token_closes_connection_and_server_keeps_accepting(tmp_path) -> None:

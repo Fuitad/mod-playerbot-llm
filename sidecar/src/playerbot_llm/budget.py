@@ -303,6 +303,16 @@ STORAGE_SCALE_NANO = 1_000
 MAX_STORABLE_NANO = 999_999_999_999_000
 
 
+def nano_to_fixed_usd_string(nano: int) -> str:
+    """Render one exact stored microdollar amount with six fractional digits."""
+
+    if nano < 0 or nano > MAX_STORABLE_NANO or nano % STORAGE_SCALE_NANO != 0:
+        raise ValueError("cost is not an exact stored microdollar amount")
+
+    whole, fraction = divmod(nano, NANO)
+    return f"{whole}.{fraction // STORAGE_SCALE_NANO:06d}"
+
+
 def quantize_storable_nano(nano: int) -> int:
     """Rounds a nano amount UP to something a DECIMAL(12, 6) column holds exactly.
 

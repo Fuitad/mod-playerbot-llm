@@ -651,7 +651,12 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
         actual_cost_nano=budget.usd_to_nano("0.40"),
         now=NOW,
     )
-    assert settled
+    assert settled == ledger.SettlementReceipt(
+        completed=True,
+        stored_cost_nano=budget.usd_to_nano("0.40"),
+        breach=False,
+        saturated=False,
+    )
 
     async with connection.cursor() as cursor:
         await cursor.execute(
@@ -676,6 +681,47 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
     assert day_after is not None
     assert day_after[0] == Decimal("0.000000")
     assert day_after[1] == Decimal("0.400000")
+
+
+@pytest.mark.parametrize(
+    ("actual_cost_nano", "expected_receipt"),
+    (
+        (0, ledger.SettlementReceipt(True, 0, False, False)),
+        (1, ledger.SettlementReceipt(True, budget.STORAGE_SCALE_NANO, False, False)),
+        (
+            budget.STORAGE_SCALE_NANO,
+            ledger.SettlementReceipt(True, budget.STORAGE_SCALE_NANO, False, False),
+        ),
+        (-1, ledger.SettlementReceipt(True, 0, True, False)),
+        (
+            budget.MAX_STORABLE_NANO + 1,
+            ledger.SettlementReceipt(True, budget.MAX_STORABLE_NANO, True, False),
+        ),
+    ),
+)
+async def test_settlement_receipt_reports_exact_stored_boundaries(
+    clean_ledger, actual_cost_nano: int, expected_receipt: ledger.SettlementReceipt
+) -> None:
+    book, connection = clean_ledger
+    _, reservation = await book.reserve(
+        connection,
+        request_kind=RequestKind.CHAT_RESPONSE,
+        model=anthropic_provider.MODEL_ID,
+        max_cost_nano=budget.usd_to_nano("1.00"),
+        priority=RequestPriority.IMMEDIATE_HUMAN,
+        now=NOW,
+    )
+    assert reservation is not None
+
+    assert (
+        await book.settle(
+            connection,
+            reservation=reservation,
+            actual_cost_nano=actual_cost_nano,
+            now=NOW,
+        )
+        == expected_receipt
+    )
 
 
 async def test_a_reservation_is_recorded_and_counted(clean_ledger) -> None:
@@ -860,7 +906,9 @@ async def test_a_crash_leaves_a_reservation_that_expiry_reclaims_without_double_
     assert decision is AdmissionDecision.ADMITTED
 
     # And the late completion for the reclaimed reservation is refused, not charged.
-    assert await book.settle(connection, reservation=stranded, actual_cost_nano=one, now=later) is False
+    assert await book.settle(
+        connection, reservation=stranded, actual_cost_nano=one, now=later
+    ) == ledger.SettlementReceipt(False, None, False, False)
 
     state = await book.snapshot(connection, now=later)
     assert state.settled_nano == 0
@@ -885,7 +933,9 @@ async def test_an_impossible_reported_cost_opens_the_circuit_and_stops_admission
     )
 
     impossible = one * 5
-    assert await book.settle(connection, reservation=reservation, actual_cost_nano=impossible, now=NOW)
+    assert await book.settle(
+        connection, reservation=reservation, actual_cost_nano=impossible, now=NOW
+    ) == ledger.SettlementReceipt(True, impossible, True, False)
 
     state = await book.snapshot(connection, now=NOW)
     assert state.circuit_open is True
@@ -1477,7 +1527,9 @@ async def test_the_state_facade_reserves_settles_and_reports(mysql_state) -> Non
     assert reservation is not None
     assert (await state.budget_state(now=NOW)).outstanding_nano == one
 
-    assert await state.settle(reservation=reservation, actual_cost_nano=one // 4, now=NOW) is True
+    assert await state.settle(
+        reservation=reservation, actual_cost_nano=one // 4, now=NOW
+    ) == ledger.SettlementReceipt(True, one // 4, False, False)
 
     after = await state.budget_state(now=NOW)
     assert after.outstanding_nano == 0
@@ -1501,7 +1553,9 @@ async def test_the_state_facade_settles_decimal_costs_without_database_warnings(
             )
             assert decision is AdmissionDecision.ADMITTED
             assert reservation is not None
-            assert await state.settle(reservation=reservation, actual_cost_nano=actual_cost, now=NOW) is True
+            assert await state.settle(
+                reservation=reservation, actual_cost_nano=actual_cost, now=NOW
+            ) == ledger.SettlementReceipt(True, actual_cost, False, False)
 
     assert (await state.budget_state(now=NOW)).settled_nano == sum(costs)
 
@@ -1759,14 +1813,16 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     await connection.commit()
 
     # A report far above both the reservation and the remaining headroom.
-    assert (
-        await book.settle(
-            connection,
-            reservation=reservation,
-            actual_cost_nano=budget.MAX_STORABLE_NANO,
-            now=NOW,
-        )
-        is True
+    assert await book.settle(
+        connection,
+        reservation=reservation,
+        actual_cost_nano=budget.MAX_STORABLE_NANO,
+        now=NOW,
+    ) == ledger.SettlementReceipt(
+        True,
+        budget.MAX_STORABLE_NANO,
+        True,
+        True,
     )
 
     state = await book.snapshot(connection, now=NOW)
@@ -1834,9 +1890,13 @@ async def test_saturation_alone_is_reported_as_saturation_not_as_an_overrun(clea
     await connection.commit()
 
     # WITHIN its reservation, so circuit_should_open is false. Only saturation applies.
-    assert (
-        await book.settle(connection, reservation=reservation, actual_cost_nano=reserve_amount, now=NOW)
-        is True
+    assert await book.settle(
+        connection, reservation=reservation, actual_cost_nano=reserve_amount, now=NOW
+    ) == ledger.SettlementReceipt(
+        True,
+        reserve_amount,
+        False,
+        True,
     )
 
     async with connection.cursor() as cursor:

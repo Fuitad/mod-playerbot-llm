@@ -86,7 +86,7 @@ class SidecarState(Protocol):
 
     async def settle(
         self, *, reservation: ledger.Reservation, actual_cost_nano: int, now: datetime
-    ) -> bool: ...
+    ) -> ledger.SettlementReceipt: ...
 
     async def release(self, *, reservation: ledger.Reservation) -> bool: ...
 
@@ -192,7 +192,9 @@ class MySqlSidecarState:
                 now=now,
             )
 
-    async def settle(self, *, reservation: ledger.Reservation, actual_cost_nano: int, now: datetime) -> bool:
+    async def settle(
+        self, *, reservation: ledger.Reservation, actual_cost_nano: int, now: datetime
+    ) -> ledger.SettlementReceipt:
         async with self._connection() as connection:
             return await self._ledger.settle(
                 connection, reservation=reservation, actual_cost_nano=actual_cost_nano, now=now

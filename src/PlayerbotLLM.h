@@ -37,6 +37,7 @@ namespace PlayerbotLLM
      * than partially understood.
      */
     inline constexpr uint32 SCHEMA_VERSION = 5;
+    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 6;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -269,6 +270,7 @@ namespace PlayerbotLLM
         // coordinator would drop the text anyway.
         uint32 emoteId = 0;
         bool regenerate = false;
+        std::optional<PlayerbotSocialCallMetadata> callMetadata;
     };
 
     /*

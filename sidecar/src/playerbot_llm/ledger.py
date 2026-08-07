@@ -77,6 +77,14 @@ class Reservation:
     max_cost_nano: int
 
 
+@dataclass(frozen=True)
+class SettlementReceipt:
+    completed: bool
+    stored_cost_nano: int | None
+    breach: bool
+    saturated: bool
+
+
 def mint_public_id() -> str:
     """A fresh opaque identity for one reservation attempt.
 
@@ -328,12 +336,11 @@ class BudgetLedger:
 
     async def settle(
         self, connection, *, reservation: Reservation, actual_cost_nano: int, now: datetime
-    ) -> bool:
+    ) -> SettlementReceipt:
         """Charges the real cost and releases the rest of the reservation.
 
-        Returns False when the reservation was not in the reserved state, which is how a
-        completion arriving after expiry recovery is refused rather than charged a second
-        time. Definition of Done 4 rests on that check.
+        The receipt distinguishes a completed row from an expired reservation and reports
+        whether the transaction had to open the circuit for an overrun or saturation.
 
         An actual cost above the reservation opens the circuit and is stored truthfully
         rather than clamped: clamping would make the ledger agree with a bound that was
@@ -360,7 +367,7 @@ class BudgetLedger:
                 )
                 if cursor.rowcount == 0:
                     await connection.commit()
-                    return False
+                    return SettlementReceipt(False, None, False, False)
 
                 # The SUM is clamped, not just the value. Clamping only the addend still
                 # overflows DECIMAL(12, 6) once anything has been spent, and MySQL then
@@ -371,13 +378,6 @@ class BudgetLedger:
                 headroom = budget.MAX_STORABLE_NANO - spent_before
                 added = max(0, min(storable, headroom))
                 saturated = added < storable
-                if saturated:
-                    # A total that is no longer the sum of what was charged is an
-                    # integrity failure whether or not the provider overran its
-                    # reservation, so it stops spending on its own account. The
-                    # configured ceiling is refused above MAX_STORABLE_NANO precisely so
-                    # honest traffic can never arrive here.
-                    breach = True
 
                 await cursor.execute(
                     "UPDATE playerbot_llm_daily_budget SET spent_usd = spent_usd + %s WHERE budget_date = %s",
@@ -386,7 +386,9 @@ class BudgetLedger:
                 # This reservation has left the reserved state, so the day owes less.
                 await self._refresh_reserved_usd(cursor, reservation.budget_date)
 
-                if breach:
+                # Either cause makes the stored charge unsafe to treat as an ordinary
+                # provider result, even though they remain distinct in the receipt.
+                if breach or saturated:
                     # The REPORTED figure goes in the reason even when it could not be
                     # stored in the column, because the number is the evidence.
                     #
@@ -412,7 +414,7 @@ class BudgetLedger:
             await connection.rollback()
             raise
 
-        return True
+        return SettlementReceipt(True, storable, breach, saturated)
 
     async def release(self, connection, *, reservation: Reservation) -> bool:
         """Gives back an unused reservation, for a request that failed before spending.
