@@ -1,9 +1,9 @@
-"""Strict framing and models mirroring the C++ ClaudeChat protocol contract.
+"""Strict framing and models mirroring the C++ PlayerbotLLM protocol contract.
 
 The wire format is a 4-byte network-order length prefix followed by one UTF-8 JSON
 object of at most 64 KiB. Requests come from worldserver; responses go back. Both
 directions carry the shared bridge token, compared in constant time and never included
-in anything sent to Claude or written to logs.
+in anything sent to the generation provider or written to logs.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ MAX_SOCIAL_CONTEXT_ENTRY_BYTES = 512
 """The wire shape of a generated biography.
 
 Here rather than beside the model that produces it, because this is what the worldserver's
-assembler accepts: it is a protocol fact, and the generator is one of its two users. `claude`
+assembler accepts: it is a protocol fact, and the generator is one of its two users. `generation`
 asserts its own reply model against this tuple at import, so the two cannot drift apart quietly.
 
 The bound matches PLAYERBOT_SOCIAL_BIOGRAPHY_MAX_FIELD_LENGTH on the C++ side. A field the

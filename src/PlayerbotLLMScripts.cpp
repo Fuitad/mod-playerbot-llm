@@ -1,8 +1,8 @@
 /*
- * This file is part of the mod-playerbot-claude module.
+ * This file is part of the mod-playerbot-llm module.
  */
 
-#include "ClaudeChat.h"
+#include "PlayerbotLLM.h"
 
 #include <algorithm>
 
@@ -34,7 +34,7 @@
 
 namespace
 {
-    using namespace ClaudeChat;
+    using namespace PlayerbotLLM;
 
     constexpr size_t MAX_CAPTURED_TEXT_BYTES = 512;
     constexpr size_t RECENT_EVENT_CAPACITY = 256;
@@ -126,7 +126,7 @@ namespace
 
     // All state lives on the world thread; every method below must only be called from
     // world-thread hooks. The bridge worker is the only other thread and it touches only
-    // the bounded queues inside ClaudeBridge.
+    // the bounded queues inside Bridge.
     /*
      * Both provider seams on one object, because they share the one bridge and the one lifetime.
      *
@@ -134,51 +134,51 @@ namespace
      * need its own reference to the bridge and its own answer to "has startup run yet", and those two
      * answers drifting apart is how a provider stays registered against a stopped bridge.
      */
-    class ClaudeChatState : public PlayerbotCareerPlanProvider, public PlayerbotSocialProvider
+    class PlayerbotLLMState : public PlayerbotCareerPlanProvider, public PlayerbotSocialProvider
     {
     public:
-        static ClaudeChatState& Instance()
+        static PlayerbotLLMState& Instance()
         {
-            static ClaudeChatState instance;
+            static PlayerbotLLMState instance;
             return instance;
         }
 
         void Startup()
         {
-            if (!sConfigMgr->GetOption<bool>("PlayerbotClaude.Enable", false))
+            if (!sConfigMgr->GetOption<bool>("PlayerbotLLM.Enable", false))
             {
-                LOG_INFO("playerbot.claude", "mod-playerbot-claude: disabled by configuration");
+                LOG_INFO("playerbot.llm", "mod-playerbot-llm: disabled by configuration");
                 return;
             }
 
-            int32 const port = sConfigMgr->GetOption<int32>("PlayerbotClaude.BridgePort", 0);
+            int32 const port = sConfigMgr->GetOption<int32>("PlayerbotLLM.BridgePort", 0);
             if (port <= 0 || port > 65535)
             {
-                LOG_INFO("playerbot.claude", "mod-playerbot-claude: disabled (PlayerbotClaude.BridgePort is not set)");
+                LOG_INFO("playerbot.llm", "mod-playerbot-llm: disabled (PlayerbotLLM.BridgePort is not set)");
                 return;
             }
 
             std::optional<std::string> token = BridgeTokenFromEnvironment();
             if (!token)
             {
-                LOG_ERROR("playerbot.claude",
-                          "mod-playerbot-claude: disabled (PLAYERBOT_CLAUDE_BRIDGE_TOKEN is missing or shorter "
+                LOG_ERROR("playerbot.llm",
+                          "mod-playerbot-llm: disabled (PLAYERBOT_LLM_BRIDGE_TOKEN is missing or shorter "
                           "than {} bytes)",
                           MIN_BRIDGE_TOKEN_BYTES);
                 return;
             }
 
             _responseDeadlineMs =
-                std::max<int64>(1000, sConfigMgr->GetOption<int32>("PlayerbotClaude.ResponseDeadlineMs", 10000));
+                std::max<int64>(1000, sConfigMgr->GetOption<int32>("PlayerbotLLM.ResponseDeadlineMs", 10000));
             _groupCooldownMs =
-                std::max<int64>(0, sConfigMgr->GetOption<int32>("PlayerbotClaude.GroupCooldownSeconds", 120)) * 1000;
+                std::max<int64>(0, sConfigMgr->GetOption<int32>("PlayerbotLLM.GroupCooldownSeconds", 120)) * 1000;
             ConfigureAmbient();
 
             BridgeConfig config;
             config.port = static_cast<uint16>(port);
             config.token = std::move(*token);
             config.queueCapacity =
-                static_cast<uint32>(std::max(1, sConfigMgr->GetOption<int32>("PlayerbotClaude.QueueSize", 16)));
+                static_cast<uint32>(std::max(1, sConfigMgr->GetOption<int32>("PlayerbotLLM.QueueSize", 16)));
             config.socketTimeoutMs = _responseDeadlineMs;
 
             std::string const bridgeToken = config.token;
@@ -187,16 +187,16 @@ namespace
             // it has no transport object of its own holding the token the way the social lane does.
             _bridgeToken = bridgeToken;
 
-            _bridge = std::make_unique<ClaudeBridge>(std::move(config));
+            _bridge = std::make_unique<Bridge>(std::move(config));
             _bridge->Start();
             if (!PlayerbotCareer::RegisterProvider(this))
             {
                 _bridge->Stop();
                 _bridge.reset();
-                LOG_ERROR("playerbot.claude", "mod-playerbot-claude: career provider registration failed");
+                LOG_ERROR("playerbot.llm", "mod-playerbot-llm: career provider registration failed");
                 return;
             }
-            LOG_INFO("playerbot.claude", "mod-playerbot-claude: bridge worker started on 127.0.0.1:{}", port);
+            LOG_INFO("playerbot.llm", "mod-playerbot-llm: bridge worker started on 127.0.0.1:{}", port);
 
             /*
              * The social provider registers only while the worldserver's social feature is on.
@@ -215,7 +215,7 @@ namespace
             {
                 _socialTransport.emplace(*_bridge, bridgeToken, _responseDeadlineMs);
                 sPlayerbotSocialMgr.SetSocialProvider(this);
-                LOG_INFO("playerbot.claude", "mod-playerbot-claude: registered as the social provider");
+                LOG_INFO("playerbot.llm", "mod-playerbot-llm: registered as the social provider");
             }
         }
 
@@ -307,7 +307,7 @@ namespace
              * voice as though the worldserver had chosen that; false here is ProviderFailed, which
              * the coordinator turns into silence.
              */
-            std::optional<std::string> encodedContext = ClaudeChat::EncodeSocialContext(context);
+            std::optional<std::string> encodedContext = PlayerbotLLM::EncodeSocialContext(context);
             if (!encodedContext)
                 return false;
             request.context = std::move(*encodedContext);
@@ -351,7 +351,7 @@ namespace
             if (!bot || !bot->IsInWorld())
                 return false;
 
-            ClaudeChat::BiographyRequest request;
+            PlayerbotLLM::BiographyRequest request;
             request.biographyRequestToken = biographyRequestToken;
             request.botGuidCounter = botGuidCounter;
             request.characterName = characterName;
@@ -361,7 +361,7 @@ namespace
             request.botLevel = bot->GetLevel();
             request.activeContentExpansion = VanillaOnlyRules::ActiveContentExpansion();
 
-            if (!ClaudeChat::BiographyRequestIsUsable(request, _bridgeToken))
+            if (!PlayerbotLLM::BiographyRequestIsUsable(request, _bridgeToken))
                 return false;
 
             return _bridge->TryEnqueueBiography(std::move(request), SteadyNowMs() + _responseDeadlineMs);
@@ -381,7 +381,7 @@ namespace
             if (!_bridge)
                 return false;
 
-            ClaudeChat::MemoryRequest request;
+            PlayerbotLLM::MemoryRequest request;
             request.memoryRequestToken = memoryRequestToken;
             request.botGuidCounter = botGuidCounter;
             request.threadPublicId = threadPublicId;
@@ -432,7 +432,7 @@ namespace
                 request.thread.push_back(speaker + ": " + line.text);
             }
 
-            if (!ClaudeChat::MemoryRequestIsUsable(request, _bridgeToken))
+            if (!PlayerbotLLM::MemoryRequestIsUsable(request, _bridgeToken))
                 return false;
 
             return _bridge->TryEnqueueMemory(std::move(request), SteadyNowMs() + _responseDeadlineMs);
@@ -543,7 +543,7 @@ namespace
                 return;
 
             // Known playerbot commands keep executing as commands (and cost nothing);
-            // only unrecognized whispers become Claude conversation.
+            // only unrecognized whispers become LLM conversation.
             bool isKnownCommand = false;
             if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(receiver))
             {
@@ -551,7 +551,7 @@ namespace
                 isKnownCommand = helper.IsChatCommand(message);
             }
 
-            std::optional<std::string> text = WhisperClaudeText(message, isKnownCommand);
+            std::optional<std::string> text = WhisperLLMText(message, isKnownCommand);
             if (!text)
                 return;
 
@@ -689,8 +689,8 @@ namespace
                                                 { return candidate.token == decision->candidateToken; });
 
                     if (decision && !offered)
-                        LOG_INFO("playerbot.claude",
-                                 "mod-playerbot-claude: career decision for request {} named a candidate "
+                        LOG_INFO("playerbot.llm",
+                                 "mod-playerbot-llm: career decision for request {} named a candidate "
                                  "that was never offered; discarded",
                                  response.requestId);
 
@@ -735,8 +735,8 @@ namespace
 
                 if (!ShouldDeliver(delivery.channel, snapshot))
                 {
-                    LOG_INFO("playerbot.claude",
-                             "mod-playerbot-claude: dropped response for request {} (expired={} botOnline={} "
+                    LOG_INFO("playerbot.llm",
+                             "mod-playerbot-llm: dropped response for request {} (expired={} botOnline={} "
                              "speakerOnline={} stillBot={} inCombat={} sameGroup={})",
                              response.requestId, snapshot.expired, snapshot.botOnline, snapshot.speakerOnline,
                              snapshot.botIsStillBot, snapshot.botInCombat, snapshot.sameGroup);
@@ -751,8 +751,8 @@ namespace
                  */
                 if (!LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 {
-                    LOG_INFO("playerbot.claude",
-                             "mod-playerbot-claude: dropped legacy response for request {} "
+                    LOG_INFO("playerbot.llm",
+                             "mod-playerbot-llm: dropped legacy response for request {} "
                              "(AiPlayerbot.SocialChat.Enable took ownership while it was in flight)",
                              response.requestId);
                     continue;
@@ -762,8 +762,8 @@ namespace
                 {
                     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
                     if (!botAI || !botAI->SayToWorld(response.message))
-                        LOG_INFO("playerbot.claude",
-                                 "mod-playerbot-claude: World delivery failed for request {}",
+                        LOG_INFO("playerbot.llm",
+                                 "mod-playerbot-llm: World delivery failed for request {}",
                                  response.requestId);
                 }
                 else if (delivery.channel == ChatChannel::Whisper)
@@ -793,7 +793,7 @@ namespace
     private:
         void ConfigureAmbient()
         {
-            if (!sConfigMgr->GetOption<bool>("PlayerbotClaude.AmbientWorldEnable", false))
+            if (!sConfigMgr->GetOption<bool>("PlayerbotLLM.AmbientWorldEnable", false))
                 return;
 
             /*
@@ -803,35 +803,35 @@ namespace
              */
             if (!LegacyAmbientWorldAllowed(true, PlayerbotSocialConfiguredGate().enabled))
             {
-                LOG_INFO("playerbot.claude",
-                         "mod-playerbot-claude: ambient World chat disabled "
+                LOG_INFO("playerbot.llm",
+                         "mod-playerbot-llm: ambient World chat disabled "
                          "(AiPlayerbot.SocialChat.Enable owns unprompted chat while it is on)");
                 return;
             }
 
             int32 const messagesPerHour =
-                sConfigMgr->GetOption<int32>("PlayerbotClaude.AmbientMaxMessagesPerHour", 6);
+                sConfigMgr->GetOption<int32>("PlayerbotLLM.AmbientMaxMessagesPerHour", 6);
             if (messagesPerHour < 1 ||
                 messagesPerHour > static_cast<int32>(MAX_AMBIENT_MESSAGES_PER_HOUR))
             {
-                LOG_ERROR("playerbot.claude",
-                          "mod-playerbot-claude: ambient World chat disabled "
-                          "(PlayerbotClaude.AmbientMaxMessagesPerHour must be from 1 through {})",
+                LOG_ERROR("playerbot.llm",
+                          "mod-playerbot-llm: ambient World chat disabled "
+                          "(PlayerbotLLM.AmbientMaxMessagesPerHour must be from 1 through {})",
                           MAX_AMBIENT_MESSAGES_PER_HOUR);
                 return;
             }
 
             if (sPlayerbotAIConfig.enableBroadcasts)
             {
-                LOG_ERROR("playerbot.claude",
-                          "mod-playerbot-claude: ambient World chat disabled "
+                LOG_ERROR("playerbot.llm",
+                          "mod-playerbot-llm: ambient World chat disabled "
                           "(set AiPlayerbot.EnableBroadcasts = 0)");
                 return;
             }
 
             _ambientCadence.emplace(static_cast<uint32>(messagesPerHour), SteadyNowMs());
-            LOG_INFO("playerbot.claude",
-                     "mod-playerbot-claude: ambient World chat enabled at up to {} messages per hour",
+            LOG_INFO("playerbot.llm",
+                     "mod-playerbot-llm: ambient World chat enabled at up to {} messages per hour",
                      messagesPerHour);
         }
 
@@ -952,7 +952,7 @@ namespace
              */
             uint64 const nowMs = PlayerbotSocialUnixMilliseconds(GameTime::GetSystemTime());
 
-            for (ClaudeSocialTransport::Completed const& completed : _socialTransport->Drain())
+            for (SocialTransport::Completed const& completed : _socialTransport->Drain())
             {
                 if (completed.outcome != SocialExchangeOutcome::Deliver)
                 {
@@ -969,7 +969,7 @@ namespace
                     completed.result, nowMs, urand(0, 100000));
 
                 if (rejection != PlayerbotSocialDeliveryRejection::None)
-                    LOG_DEBUG("playerbot.claude", "mod-playerbot-claude: social result for request {} refused ({})",
+                    LOG_DEBUG("playerbot.llm", "mod-playerbot-llm: social result for request {} refused ({})",
                               completed.socialRequestToken, PlayerbotSocialDeliveryRejectionName(rejection));
             }
         }
@@ -1001,8 +1001,8 @@ namespace
                 PlayerbotSocialAssessmentApplication const application =
                     sPlayerbotSocialMgr.ApplyRoleplayAssessment(result);
                 if (application.discard != PlayerbotSocialRoleplayAssessmentDiscard::None)
-                    LOG_DEBUG("playerbot.claude",
-                              "mod-playerbot-claude: roleplay assessment {} discarded by coordinator ({})",
+                    LOG_DEBUG("playerbot.llm",
+                              "mod-playerbot-llm: roleplay assessment {} discarded by coordinator ({})",
                               response.assessmentToken,
                               PlayerbotSocialRoleplayAssessmentDiscardName(application.discard));
             }
@@ -1045,12 +1045,12 @@ namespace
             if (!_bridge)
                 return;
 
-            for (ClaudeChat::MemoryResponse const& response : _bridge->DrainMemoryResponses())
+            for (PlayerbotLLM::MemoryResponse const& response : _bridge->DrainMemoryResponses())
             {
                 std::vector<PlayerbotSocialExtractedMemory> extracted;
                 extracted.reserve(response.memories.size());
 
-                for (ClaudeChat::MemoryResponseCandidate const& candidate : response.memories)
+                for (PlayerbotLLM::MemoryResponseCandidate const& candidate : response.memories)
                     extracted.push_back({candidate.paraphrase, candidate.aboutGuidCounter, candidate.scope});
 
                 sPlayerbotSocialMgr.ApplyExtractedMemories(response.memoryRequestToken,
@@ -1066,7 +1066,7 @@ namespace
 
             uint64 const nowUnixSeconds = static_cast<uint64>(GameTime::GetGameTime().count());
 
-            for (ClaudeChat::BiographyResponse const& response : _bridge->DrainBiographyResponses())
+            for (PlayerbotLLM::BiographyResponse const& response : _bridge->DrainBiographyResponses())
             {
                 /*
                  * Identity is re-resolved from the live character rather than remembered from the
@@ -1092,7 +1092,7 @@ namespace
 
                 std::vector<PlayerbotBiographyFieldValue> fields;
                 fields.reserve(response.fields.size());
-                for (ClaudeChat::BiographyResponseField const& field : response.fields)
+                for (PlayerbotLLM::BiographyResponseField const& field : response.fields)
                     fields.push_back(PlayerbotBiographyFieldValue{field.name, field.value});
 
                 PlayerbotBiographyCompletionRejection const rejection = sPlayerbotSocialMgr.AcceptBiographyResult(
@@ -1100,8 +1100,8 @@ namespace
                     nowUnixSeconds);
 
                 if (rejection != PlayerbotBiographyCompletionRejection::None)
-                    LOG_DEBUG("playerbot.claude",
-                              "mod-playerbot-claude: biography for request {} refused ({})",
+                    LOG_DEBUG("playerbot.llm",
+                              "mod-playerbot-llm: biography for request {} refused ({})",
                               response.biographyRequestToken,
                               PlayerbotBiographyCompletionRejectionName(rejection));
             }
@@ -1121,11 +1121,11 @@ namespace
                 _pending[requestId] = delivery;
         }
 
-        std::unique_ptr<ClaudeBridge> _bridge;
+        std::unique_ptr<Bridge> _bridge;
 
         // Present only while this module is the registered social provider. Holds a reference to the
         // bridge, so it is destroyed before the bridge is and never outlives it.
-        std::optional<ClaudeSocialTransport> _socialTransport;
+        std::optional<SocialTransport> _socialTransport;
         RoleplayAssessmentExchange _assessmentExchange;
 
         std::unordered_map<uint64, PendingDelivery> _pending;
@@ -1142,10 +1142,10 @@ namespace
         int64 _groupCooldownMs = 120000;
     };
 
-    class ClaudeChatPlayerScript : public PlayerScript
+    class PlayerbotLLMPlayerScript : public PlayerScript
     {
     public:
-        ClaudeChatPlayerScript() : PlayerScript("ClaudeChatPlayerScript") { }
+        PlayerbotLLMPlayerScript() : PlayerScript("PlayerbotLLMPlayerScript") { }
 
         // Observation only: the original message is never modified or blocked, so the
         // playerbot command path sees exactly what it would without this module.
@@ -1160,7 +1160,7 @@ namespace
              */
             if (type == CHAT_MSG_WHISPER && language != LANG_ADDON &&
                 LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
-                ClaudeChatState::Instance().CaptureWhisper(player, receiver, message);
+                PlayerbotLLMState::Instance().CaptureWhisper(player, receiver, message);
 
             return true;
         }
@@ -1170,7 +1170,7 @@ namespace
         {
             if (type == CHAT_MSG_PARTY && language != LANG_ADDON &&
                 LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
-                ClaudeChatState::Instance().CaptureParty(player, group, message);
+                PlayerbotLLMState::Instance().CaptureParty(player, group, message);
 
             return true;
         }
@@ -1180,7 +1180,7 @@ namespace
             if (!quest || !LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 return;
 
-            ClaudeChatState::Instance().CaptureMilestone(player, 1, quest->GetQuestId(),
+            PlayerbotLLMState::Instance().CaptureMilestone(player, 1, quest->GetQuestId(),
                                                          "Completed quest: " + quest->GetTitle());
         }
 
@@ -1190,7 +1190,7 @@ namespace
                 !LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 return;
 
-            ClaudeChatState::Instance().CaptureMilestone(player, 2, player->GetLevel(),
+            PlayerbotLLMState::Instance().CaptureMilestone(player, 2, player->GetLevel(),
                                                          "Reached level " + std::to_string(player->GetLevel()));
         }
 
@@ -1203,25 +1203,25 @@ namespace
             if (!proto || proto->Quality < ITEM_QUALITY_RARE || proto->Quality > ITEM_QUALITY_EPIC)
                 return;
 
-            ClaudeChatState::Instance().CaptureMilestone(player, 3, proto->ItemId, "Looted: " + proto->Name1);
+            PlayerbotLLMState::Instance().CaptureMilestone(player, 3, proto->ItemId, "Looted: " + proto->Name1);
         }
     };
 
-    class ClaudeChatWorldScript : public WorldScript
+    class PlayerbotLLMWorldScript : public WorldScript
     {
     public:
-        ClaudeChatWorldScript() : WorldScript("ClaudeChatWorldScript") { }
+        PlayerbotLLMWorldScript() : WorldScript("PlayerbotLLMWorldScript") { }
 
-        void OnStartup() override { ClaudeChatState::Instance().Startup(); }
+        void OnStartup() override { PlayerbotLLMState::Instance().Startup(); }
 
-        void OnShutdown() override { ClaudeChatState::Instance().Shutdown(); }
+        void OnShutdown() override { PlayerbotLLMState::Instance().Shutdown(); }
 
-        void OnUpdate(uint32 /*diff*/) override { ClaudeChatState::Instance().Update(); }
+        void OnUpdate(uint32 /*diff*/) override { PlayerbotLLMState::Instance().Update(); }
     };
 }
 
-void AddClaudeChatScripts()
+void AddPlayerbotLLMScripts()
 {
-    new ClaudeChatPlayerScript();
-    new ClaudeChatWorldScript();
+    new PlayerbotLLMPlayerScript();
+    new PlayerbotLLMWorldScript();
 }

@@ -9,13 +9,13 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from playerbot_claude import budget, ledger, schema
+from playerbot_llm import budget, ledger, schema
 
 
 class FakeState:
-    """In-memory stand-in for :class:`playerbot_claude.state.SidecarState`.
+    """In-memory stand-in for :class:`playerbot_llm.state.SidecarState`.
 
-    The admission arithmetic is the REAL policy from ``playerbot_claude.budget``, not a
+    The admission arithmetic is the REAL policy from ``playerbot_llm.budget``, not a
     hand-rolled approximation. What these tests exercise is the service's ordering, that
     it reserves before generating, settles after, and gives the money back on failure,
     and a double that invented its own admission rule could pass while the service and

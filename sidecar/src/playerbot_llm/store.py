@@ -4,7 +4,7 @@ Everything here used to live in a private SQLite file. Sharing the Playerbots da
 instead removes a second thing to back up, a second thing to migrate, and a file whose
 absence or corruption was a failure mode nobody monitored.
 
-Separate from :mod:`playerbot_claude.ledger` because the two share nothing but a
+Separate from :mod:`playerbot_llm.ledger` because the two share nothing but a
 connection and the lock table. Money has a ceiling, a circuit breaker, and a reconciled
 schema it does not own; this has none of that, and reading one should not mean paging
 through the other.
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from playerbot_claude.schema import (
+from playerbot_llm.schema import (
     CONVERSATION_LOCK_BUCKETS,
     LedgerError,
     acquire_named_lock,
@@ -56,7 +56,7 @@ class SidecarStore:
     ) -> None:
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "INSERT INTO playerbot_claude_profile (bot_guid, profile_version, crafting_affinity, "
+                "INSERT INTO playerbot_llm_profile (bot_guid, profile_version, crafting_affinity, "
                 "gathering_affinity, exploration_affinity, sociability, voice, bot_name, updated_at) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE profile_version = VALUES(profile_version), "
@@ -83,7 +83,7 @@ class SidecarStore:
         async with connection.cursor() as cursor:
             await cursor.execute(
                 "SELECT profile_version, crafting_affinity, gathering_affinity, exploration_affinity, "
-                "sociability, voice, bot_name FROM playerbot_claude_profile WHERE bot_guid = %s",
+                "sociability, voice, bot_name FROM playerbot_llm_profile WHERE bot_guid = %s",
                 (bot_guid,),
             )
             row = await cursor.fetchone()
@@ -124,13 +124,13 @@ class SidecarStore:
                 # little contention and buys a table that cannot grow.
                 await acquire_named_lock(cursor, f"conversation:{bot_guid % CONVERSATION_LOCK_BUCKETS}")
                 await cursor.execute(
-                    "INSERT INTO playerbot_claude_conversation_turn (bot_guid, role, content, created_at) "
+                    "INSERT INTO playerbot_llm_conversation_turn (bot_guid, role, content, created_at) "
                     "VALUES (%s, %s, %s, %s)",
                     (bot_guid, role, content, now),
                 )
                 await cursor.execute(
-                    "DELETE FROM playerbot_claude_conversation_turn WHERE bot_guid = %s AND id NOT IN "
-                    "(SELECT id FROM (SELECT id FROM playerbot_claude_conversation_turn "
+                    "DELETE FROM playerbot_llm_conversation_turn WHERE bot_guid = %s AND id NOT IN "
+                    "(SELECT id FROM (SELECT id FROM playerbot_llm_conversation_turn "
                     "WHERE bot_guid = %s ORDER BY id DESC LIMIT %s) AS keep)",
                     (bot_guid, bot_guid, CONVERSATION_TURN_LIMIT),
                 )
@@ -142,7 +142,7 @@ class SidecarStore:
     async def recent_turns(self, connection, *, bot_guid: int) -> list[tuple[str, str]]:
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "SELECT role, content FROM playerbot_claude_conversation_turn "
+                "SELECT role, content FROM playerbot_llm_conversation_turn "
                 "WHERE bot_guid = %s ORDER BY id ASC",
                 (bot_guid,),
             )
@@ -162,7 +162,7 @@ class SidecarStore:
     ) -> None:
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "INSERT INTO playerbot_claude_career_decision "
+                "INSERT INTO playerbot_llm_career_decision "
                 "(bot_guid, career_version, candidate_token, spending_style, updated_at) "
                 "VALUES (%s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE career_version = VALUES(career_version), "
@@ -176,7 +176,7 @@ class SidecarStore:
         async with connection.cursor() as cursor:
             await cursor.execute(
                 "SELECT career_version, candidate_token, spending_style "
-                "FROM playerbot_claude_career_decision WHERE bot_guid = %s",
+                "FROM playerbot_llm_career_decision WHERE bot_guid = %s",
                 (bot_guid,),
             )
             row = await cursor.fetchone()
@@ -212,13 +212,13 @@ class SidecarStore:
                 await acquire_named_lock(cursor, "ambient")
 
                 await cursor.execute(
-                    "DELETE FROM playerbot_claude_ambient_attempt WHERE created_at <= %s",
+                    "DELETE FROM playerbot_llm_ambient_attempt WHERE created_at <= %s",
                     (cutoff,),
                 )
                 # Predicated on the indexed column, so this reads an index range rather
                 # than the table.
                 await cursor.execute(
-                    "SELECT COUNT(*) FROM playerbot_claude_ambient_attempt WHERE created_at > %s",
+                    "SELECT COUNT(*) FROM playerbot_llm_ambient_attempt WHERE created_at > %s",
                     (cutoff,),
                 )
                 row = await cursor.fetchone()
@@ -227,7 +227,7 @@ class SidecarStore:
                     return False
 
                 await cursor.execute(
-                    "INSERT INTO playerbot_claude_ambient_attempt (created_at) VALUES (%s)",
+                    "INSERT INTO playerbot_llm_ambient_attempt (created_at) VALUES (%s)",
                     (now,),
                 )
             await connection.commit()

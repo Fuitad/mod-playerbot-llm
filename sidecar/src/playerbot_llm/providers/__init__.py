@@ -1,0 +1,1 @@
+"""Concrete generation provider adapters."""

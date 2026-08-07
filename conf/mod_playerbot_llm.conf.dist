@@ -1,32 +1,32 @@
 [worldserver]
 
 ###################################################################################################
-#    mod-playerbot-claude configuration
+#    mod-playerbot-llm configuration
 #
 #    Everything is disabled by default. The module sends chat text, bounded context, and the
 #    deterministic personality profile of addressed bots to the Anthropic API through a local
 #    sidecar. Read the README privacy section before enabling anything.
 #
 #    Secrets are never read from this file. The bridge token comes from the
-#    PLAYERBOT_CLAUDE_BRIDGE_TOKEN environment variable (required, minimum 32 bytes) and the
-#    Anthropic API key from MOD_PLAYERBOT_CLAUDE_APIKEY (read by the sidecar only; the global
+#    PLAYERBOT_LLM_BRIDGE_TOKEN environment variable (required, minimum 32 bytes) and the
+#    Anthropic API key from MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY (read by the sidecar only; the global
 #    ANTHROPIC_API_KEY variable is deliberately ignored).
 ###################################################################################################
 
 #
-#    PlayerbotClaude.Enable
-#        Description: Enables the Claude chat module hooks in worldserver.
+#    PlayerbotLLM.Enable
+#        Description: Enables the provider-neutral generation module hooks in worldserver.
 #        Default:     0 - Disabled
 #                     1 - Enabled
 
-PlayerbotClaude.Enable = 0
+PlayerbotLLM.Enable = 0
 
 #
-#    PlayerbotClaude.AmbientWorldEnable
+#    PlayerbotLLM.AmbientWorldEnable
 #        LEGACY. Kept only for a server running with AiPlayerbot.SocialChat.Enable = 0.
 #
 #        Description: Enables personality shaped ambient messages in the World channel. Requires
-#                     AiPlayerbot.EnableBroadcasts = 0 so canned and Claude chatter cannot overlap.
+#                     AiPlayerbot.EnableBroadcasts = 0 so canned and generated chatter cannot overlap.
 #
 #                     Inert while interactive social chat is on. That feature owns unprompted
 #                     chatter, and it never speaks in World at all: zone General, say, party, and
@@ -36,10 +36,10 @@ PlayerbotClaude.Enable = 0
 #        Default:     0 - Disabled
 #                     1 - Enabled
 
-PlayerbotClaude.AmbientWorldEnable = 0
+PlayerbotLLM.AmbientWorldEnable = 0
 
 #
-#    PlayerbotClaude.AmbientMaxMessagesPerHour
+#    PlayerbotLLM.AmbientMaxMessagesPerHour
 #        LEGACY. Applies only to the setting above, and only while social chat is off.
 #
 #        Description: Maximum accepted ambient attempts in any rolling hour. Values outside the
@@ -49,20 +49,20 @@ PlayerbotClaude.AmbientWorldEnable = 0
 #                     silently declined and no World line is ever spoken. Treat 6 as the ceiling.
 #        Default:     6
 
-PlayerbotClaude.AmbientMaxMessagesPerHour = 6
+PlayerbotLLM.AmbientMaxMessagesPerHour = 6
 
 #
-#    PlayerbotClaude.BridgePort
+#    PlayerbotLLM.BridgePort
 #        Description: Loopback TCP port of the sidecar bridge. Both worldserver and the sidecar
 #                     use this value. 0 disables both processes. The sidecar binds only to
 #                     127.0.0.1.
 #        Default:     0 - Disabled
 
-PlayerbotClaude.BridgePort = 0
+PlayerbotLLM.BridgePort = 0
 
 #
-#    PlayerbotClaude.DailyBudgetUsd
-#        Description: The spending ceiling shared by every Claude generation. Settled actual cost
+#    PlayerbotLLM.DailyBudgetUsd
+#        Description: The spending ceiling shared by every provider generation. Settled actual cost
 #                     plus live maximum reservations may not exceed this value within one UTC
 #                     calendar day, so it rolls over at one instant regardless of server timezone
 #                     or daylight saving. This is the SOLE ceiling: no policy limit is applied
@@ -77,10 +77,10 @@ PlayerbotClaude.BridgePort = 0
 #                     always favours the budget, never the spend.
 #        Default:     5
 
-PlayerbotClaude.DailyBudgetUsd = 5
+PlayerbotLLM.DailyBudgetUsd = 5
 
 #
-#    PlayerbotClaude.HumanBudgetReserveRatio
+#    PlayerbotLLM.HumanBudgetReserveRatio
 #        Description: The share of the daily ceiling held for players who are actually waiting on
 #                     an answer. Background work, bot only continuation, and memory extraction
 #                     cannot spend into this remainder, so a server that spent the day on
@@ -90,28 +90,28 @@ PlayerbotClaude.DailyBudgetUsd = 5
 #                     work using any budget at all. An unusable value fails closed to 1.
 #        Default:     0.25
 
-PlayerbotClaude.HumanBudgetReserveRatio = 0.25
+PlayerbotLLM.HumanBudgetReserveRatio = 0.25
 
 #
-#    PlayerbotClaude.InputUsdPerMTok
+#    PlayerbotLLM.InputUsdPerMTok
 #        Description: Price of one million input tokens in USD, used by the sidecar budget
 #                     ledger. Must match the current Anthropic pricing for the configured
 #                     model. 0 disables all generation.
-#        Default:     1.00 (Claude Haiku 4.5 input)
+#        Default:     1.00 (current Anthropic adapter input)
 
-PlayerbotClaude.InputUsdPerMTok = 1.00
+PlayerbotLLM.InputUsdPerMTok = 1.00
 
 #
-#    PlayerbotClaude.OutputUsdPerMTok
+#    PlayerbotLLM.OutputUsdPerMTok
 #        Description: Price of one million output tokens in USD, used by the sidecar budget
 #                     ledger. Must match the current Anthropic pricing for the configured
 #                     model. 0 disables all generation.
-#        Default:     5.00 (Claude Haiku 4.5 output)
+#        Default:     5.00 (current Anthropic adapter output)
 
-PlayerbotClaude.OutputUsdPerMTok = 5.00
+PlayerbotLLM.OutputUsdPerMTok = 5.00
 
 #
-#    PlayerbotClaude.SidecarDatabase (REMOVED)
+#    PlayerbotLLM.SidecarDatabase (REMOVED)
 #        The sidecar no longer keeps its own SQLite file. Profiles, conversation memory,
 #        career decisions, the ambient rate, and the budget ledger all live in the shared
 #        acore_playerbots database now, so the budget holds across sidecar restarts and
@@ -123,12 +123,12 @@ PlayerbotClaude.OutputUsdPerMTok = 5.00
 #        and the one that gets missed is the one that keeps working with the old password
 #        until it suddenly does not.
 #
-#        A leftover PlayerbotClaude.SidecarDatabase line is ignored. Nothing migrates the
+#        A leftover PlayerbotLLM.SidecarDatabase line is ignored. Nothing migrates the
 #        old file; the ledger starts empty.
 #
 
 #
-#    PlayerbotClaude.ResponseDeadlineMs
+#    PlayerbotLLM.ResponseDeadlineMs
 #        Description: Milliseconds a pending conversation or career choice waits for the
 #                     sidecar before the request expires. Expired conversations are dropped.
 #                     Expired career choices use the deterministic playerbot fallback.
@@ -137,28 +137,28 @@ PlayerbotClaude.OutputUsdPerMTok = 5.00
 #                     before delivery, so a late provider reply is never spoken.
 #        Default:     10000
 
-PlayerbotClaude.ResponseDeadlineMs = 10000
+PlayerbotLLM.ResponseDeadlineMs = 10000
 
 #
-#    PlayerbotClaude.LogModelIO
+#    PlayerbotLLM.LogModelIO
 #        Logs the complete system prompt, user messages, output schema, and raw provider reply for
 #        every generation. This includes player conversation content and generated memories. Enable
 #        it only for temporary local diagnostics, then delete the captured log.
 #        Default: 0
 
-PlayerbotClaude.LogModelIO = 0
+PlayerbotLLM.LogModelIO = 0
 
 #
-#    PlayerbotClaude.QueueSize
+#    PlayerbotLLM.QueueSize
 #        Description: Maximum pending requests between the world thread and the bridge worker.
 #                     A full queue rejects new requests immediately.
 #        Default:     16
 
-PlayerbotClaude.QueueSize = 16
+PlayerbotLLM.QueueSize = 16
 
 #
-#    PlayerbotClaude.GroupCooldownSeconds
+#    PlayerbotLLM.GroupCooldownSeconds
 #        Description: Minimum seconds between milestone reactions for the same group.
 #        Default:     120
 
-PlayerbotClaude.GroupCooldownSeconds = 120
+PlayerbotLLM.GroupCooldownSeconds = 120

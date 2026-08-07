@@ -1,42 +1,22 @@
-"""Claude Haiku adapter: one validated player-style chat line per request.
-
-The model receives no tools and cannot influence routing: the trusted personality
-profile is rendered into the system prompt, the player text stays a separate and
-explicitly untrusted user message, and the structured output carries only `message`.
-"""
+"""Provider-neutral prompts, output schemas, and deterministic validation."""
 
 from __future__ import annotations
 
 import json
-import os
 import re
-from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from collections.abc import Collection
 from enum import StrEnum
-from typing import Literal, TypeVar, cast
+from typing import Literal, TypedDict, cast
 
-import anthropic
-import httpx
-from anthropic.lib._parse._response import parse_response
-from anthropic.lib._parse._transform import transform_schema
-from anthropic.types import MessageParam, ParsedMessage
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
-from playerbot_claude import protocol
+from playerbot_llm import protocol, provider
 
-# Module-scoped credential: the environment variable *name*, not a secret value.
-# Deliberately not ANTHROPIC_API_KEY, so a machine-wide key can never be used
-# implicitly by this module; the adapter never falls back to the SDK default.
-API_KEY_ENV_VAR = "MOD_PLAYERBOT_CLAUDE_APIKEY"
 
-MODEL_ID = "claude-haiku-4-5-20251001"
-MAX_OUTPUT_TOKENS = 96
-# Eight short player-profile fields do not fit inside the one-line chat envelope. The live Task 16
-# probe reached 415 JSON characters and was still truncated at 96 tokens. This keeps chat terse
-# while giving the structured biography response enough room to finish.
-BIOGRAPHY_MAX_OUTPUT_TOKENS = 512
-MAX_INPUT_TOKENS = 4095
-REQUEST_TIMEOUT_SECONDS = 30.0
+class MessageParam(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str
+
 
 EVENT_KIND_NAMES = {
     0: "conversation",
@@ -86,53 +66,6 @@ _FICTIONAL_IDENTITY_KEYS = (
     "fictional_home_country",
 )
 
-_ResponseModelT = TypeVar("_ResponseModelT", bound=BaseModel)
-
-
-@dataclass(frozen=True)
-class UsageTotals:
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
-
-    @property
-    def is_priceable(self) -> bool:
-        """Whether these counts can be turned into a cost at all.
-
-        The SDK's own ``Usage`` model accepts negative token counts, so a broken or
-        hostile provider response can carry them, and a negative count prices to a
-        negative cost or to nothing at all. Checked here rather than trusted, because
-        this is the boundary where provider data becomes ledger data.
-        """
-
-        return (
-            self.input_tokens >= 0
-            and self.output_tokens >= 0
-            and self.cache_creation_input_tokens >= 0
-            and self.cache_read_input_tokens >= 0
-        )
-
-
-class ClaudeError(Exception):
-    """Base class for bounded adapter failures. The bot stays silent on all of them."""
-
-
-class ClaudeTimeoutError(ClaudeError):
-    pass
-
-
-class ClaudeAuthError(ClaudeError):
-    pass
-
-
-class ClaudeRateLimitError(ClaudeError):
-    pass
-
-
-class ClaudeProviderError(ClaudeError):
-    pass
-
 
 class ModerationCategory(StrEnum):
     """Why a generated answer was refused.
@@ -166,57 +99,6 @@ class ModerationCategory(StrEnum):
     EMOTE_CHANNEL_ILLEGAL = "emote_channel_illegal"
     UNKNOWN_SUBJECT = "unknown_subject"
     SCOPE_MISMATCH = "scope_mismatch"
-
-
-class ClaudeInvalidOutputError(ClaudeError):
-    """The provider answered, but the answer is unusable.
-
-    Carries the reported ``usage`` whenever a completion actually came back, which is
-    every case except a response too malformed to parse at all. The tokens WERE generated
-    and billed, so the caller can settle the reservation at the true cost rather than
-    guessing at it or letting the charge disappear.
-
-    ``category`` names WHY when the rejection came from the moderation gate, so telemetry can
-    count the reasons rather than parsing a sentence. It is None for the failures that are not
-    a judgement about content, such as a schema mismatch or impossible token counts.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        usage: UsageTotals | None = None,
-        category: ModerationCategory | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.usage = usage
-        self.category = category
-
-
-def billing_is_impossible(error: ClaudeError) -> bool:
-    """Whether this failure PROVES the provider generated nothing and billed nothing.
-
-    Only the refusals qualify. Authentication fails at 401 and rate limiting at 429, both
-    before any generation, so a reservation held for one of those is money that was never
-    going to be spent and giving it back is correct.
-
-    A caller uses this to decide the fate of a reservation, alongside
-    ``ClaudeInvalidOutputError.usage``:
-
-    - True here means release. Nothing was generated.
-    - Otherwise, if the error carries usage, the completion happened and its exact cost is
-      known, so settle at that.
-    - Otherwise the outcome is genuinely unknown. ``ClaudeTimeoutError`` and
-      ``ClaudeProviderError`` carry no usage, and with ``max_retries=1`` a request may
-      have been received and billed before the connection failed. Those reservations are
-      left outstanding for the ledger's expiry, which holds the money against the ceiling
-      while the answer might still matter and stops guessing once it cannot.
-
-    Note the limit of what a status code proves. A 401 or a 429 shows the request was
-    refused before generation, which is the provider's documented behaviour; it is not the
-    same as a billing guarantee from the contract.
-    """
-
-    return isinstance(error, ClaudeAuthError | ClaudeRateLimitError)
 
 
 class ChatReply(BaseModel):
@@ -667,432 +549,6 @@ def _build_messages(request: protocol.ChatRequest, history: list[tuple[str, str]
     return messages
 
 
-class ClaudeAdapter:
-    """Synchronous Anthropic SDK wrapper with bounded, typed failures."""
-
-    def __init__(
-        self,
-        client: anthropic.Anthropic | None = None,
-        timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
-        model_io_logger: Callable[[str], None] | None = None,
-    ) -> None:
-        # api_key is always passed explicitly: an empty value fails authentication
-        # instead of silently falling back to the SDK's ANTHROPIC_API_KEY lookup.
-        self._client = client or anthropic.Anthropic(
-            api_key=os.environ.get(API_KEY_ENV_VAR, ""),
-            timeout=timeout_seconds,
-            max_retries=1,
-        )
-        self._model_io_logger = model_io_logger
-
-    def _trace_request(
-        self,
-        kind: str,
-        correlation_id: int,
-        system: str,
-        messages: list[MessageParam],
-        output_format: type[BaseModel],
-        max_tokens: int,
-    ) -> None:
-        if self._model_io_logger is None:
-            return
-
-        self._model_io_logger(
-            json.dumps(
-                {
-                    "phase": "request",
-                    "kind": kind,
-                    "correlation_id": correlation_id,
-                    "model": MODEL_ID,
-                    "max_tokens": max_tokens,
-                    "system": system,
-                    "messages": messages,
-                    "output_schema": output_format.model_json_schema(),
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-
-    def _trace_response(self, kind: str, correlation_id: int, response: BaseModel) -> None:
-        if self._model_io_logger is None:
-            return
-
-        provider_message = response.model_dump(
-            mode="json",
-            exclude={"parsed_output": True, "content": {"__all__": {"parsed_output"}}},
-            warnings=False,
-        )
-        self._model_io_logger(
-            json.dumps(
-                {
-                    "phase": "response",
-                    "kind": kind,
-                    "correlation_id": correlation_id,
-                    "provider_message": provider_message,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-
-    def _generate_structured(
-        self,
-        kind: str,
-        correlation_id: int,
-        system: str,
-        messages: list[MessageParam],
-        output_format: type[_ResponseModelT],
-        max_tokens: int,
-    ) -> ParsedMessage[_ResponseModelT]:
-        self._trace_request(kind, correlation_id, system, messages, output_format, max_tokens)
-        response = self._client.messages.create(
-            model=MODEL_ID,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            output_config={
-                "format": {
-                    "type": "json_schema",
-                    "schema": transform_schema(output_format),
-                }
-            },
-        )
-        self._trace_response(kind, correlation_id, response)
-        return cast(
-            ParsedMessage[_ResponseModelT],
-            parse_response(response=response, output_format=output_format),
-        )
-
-    def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
-        output_format = CareerReply if request.is_career else ChatReply
-        try:
-            # output_format must match generate_reply exactly: the structured output
-            # schema is billed as input, and the budget reservation is priced from
-            # this count.
-            result = self._client.messages.count_tokens(
-                model=MODEL_ID,
-                system=build_system_prompt(request),
-                messages=_build_messages(request, history),
-                output_format=output_format,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-
-        return result.input_tokens
-
-    def count_social_input_tokens(self, request: protocol.SocialRequest) -> int:
-        try:
-            # Must match generate_social_reply exactly, for the same reason the chat count
-            # does: the structured output schema is billed as input and priced from here.
-            result = self._client.messages.count_tokens(
-                model=MODEL_ID,
-                system=build_social_system_prompt(request),
-                messages=_social_messages(request),
-                output_format=SocialReply,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-
-        return result.input_tokens
-
-    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, int, UsageTotals]:
-        system = build_social_system_prompt(request)
-        messages = _social_messages(request)
-        try:
-            response = self._generate_structured(
-                "social", request.social_request_token, system, messages, SocialReply, MAX_OUTPUT_TOKENS
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-        except ValidationError as error:
-            raise ClaudeInvalidOutputError("model output did not match the social reply schema") from error
-
-        # Read BEFORE validating, for the same reason as the chat path: everything below
-        # rejects a completion that was already generated and billed, and the caller has to
-        # settle the real cost of it.
-        usage = response.usage
-        totals = UsageTotals(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-        )
-
-        if not totals.is_priceable:
-            raise ClaudeInvalidOutputError("provider reported impossible token counts")
-
-        parsed = response.parsed_output
-        if parsed is None or not isinstance(parsed, SocialReply):
-            raise ClaudeInvalidOutputError("model output did not match the social reply schema", totals)
-
-        # Exactly one answer. Both filled is the model hedging, and picking one for it would
-        # be inventing an intention it did not have; neither filled is silence, which schema 3
-        # cannot express, so it is a regeneration rather than something to deliver.
-        if parsed.emote and parsed.message.strip():
-            raise ClaudeInvalidOutputError(
-                "model answered with both a line and a gesture",
-                totals,
-                ModerationCategory.BOTH_ANSWERS,
-            )
-
-        if parsed.emote:
-            return "", validate_social_emote(parsed.emote, request, totals), totals
-
-        return validate_social_message(parsed.message, request, totals), 0, totals
-
-    def count_roleplay_assessment_input_tokens(self, request: protocol.RoleplayAssessmentRequest) -> int:
-        try:
-            # Must match assess_roleplay exactly: the structured output schema is billed as
-            # input and priced from here.
-            result = self._client.messages.count_tokens(
-                model=MODEL_ID,
-                system=build_roleplay_assessment_system_prompt(request),
-                messages=_roleplay_assessment_messages(request),
-                output_format=protocol.RoleplayAssessmentCompletion,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-
-        return result.input_tokens
-
-    def assess_roleplay(
-        self, request: protocol.RoleplayAssessmentRequest
-    ) -> tuple[protocol.RoleplayAssessmentCompletion, UsageTotals]:
-        """Classifies one observed line, or raises. Never guesses from partial text.
-
-        The completion is the strict protocol schema directly, so its per kind cardinality
-        contract is enforced by parsing: output that does not satisfy it is a
-        ClaudeInvalidOutputError, which the service answers with silence rather than with a
-        fabricated ordinary result.
-        """
-
-        system = build_roleplay_assessment_system_prompt(request)
-        messages = _roleplay_assessment_messages(request)
-        try:
-            response = self._generate_structured(
-                "roleplay_assessment",
-                request.roleplay_assessment_request_token,
-                system,
-                messages,
-                protocol.RoleplayAssessmentCompletion,
-                MAX_OUTPUT_TOKENS,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-        except ValidationError as error:
-            raise ClaudeInvalidOutputError(
-                "model output did not match the roleplay assessment schema"
-            ) from error
-
-        # Read BEFORE validating, so a rejected completion still settles what it cost.
-        usage = response.usage
-        totals = UsageTotals(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-        )
-
-        if not totals.is_priceable:
-            raise ClaudeInvalidOutputError("provider reported impossible token counts")
-
-        parsed = response.parsed_output
-        if parsed is None or not isinstance(parsed, protocol.RoleplayAssessmentCompletion):
-            raise ClaudeInvalidOutputError(
-                "model output did not match the roleplay assessment schema", totals
-            )
-
-        return parsed, totals
-
-    def count_biography_input_tokens(self, request: protocol.BiographyRequest) -> int:
-        try:
-            # Must match generate_biography exactly, for the same reason the other two counts
-            # do: the structured output schema is billed as input and priced from here.
-            result = self._client.messages.count_tokens(
-                model=MODEL_ID,
-                system=build_biography_system_prompt(request),
-                messages=_biography_messages(request),
-                output_format=BiographyReply,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-
-        return result.input_tokens
-
-    def generate_biography(self, request: protocol.BiographyRequest) -> tuple[dict[str, str], UsageTotals]:
-        system = build_biography_system_prompt(request)
-        messages = _biography_messages(request)
-        try:
-            response = self._generate_structured(
-                "biography",
-                request.biography_request_token,
-                system,
-                messages,
-                BiographyReply,
-                BIOGRAPHY_MAX_OUTPUT_TOKENS,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-        except ValidationError as error:
-            raise ClaudeInvalidOutputError("model output did not match the biography schema") from error
-
-        # Read BEFORE validating, for the reason the other two generators give: everything below
-        # rejects a completion that was already generated and billed.
-        usage = response.usage
-        totals = UsageTotals(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-        )
-
-        if not totals.is_priceable:
-            raise ClaudeInvalidOutputError("provider reported impossible token counts")
-
-        parsed = response.parsed_output
-        if parsed is None or not isinstance(parsed, BiographyReply):
-            raise ClaudeInvalidOutputError("model output did not match the biography schema", totals)
-
-        return biography_fields_for_transport(parsed, request, totals), totals
-
-    def count_memory_input_tokens(self, request: protocol.MemoryRequest) -> int:
-        try:
-            # Must match generate_memories exactly. The structured output schema is billed as
-            # input, so a count taken without it under-prices the reservation.
-            result = self._client.messages.count_tokens(
-                model=MODEL_ID,
-                system=build_memory_system_prompt(request),
-                messages=_memory_messages(request),
-                output_format=MemoryReply,
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-
-        return result.input_tokens
-
-    def generate_memories(
-        self, request: protocol.MemoryRequest
-    ) -> tuple[list[dict[str, object]], UsageTotals]:
-        system = build_memory_system_prompt(request)
-        messages = _memory_messages(request)
-        try:
-            response = self._generate_structured(
-                "memory", request.memory_request_token, system, messages, MemoryReply, MAX_OUTPUT_TOKENS
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-        except ValidationError as error:
-            raise ClaudeInvalidOutputError("model output did not match the memory schema") from error
-
-        # Read BEFORE validating. Everything below rejects a completion that was already
-        # generated and billed, and the caller has to settle it either way.
-        usage = response.usage
-        totals = UsageTotals(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-        )
-
-        if not totals.is_priceable:
-            raise ClaudeInvalidOutputError("provider reported impossible token counts")
-
-        parsed = response.parsed_output
-        if parsed is None or not isinstance(parsed, MemoryReply):
-            raise ClaudeInvalidOutputError("model output did not match the memory schema", totals)
-
-        accepted = validate_memory_reply(
-            parsed, list(request.thread), request.subject_guids, request.scope, totals
-        )
-        return accepted, totals
-
-    def generate_reply(
-        self, request: protocol.ChatRequest, history: list[tuple[str, str]]
-    ) -> tuple[str, UsageTotals]:
-        output_format = CareerReply if request.is_career else ChatReply
-        kind = "career" if request.is_career else "chat"
-        system = build_system_prompt(request)
-        messages = _build_messages(request, history)
-        try:
-            response = self._generate_structured(
-                kind, request.request_id, system, messages, output_format, MAX_OUTPUT_TOKENS
-            )
-        except anthropic.APIError as error:
-            raise _map_api_error(error) from error
-        except httpx.TimeoutException as error:
-            raise ClaudeTimeoutError(str(error)) from error
-        except ValidationError as error:
-            raise ClaudeInvalidOutputError("model output did not match the reply schema") from error
-
-        # Read BEFORE validating the content. Everything below this line rejects a
-        # completion that was generated and billed, and the caller has to settle the real
-        # cost of it; discovering the tokens after deciding to raise is how that charge
-        # goes missing.
-        usage = response.usage
-        totals = UsageTotals(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-        )
-
-        if not totals.is_priceable:
-            # Impossible counts are not a cost the caller can settle, so they are not
-            # handed on as one. Raised WITHOUT usage, which puts this in the same lane as
-            # a timeout: the reservation stays outstanding at its maximum for expiry
-            # rather than being charged a number that cannot be right or released as free.
-            raise ClaudeInvalidOutputError("provider reported impossible token counts")
-
-        parsed = response.parsed_output
-        if parsed is None:
-            raise ClaudeInvalidOutputError("model output did not match the reply schema", totals)
-
-        if request.is_career:
-            if not isinstance(parsed, CareerReply):
-                raise ClaudeInvalidOutputError("model output did not match the career reply schema", totals)
-            message = _validate_career_reply(request, parsed, totals)
-        else:
-            if not isinstance(parsed, ChatReply):
-                raise ClaudeInvalidOutputError("model output did not match the chat reply schema", totals)
-            message = parsed.message.strip()
-        if not message:
-            raise ClaudeInvalidOutputError("model returned an empty message", totals)
-
-        if any(ord(character) < 0x20 for character in message):
-            raise ClaudeInvalidOutputError("model message must be a single line", totals)
-
-        if len(message.encode("utf-8")) > protocol.MAX_RESPONSE_MESSAGE_BYTES:
-            raise ClaudeInvalidOutputError("model message exceeds 240 UTF-8 bytes", totals)
-
-        return message, totals
-
-
-"""Fragments that mean the model answered as an assistant rather than as a character.
-
-Matched case-insensitively against the whole line. These are the shapes an injected
-instruction produces when it succeeds: the model narrating its own rules, its
-configuration, or its refusal, instead of speaking as the bot. A line that does this is
-not unsafe so much as broken character, and either way it must not reach a chat channel.
-"""
 _SOCIAL_LEAK_MARKERS = (
     "system prompt",
     "as an ai",
@@ -1105,14 +561,11 @@ _SOCIAL_LEAK_MARKERS = (
     "api key",
 )
 
-# Structural tells that the model produced a transcript, a document, or a scripted exchange
-# rather than one spoken line. Deliberately separate from the leak markers: this is about
-# SHAPE, and the coordinator has its own burst check for the same reason.
 _SOCIAL_STRUCTURE_MARKERS = ("```", "###", "</", "/>")
 
 
 def validate_social_message(
-    message: str, request: protocol.SocialRequest, usage: UsageTotals | None = None
+    message: str, request: protocol.SocialRequest, usage: provider.GenerationUsage | None = None
 ) -> str:
     """Deterministic gate on one social line. Raises rather than substituting anything.
 
@@ -1125,24 +578,24 @@ def validate_social_message(
 
     message = message.strip()
     if not message:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "model returned an empty social message", usage, ModerationCategory.EMPTY
         )
 
     if any(ord(character) < 0x20 for character in message):
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "social message must be a single line", usage, ModerationCategory.NOT_ONE_LINE
         )
 
     if len(message.encode("utf-8")) > protocol.MAX_RESPONSE_MESSAGE_BYTES:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "social message exceeds 240 UTF-8 bytes", usage, ModerationCategory.TOO_LONG
         )
 
     lowered = message.casefold()
     for marker in _SOCIAL_LEAK_MARKERS:
         if marker in lowered:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 f"social message broke character near {marker!r}",
                 usage,
                 ModerationCategory.BROKE_CHARACTER,
@@ -1150,7 +603,7 @@ def validate_social_message(
 
     for marker in _SOCIAL_STRUCTURE_MARKERS:
         if marker in message:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 "social message carried document structure",
                 usage,
                 ModerationCategory.DOCUMENT_STRUCTURE,
@@ -1158,12 +611,12 @@ def validate_social_message(
 
     reason = _unsafe_content_reason(message)
     if reason is not None:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             f"social message carried unsafe content ({reason})", usage, ModerationCategory.UNSAFE_CONTENT
         )
 
     if _is_targeted_repetition(message):
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "social message was repetition rather than a line",
             usage,
             ModerationCategory.TARGETED_REPETITION,
@@ -1173,7 +626,7 @@ def validate_social_message(
     # Checked against the name the COORDINATOR gave, not against anything in the context.
     speaker_prefix = f"{request.bot_name.casefold()}:"
     if lowered.startswith(speaker_prefix):
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "social message was formatted as a transcript", usage, ModerationCategory.TRANSCRIPT
         )
 
@@ -1460,7 +913,7 @@ def build_biography_system_prompt(request: protocol.BiographyRequest) -> str:
     character data alone, with no chat, no memory, and no player-authored text of any kind. That
     is what makes it the one prompt in this file with no UNTRUSTED section.
 
-    Raises ClaudeInvalidOutputError when the identity cannot be named. Refusing is the honest
+    Raises provider.GenerationInvalidOutputError when the identity cannot be named. Refusing is the honest
     answer: a race id this build does not know means a worldserver newer than the sidecar or a
     corrupt row, and the alternatives are a player profile attached to an identity whose race the
     prompt guessed, or one silently written about nobody in particular.
@@ -1470,7 +923,7 @@ def build_biography_system_prompt(request: protocol.BiographyRequest) -> str:
     character_class = CLASS_NAMES.get(request.class_id)
     gender = GENDER_NAMES.get(request.gender_id)
     if race is None or character_class is None or gender is None:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             f"unknown identity for biography request {request.biography_request_token}: "
             f"race {request.race_id}, class {request.class_id}, gender {request.gender_id}"
         )
@@ -1562,7 +1015,7 @@ def _biography_messages(request: protocol.BiographyRequest) -> list[MessageParam
 
 
 def biography_fields_for_transport(
-    reply: BiographyReply, request: protocol.BiographyRequest, usage: UsageTotals | None = None
+    reply: BiographyReply, request: protocol.BiographyRequest, usage: provider.GenerationUsage | None = None
 ) -> dict[str, str]:
     """Validates a generated player profile and returns the transport-compatible fields.
 
@@ -1585,21 +1038,21 @@ def biography_fields_for_transport(
 
 
 def build_biography(
-    reply: BiographyReply, identity: dict[str, object], usage: UsageTotals | None = None
+    reply: BiographyReply, identity: dict[str, object], usage: provider.GenerationUsage | None = None
 ) -> dict[str, object]:
     """Validates a generated player profile and stamps the authoritative identity onto it."""
 
     fields = reply.model_dump()
     for name, value in fields.items():
         if not value.strip():
-            raise ClaudeInvalidOutputError(f"biography field {name} is empty", usage)
+            raise provider.GenerationInvalidOutputError(f"biography field {name} is empty", usage)
 
         if len(value.encode("utf-8")) > MAX_BIOGRAPHY_FIELD_LENGTH:
-            raise ClaudeInvalidOutputError(f"biography field {name} runs to prose", usage)
+            raise provider.GenerationInvalidOutputError(f"biography field {name} runs to prose", usage)
 
         term = _contains_forbidden_claim(value)
         if term is not None:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 f"biography field {name} claims {term!r}, which the bot cannot have",
                 usage,
                 ModerationCategory.FORBIDDEN_CLAIM,
@@ -1630,7 +1083,7 @@ def validate_memory_reply(
     thread: list[str],
     subjects: Collection[int],
     scope: str,
-    usage: UsageTotals | None = None,
+    usage: provider.GenerationUsage | None = None,
 ) -> list[dict[str, object]]:
     """Accepts paraphrases drawn from this thread, about these people, at this privacy.
 
@@ -1651,7 +1104,7 @@ def validate_memory_reply(
         # is one it already filtered for consent and presence, so anything else is a memory about
         # somebody who never agreed to this and may not have been in the room.
         if candidate.about_guid not in allowed:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 "memory candidate is about someone who was not there",
                 usage,
                 ModerationCategory.UNKNOWN_SUBJECT,
@@ -1663,7 +1116,7 @@ def validate_memory_reply(
         # something a bot announces to a zone. The narrower direction is merely wrong, and is
         # refused too rather than accepting a field that is never useful.
         if candidate.scope != scope:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 "memory candidate relabels the privacy it was learned under",
                 usage,
                 ModerationCategory.SCOPE_MISMATCH,
@@ -1671,14 +1124,14 @@ def validate_memory_reply(
 
         text = candidate.paraphrase.strip()
         if not text:
-            raise ClaudeInvalidOutputError("memory candidate is empty", usage)
+            raise provider.GenerationInvalidOutputError("memory candidate is empty", usage)
 
         if len(text.encode("utf-8")) > protocol.MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
-            raise ClaudeInvalidOutputError("memory candidate runs to prose", usage)
+            raise provider.GenerationInvalidOutputError("memory candidate runs to prose", usage)
 
         for pattern in _MEMORY_FORBIDDEN_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):
-                raise ClaudeInvalidOutputError(
+                raise provider.GenerationInvalidOutputError(
                     "memory candidate carries content it must not",
                     usage,
                     ModerationCategory.CARRIED_SECRET,
@@ -1688,7 +1141,7 @@ def validate_memory_reply(
         # worse than saying it once.
         reason = _unsafe_content_reason(text)
         if reason is not None:
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 f"memory candidate carries unsafe content ({reason})",
                 usage,
                 ModerationCategory.UNSAFE_CONTENT,
@@ -1698,7 +1151,7 @@ def validate_memory_reply(
         # the memory table into a chat log with a longer retention period.
         compared = _normalized(text)
         if any(compared and compared in line for line in normalized):
-            raise ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 "memory candidate quotes the thread rather than paraphrasing it",
                 usage,
                 ModerationCategory.QUOTED_THREAD,
@@ -1717,7 +1170,7 @@ def _normalized(line: str) -> str:
 
 
 def validate_social_emote(
-    name: str, request: protocol.SocialRequest, usage: UsageTotals | None = None
+    name: str, request: protocol.SocialRequest, usage: provider.GenerationUsage | None = None
 ) -> int:
     """Resolves a gesture NAME to its ID, refusing one nobody could see.
 
@@ -1728,14 +1181,14 @@ def validate_social_emote(
 
     emote_id = SOCIAL_EMOTES.get(name)
     if emote_id is None:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             f"model chose an emote outside the vocabulary: {name!r}",
             usage,
             ModerationCategory.UNKNOWN_EMOTE,
         )
 
     if request.speak_on_channel not in SOCIAL_EMOTE_CHANNELS:
-        raise ClaudeInvalidOutputError(
+        raise provider.GenerationInvalidOutputError(
             "an emote cannot be seen on this channel",
             usage,
             ModerationCategory.EMOTE_CHANNEL_ILLEGAL,
@@ -1758,14 +1211,16 @@ def _roleplay_assessment_messages(request: protocol.RoleplayAssessmentRequest) -
 
 
 def _validate_career_reply(
-    request: protocol.ChatRequest, reply: CareerReply, usage: UsageTotals | None = None
+    request: protocol.ChatRequest, reply: CareerReply, usage: provider.GenerationUsage | None = None
 ) -> str:
     candidates = {candidate.token: candidate for candidate in request.career_content.candidates}
     candidate = candidates.get(reply.candidate_token)
     if candidate is None:
-        raise ClaudeInvalidOutputError("model selected an unknown career candidate", usage)
+        raise provider.GenerationInvalidOutputError("model selected an unknown career candidate", usage)
     if _SPENDING_STYLE_ORDER[reply.spending_style] > _SPENDING_STYLE_ORDER[candidate.maximum_spending_style]:
-        raise ClaudeInvalidOutputError("model selected spending above the candidate maximum", usage)
+        raise provider.GenerationInvalidOutputError(
+            "model selected spending above the candidate maximum", usage
+        )
 
     return json.dumps(
         {
@@ -1774,14 +1229,3 @@ def _validate_career_reply(
         },
         separators=(",", ":"),
     )
-
-
-def _map_api_error(error: anthropic.APIError) -> ClaudeError:
-    if isinstance(error, anthropic.APITimeoutError):
-        return ClaudeTimeoutError(str(error))
-    if isinstance(error, anthropic.AuthenticationError):
-        return ClaudeAuthError("authentication with the Anthropic API failed")
-    if isinstance(error, anthropic.RateLimitError):
-        return ClaudeRateLimitError("the Anthropic API rate limit was hit")
-
-    return ClaudeProviderError(f"provider error: {type(error).__name__}")

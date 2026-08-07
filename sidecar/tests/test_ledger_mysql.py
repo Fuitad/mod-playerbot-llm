@@ -1,6 +1,6 @@
 """Budget ledger tests against a real MySQL.
 
-Marked ``mysql`` and skipped unless ``PLAYERBOT_CLAUDE_TEST_MYSQL_DSN`` names a
+Marked ``mysql`` and skipped unless ``PLAYERBOT_LLM_TEST_MYSQL_DSN`` names a
 disposable database. These cannot be mocked usefully: what they prove is that
 ``SELECT ... FOR UPDATE`` actually serializes two concurrent transactions, and a mock
 that serializes them is a mock that assumes the answer.
@@ -16,6 +16,7 @@ import json
 import os
 import warnings
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -23,19 +24,21 @@ from pathlib import Path
 import aiomysql
 import pytest
 from pymysql.constants import CLIENT
+from pymysql.err import OperationalError
 
-from playerbot_claude import app, budget, claude, ledger, protocol, schema
-from playerbot_claude import state as state_module
-from playerbot_claude import store as store_module
-from playerbot_claude.app import PlayerbotsDatabaseSettings
-from playerbot_claude.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbot_llm import app, budget, generation, ledger, protocol, provider, schema
+from playerbot_llm import state as state_module
+from playerbot_llm import store as store_module
+from playerbot_llm.app import PlayerbotsDatabaseSettings
+from playerbot_llm.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbot_llm.providers import anthropic as anthropic_provider
 
 pytestmark = [pytest.mark.mysql, pytest.mark.asyncio]
 
-DSN = os.environ.get("PLAYERBOT_CLAUDE_TEST_MYSQL_DSN")
+DSN = os.environ.get("PLAYERBOT_LLM_TEST_MYSQL_DSN")
 
 if not DSN:  # pragma: no cover - the skip is the point
-    pytest.skip("PLAYERBOT_CLAUDE_TEST_MYSQL_DSN is not set", allow_module_level=True)
+    pytest.skip("PLAYERBOT_LLM_TEST_MYSQL_DSN is not set", allow_module_level=True)
 
 
 CEILING = budget.usd_to_nano("10.00")
@@ -59,6 +62,24 @@ SQL_REVISIONS = sorted(
     (Path(__file__).resolve().parents[3] / "mod-playerbots" / "data" / "sql" / "playerbots" / "updates").glob(
         "2026_08_*.sql"
     )
+)
+
+PLAYERBOTS_UPDATES = (
+    Path(__file__).resolve().parents[3] / "mod-playerbots" / "data" / "sql" / "playerbots" / "updates"
+)
+LEGACY_SOCIAL_REVISIONS = (
+    PLAYERBOTS_UPDATES / "2026_08_01_00_playerbot_social_schema.sql",
+    PLAYERBOTS_UPDATES / "2026_08_04_00_playerbot_budget_lane_unspecified.sql",
+)
+LLM_TABLE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_07_00_playerbot_llm_tables.sql"
+PROVIDER_TABLE_SUFFIXES = (
+    "daily_budget",
+    "budget_reservation",
+    "lock",
+    "profile",
+    "conversation_turn",
+    "career_decision",
+    "ambient_attempt",
 )
 
 if not SQL_REVISIONS:  # pragma: no cover - a moved module directory, not a test outcome
@@ -87,6 +108,112 @@ async def _connect() -> aiomysql.Connection:
     )
 
 
+async def _apply_revisions(database: str, revisions: tuple[Path, ...]) -> None:
+    settings = _settings()
+    connection = await aiomysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        db=database,
+        autocommit=True,
+        client_flag=CLIENT.MULTI_STATEMENTS,
+    )
+    try:
+        for revision in revisions:
+            async with connection.cursor() as cursor:
+                await cursor.execute(revision.read_text())
+                while await cursor.nextset():
+                    pass
+    finally:
+        connection.close()
+
+
+async def _execute_statements(database: str, statements: tuple[str, ...]) -> None:
+    settings = _settings()
+    connection = await aiomysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        db=database,
+        autocommit=True,
+    )
+    try:
+        async with connection.cursor() as cursor:
+            for statement in statements:
+                await cursor.execute(statement)
+    finally:
+        connection.close()
+
+
+async def _create_legacy_sidecar_schema(database: str) -> None:
+    statements = tuple(
+        statement.replace("playerbot_llm_", "playerbot_claude_") for statement in schema.SCHEMA_STATEMENTS
+    )
+    await _execute_statements(database, statements)
+
+
+async def _provider_table_snapshot(database: str) -> dict[str, int]:
+    settings = _settings()
+    connection = await aiomysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        db=database,
+        autocommit=True,
+    )
+    try:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() "
+                "AND (table_name LIKE 'playerbot_llm_%' OR table_name LIKE 'playerbot_claude_%') "
+                "ORDER BY table_name"
+            )
+            names = [row[0] for row in await cursor.fetchall()]
+            snapshot: dict[str, int] = {}
+            for name in names:
+                assert name in {
+                    f"playerbot_{prefix}_{suffix}"
+                    for prefix in ("claude", "llm")
+                    for suffix in PROVIDER_TABLE_SUFFIXES
+                }
+                await cursor.execute(f"SELECT COUNT(1) FROM `{name}`")  # noqa: S608
+                row = await cursor.fetchone()
+                assert row is not None
+                snapshot[name] = row[0]
+            return snapshot
+    finally:
+        connection.close()
+
+
+@asynccontextmanager
+async def _isolated_database(suffix: str) -> AsyncIterator[str]:
+    settings = _settings()
+    database = f"{settings.database}_{suffix}"
+    admin = await _connect()
+    try:
+        async with admin.cursor() as cursor:
+            await cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+            await cursor.execute(f"CREATE DATABASE `{database}`")
+        await admin.commit()
+    finally:
+        admin.close()
+
+    try:
+        yield database
+    finally:
+        admin = await _connect()
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+            await admin.commit()
+        finally:
+            admin.close()
+
+
 async def _apply_deployed_schema() -> None:
     """Runs the module's SQL revisions, in order, against the test database.
 
@@ -108,6 +235,22 @@ async def _apply_deployed_schema() -> None:
         client_flag=CLIENT.MULTI_STATEMENTS,
     )
     try:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(1) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name IN ('playerbot_llm_daily_budget', 'playerbot_llm_budget_reservation')"
+            )
+            neutral_budget_tables = (await cursor.fetchone())[0]
+
+        # The AzerothCore updater records completed revisions and never replays an old
+        # CREATE TABLE after a later revision renamed that table. This fixture used to
+        # replay every historical file before every test, which would recreate the two
+        # retired names beside the migrated tables. Apply the revision chain once, just
+        # as the real updater does.
+        if neutral_budget_tables == 2:
+            return
+
         for revision in SQL_REVISIONS:
             async with connection.cursor() as cursor:
                 # Otherwise every CREATE TABLE IF NOT EXISTS past the first run emits a
@@ -131,8 +274,8 @@ async def clean_ledger():
     try:
         await schema.ensure_schema(connection)
         async with connection.cursor() as cursor:
-            await cursor.execute("DELETE FROM playerbot_claude_budget_reservation")
-            await cursor.execute("DELETE FROM playerbot_claude_daily_budget")
+            await cursor.execute("DELETE FROM playerbot_llm_budget_reservation")
+            await cursor.execute("DELETE FROM playerbot_llm_daily_budget")
             # The breaker lives on the social runtime control row now, so a test that
             # trips it would otherwise deny every later test in the session.
             await cursor.execute("DELETE FROM playerbot_social_runtime_control")
@@ -220,6 +363,140 @@ async def test_starting_against_a_database_without_the_module_schema_is_refused(
         await _drop()
 
 
+async def test_fresh_migration_runs_before_sidecar_schema_initialization() -> None:
+    async with _isolated_database("fresh_llm_migration") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+
+        settings = _settings()
+        connection = await aiomysql.connect(
+            host=settings.host,
+            port=settings.port,
+            user=settings.user,
+            password=settings.password,
+            db=database,
+            autocommit=False,
+        )
+        try:
+            await schema.ensure_schema(connection)
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() "
+                    "AND (table_name LIKE 'playerbot_llm_%' OR table_name LIKE 'playerbot_claude_%')"
+                )
+                tables = {row[0] for row in await cursor.fetchall()}
+            await connection.commit()
+        finally:
+            connection.close()
+
+        assert tables == set(schema.REQUIRED_MODULE_TABLES[:2]) | set(schema.SIDECAR_OWNED_TABLES)
+
+
+async def test_full_legacy_migration_preserves_every_provider_table_and_row() -> None:
+    async with _isolated_database("full_llm_migration") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _create_legacy_sidecar_schema(database)
+        await _execute_statements(
+            database,
+            (
+                "INSERT INTO playerbot_claude_daily_budget "
+                "(budget_date, reserved_usd, spent_usd) VALUES ('2026-08-07', 1.25, 2.50)",
+                "INSERT INTO playerbot_claude_budget_reservation "
+                "(public_id, budget_date, request_kind, priority_lane, model, max_cost_usd, "
+                "actual_cost_usd, state, expires_at, settled_at) VALUES "
+                "('req_0123456789abcdef0123456789abcdef', '2026-08-07', 'chat_response', "
+                "'unspecified', 'fixture-model', 1.25, 0.50, 'completed', "
+                "'2026-08-07 12:05:00', '2026-08-07 12:01:00')",
+                "INSERT INTO playerbot_claude_lock (lock_key) VALUES ('fixture-lock')",
+                "INSERT INTO playerbot_claude_profile "
+                "(bot_guid, profile_version, crafting_affinity, gathering_affinity, "
+                "exploration_affinity, sociability, voice, bot_name, updated_at) "
+                "VALUES (42, 3, 1, 2, 3, 4, 'warm', 'Mira', '2026-08-07 12:00:00')",
+                "INSERT INTO playerbot_claude_conversation_turn "
+                "(bot_guid, role, content, created_at) "
+                "VALUES (42, 'assistant', 'A preserved turn.', '2026-08-07 12:00:00')",
+                "INSERT INTO playerbot_claude_career_decision "
+                "(bot_guid, career_version, candidate_token, spending_style, updated_at) "
+                "VALUES (42, 2, 'blacksmithing', 'careful', '2026-08-07 12:00:00')",
+                "INSERT INTO playerbot_claude_ambient_attempt (created_at) VALUES ('2026-08-07 12:00:00')",
+            ),
+        )
+
+        assert set((await _provider_table_snapshot(database)).values()) == {1}
+
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        migrated = await _provider_table_snapshot(database)
+        assert migrated == {f"playerbot_llm_{suffix}": 1 for suffix in PROVIDER_TABLE_SUFFIXES}
+
+        # A second updater pass is an exact no-op for names and rows.
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        assert await _provider_table_snapshot(database) == migrated
+
+
+@pytest.mark.parametrize("suffix", PROVIDER_TABLE_SUFFIXES)
+async def test_each_old_and_new_table_collision_is_refused_before_ddl(suffix: str) -> None:
+    async with _isolated_database(f"collision_{suffix}") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _create_legacy_sidecar_schema(database)
+        await _execute_statements(
+            database,
+            (f"CREATE TABLE `playerbot_llm_{suffix}` LIKE `playerbot_claude_{suffix}`",),
+        )
+        before = await _provider_table_snapshot(database)
+
+        with pytest.raises(OperationalError, match="mixed_or_colliding_schema"):
+            await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+
+        assert await _provider_table_snapshot(database) == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "RENAME TABLE `playerbot_claude_lock` TO `playerbot_llm_lock`",
+        "DROP TABLE `playerbot_claude_lock`",
+    ),
+)
+async def test_unrecognized_partial_table_layout_is_refused_before_ddl(mutation: str) -> None:
+    async with _isolated_database("partial_layout") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _create_legacy_sidecar_schema(database)
+        await _execute_statements(database, (mutation,))
+        before = await _provider_table_snapshot(database)
+
+        with pytest.raises(OperationalError, match="mixed_or_colliding_schema"):
+            await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+
+        assert await _provider_table_snapshot(database) == before
+
+
+async def test_sidecar_refuses_a_mixed_schema_before_creating_neutral_tables() -> None:
+    async with _isolated_database("mixed_sidecar_start") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        legacy_lock_statement = schema.SCHEMA_STATEMENTS[0].replace("playerbot_llm_", "playerbot_claude_")
+        await _execute_statements(database, (legacy_lock_statement,))
+        before = await _provider_table_snapshot(database)
+
+        settings = _settings()
+        connection = await aiomysql.connect(
+            host=settings.host,
+            port=settings.port,
+            user=settings.user,
+            password=settings.password,
+            db=database,
+            autocommit=False,
+        )
+        try:
+            with pytest.raises(schema.LedgerError, match="legacy or mixed provider table layout"):
+                await schema.ensure_schema(connection)
+        finally:
+            connection.close()
+
+        assert await _provider_table_snapshot(database) == before
+
+
 async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger) -> None:
     """Definition of Done 7: the ledger works against the deployed schema, not its own.
 
@@ -234,7 +511,7 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
     decision, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("1.00"),
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -249,13 +526,13 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
     async with connection.cursor() as cursor:
         await cursor.execute(
             "SELECT public_id, budget_date, request_kind, priority_lane, model, max_cost_usd, "
-            "actual_cost_usd, state, expires_at FROM playerbot_claude_budget_reservation "
+            "actual_cost_usd, state, expires_at FROM playerbot_llm_budget_reservation "
             "WHERE id = %s",
             (reservation.reservation_id,),
         )
         row = await cursor.fetchone()
         await cursor.execute(
-            "SELECT reserved_usd, spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
+            "SELECT reserved_usd, spent_usd FROM playerbot_llm_daily_budget WHERE budget_date = %s",
             (NOW.date(),),
         )
         day = await cursor.fetchone()
@@ -266,7 +543,7 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
     assert row[2] == "chat_response"
     # Not a guess at the lane. The sidecar is never told it, and says so.
     assert row[3] == "unspecified"
-    assert row[4] == claude.MODEL_ID
+    assert row[4] == anthropic_provider.MODEL_ID
     assert row[5] == Decimal("1.000000")
     assert row[6] is None
     assert row[7] == "reserved"
@@ -287,13 +564,12 @@ async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger)
 
     async with connection.cursor() as cursor:
         await cursor.execute(
-            "SELECT state, actual_cost_usd, settled_at FROM playerbot_claude_budget_reservation "
-            "WHERE id = %s",
+            "SELECT state, actual_cost_usd, settled_at FROM playerbot_llm_budget_reservation WHERE id = %s",
             (reservation.reservation_id,),
         )
         after = await cursor.fetchone()
         await cursor.execute(
-            "SELECT reserved_usd, spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
+            "SELECT reserved_usd, spent_usd FROM playerbot_llm_daily_budget WHERE budget_date = %s",
             (NOW.date(),),
         )
         day_after = await cursor.fetchone()
@@ -317,7 +593,7 @@ async def test_a_reservation_is_recorded_and_counted(clean_ledger) -> None:
     decision, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("1.00"),
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -357,7 +633,7 @@ async def test_two_concurrent_reservations_cannot_jointly_exceed_the_ceiling(cle
         await first_connection.begin()
         async with first_connection.cursor() as cursor:
             await cursor.execute(
-                "INSERT IGNORE INTO playerbot_claude_daily_budget (budget_date) VALUES (%s)",
+                "INSERT IGNORE INTO playerbot_llm_daily_budget (budget_date) VALUES (%s)",
                 (schema.utc_day(NOW),),
             )
         await first_connection.commit()
@@ -367,7 +643,7 @@ async def test_two_concurrent_reservations_cannot_jointly_exceed_the_ceiling(cle
             return await book.reserve(
                 connection,
                 request_kind=RequestKind.CHAT_RESPONSE,
-                model=claude.MODEL_ID,
+                model=anthropic_provider.MODEL_ID,
                 max_cost_nano=six,
                 priority=RequestPriority.IMMEDIATE_HUMAN,
                 now=NOW,
@@ -392,7 +668,7 @@ async def test_background_work_is_denied_at_the_reserve_while_a_human_proceeds(c
     await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("7.00"),
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -402,7 +678,7 @@ async def test_background_work_is_denied_at_the_reserve_while_a_human_proceeds(c
     background, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.BACKGROUND,
         now=NOW,
@@ -410,7 +686,7 @@ async def test_background_work_is_denied_at_the_reserve_while_a_human_proceeds(c
     human, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -432,7 +708,7 @@ async def test_every_retry_gets_its_own_reservation_and_cost(clean_ledger) -> No
     first_decision, first = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -440,7 +716,7 @@ async def test_every_retry_gets_its_own_reservation_and_cost(clean_ledger) -> No
     second_decision, second = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -473,7 +749,7 @@ async def test_a_crash_leaves_a_reservation_that_expiry_reclaims_without_double_
     _, stranded = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -485,7 +761,7 @@ async def test_a_crash_leaves_a_reservation_that_expiry_reclaims_without_double_
     decision, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("10.00"),
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=later,
@@ -511,7 +787,7 @@ async def test_an_impossible_reported_cost_opens_the_circuit_and_stops_admission
     _, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -528,7 +804,7 @@ async def test_an_impossible_reported_cost_opens_the_circuit_and_stops_admission
         decision, _ = await book.reserve(
             connection,
             request_kind=RequestKind.CHAT_RESPONSE,
-            model=claude.MODEL_ID,
+            model=anthropic_provider.MODEL_ID,
             max_cost_nano=1,
             priority=priority,
             now=NOW,
@@ -543,7 +819,7 @@ async def test_a_released_reservation_returns_its_money(clean_ledger) -> None:
     _, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=nine,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -553,7 +829,7 @@ async def test_a_released_reservation_returns_its_money(clean_ledger) -> None:
     blocked, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=nine,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -567,7 +843,7 @@ async def test_a_released_reservation_returns_its_money(clean_ledger) -> None:
     freed, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=nine,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -582,7 +858,7 @@ async def test_the_ceiling_rolls_over_at_utc_midnight(clean_ledger) -> None:
     _, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=ten,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -592,7 +868,7 @@ async def test_the_ceiling_rolls_over_at_utc_midnight(clean_ledger) -> None:
     exhausted, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=1,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -604,7 +880,7 @@ async def test_the_ceiling_rolls_over_at_utc_midnight(clean_ledger) -> None:
     fresh, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=ten,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=tomorrow,
@@ -622,10 +898,10 @@ async def store(clean_ledger):
     # bound parameter, so a loop here means building SQL from a string, and a test that
     # does that teaches the pattern even when its own inputs are literals.
     async with connection.cursor() as cursor:
-        await cursor.execute("DELETE FROM playerbot_claude_profile")
-        await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
-        await cursor.execute("DELETE FROM playerbot_claude_career_decision")
-        await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
+        await cursor.execute("DELETE FROM playerbot_llm_profile")
+        await cursor.execute("DELETE FROM playerbot_llm_conversation_turn")
+        await cursor.execute("DELETE FROM playerbot_llm_career_decision")
+        await cursor.execute("DELETE FROM playerbot_llm_ambient_attempt")
     await connection.commit()
     return store_module.SidecarStore(), connection
 
@@ -680,7 +956,7 @@ async def test_conversation_memory_is_trimmed_on_disk_not_merely_on_read(store) 
 
     # And the trim really happened in the table, not just in what the query returned.
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_conversation_turn WHERE bot_guid = 7")
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_conversation_turn WHERE bot_guid = 7")
         row = await cursor.fetchone()
     assert int(row[0]) == store_module.CONVERSATION_TURN_LIMIT
 
@@ -704,7 +980,7 @@ async def test_an_unsupported_role_is_refused_rather_than_stored(store) -> None:
     # The name says "rather than stored", so the test has to check that rather than
     # settling for the exception having been raised.
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_conversation_turn WHERE bot_guid = 7")
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_conversation_turn WHERE bot_guid = 7")
         row = await cursor.fetchone()
     assert int(row[0]) == 0
 
@@ -761,7 +1037,7 @@ async def test_an_out_of_range_ambient_rate_consumes_nothing(store) -> None:
     )
 
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_ambient_attempt")
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_ambient_attempt")
         row = await cursor.fetchone()
     assert int(row[0]) == 0
 
@@ -789,7 +1065,7 @@ async def test_the_very_first_reservation_of_a_day_succeeds_with_no_row_present(
             return await book.reserve(
                 connection,
                 request_kind=RequestKind.CHAT_RESPONSE,
-                model=claude.MODEL_ID,
+                model=anthropic_provider.MODEL_ID,
                 max_cost_nano=one,
                 priority=RequestPriority.IMMEDIATE_HUMAN,
                 now=NOW,
@@ -819,7 +1095,7 @@ async def test_repeated_appends_for_one_bot_from_two_connections_settle_correctl
 
     try:
         async with first_connection.cursor() as cursor:
-            await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+            await cursor.execute("DELETE FROM playerbot_llm_conversation_turn")
         await first_connection.commit()
 
         barrier = asyncio.Barrier(2)
@@ -850,7 +1126,7 @@ async def test_two_ambient_attempts_for_the_last_slot_yield_exactly_one(clean_le
 
     try:
         async with first_connection.cursor() as cursor:
-            await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
+            await cursor.execute("DELETE FROM playerbot_llm_ambient_attempt")
         await first_connection.commit()
 
         # Two of the three slots are already gone.
@@ -941,8 +1217,8 @@ async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
     store = store_module.SidecarStore()
 
     async with connection.cursor() as cursor:
-        await cursor.execute("DELETE FROM playerbot_claude_lock")
-        await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
+        await cursor.execute("DELETE FROM playerbot_llm_lock")
+        await cursor.execute("DELETE FROM playerbot_llm_conversation_turn")
     await connection.commit()
 
     # Many bots and several days must not produce many keys.
@@ -953,14 +1229,14 @@ async def test_the_lock_key_set_is_bounded(clean_ledger) -> None:
         await book.reserve(
             connection,
             request_kind=RequestKind.CHAT_RESPONSE,
-            model=claude.MODEL_ID,
+            model=anthropic_provider.MODEL_ID,
             max_cost_nano=1,
             priority=RequestPriority.IMMEDIATE_HUMAN,
             now=NOW + timedelta(days=offset),
         )
 
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_lock")
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_lock")
         row = await cursor.fetchone()
 
     # One budget key plus at most one per conversation bucket, regardless of bot count
@@ -979,9 +1255,9 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     _, connection = clean_ledger
 
     async with connection.cursor() as cursor:
-        await cursor.execute("DELETE FROM playerbot_claude_lock")
+        await cursor.execute("DELETE FROM playerbot_llm_lock")
         await cursor.executemany(
-            "INSERT INTO playerbot_claude_lock (lock_key) VALUES (%s)",
+            "INSERT INTO playerbot_llm_lock (lock_key) VALUES (%s)",
             [
                 ("budget_day:2026-08-01",),
                 ("budget_day:2026-08-02",),
@@ -996,7 +1272,7 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     # ensure_schema must NOT remove them on its own.
     await schema.ensure_schema(connection)
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT COUNT(*) FROM playerbot_claude_lock")
+        await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_lock")
         row = await cursor.fetchone()
     assert int(row[0]) == 6
 
@@ -1004,7 +1280,7 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     assert removed == 3  # two dated budget keys and the out of range conversation key
 
     async with connection.cursor() as cursor:
-        await cursor.execute("SELECT lock_key FROM playerbot_claude_lock ORDER BY lock_key")
+        await cursor.execute("SELECT lock_key FROM playerbot_llm_lock ORDER BY lock_key")
         rows = await cursor.fetchall()
 
     # The live keys survive, and so does the low numbered conversation key, which is
@@ -1033,13 +1309,13 @@ async def mysql_state() -> AsyncIterator[tuple[state_module.MySqlSidecarState, a
     # cannot be a bound parameter, so a loop means building SQL from a string.
     async with pool.acquire() as connection:
         async with connection.cursor() as cursor:
-            await cursor.execute("DELETE FROM playerbot_claude_budget_reservation")
-            await cursor.execute("DELETE FROM playerbot_claude_daily_budget")
+            await cursor.execute("DELETE FROM playerbot_llm_budget_reservation")
+            await cursor.execute("DELETE FROM playerbot_llm_daily_budget")
             await cursor.execute("DELETE FROM playerbot_social_runtime_control")
-            await cursor.execute("DELETE FROM playerbot_claude_profile")
-            await cursor.execute("DELETE FROM playerbot_claude_conversation_turn")
-            await cursor.execute("DELETE FROM playerbot_claude_career_decision")
-            await cursor.execute("DELETE FROM playerbot_claude_ambient_attempt")
+            await cursor.execute("DELETE FROM playerbot_llm_profile")
+            await cursor.execute("DELETE FROM playerbot_llm_conversation_turn")
+            await cursor.execute("DELETE FROM playerbot_llm_career_decision")
+            await cursor.execute("DELETE FROM playerbot_llm_ambient_attempt")
         await connection.commit()
     try:
         yield state, pool
@@ -1101,7 +1377,7 @@ async def test_the_state_facade_reserves_settles_and_reports(mysql_state) -> Non
 
     decision, reservation = await state.reserve(
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=one,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -1127,7 +1403,7 @@ async def test_the_state_facade_settles_decimal_costs_without_database_warnings(
         for actual_cost in costs:
             decision, reservation = await state.reserve(
                 request_kind=RequestKind.CHAT_RESPONSE,
-                model=claude.MODEL_ID,
+                model=anthropic_provider.MODEL_ID,
                 max_cost_nano=maximum,
                 priority=RequestPriority.IMMEDIATE_HUMAN,
                 now=NOW,
@@ -1174,7 +1450,7 @@ async def test_a_repeated_request_gets_its_own_row_under_its_own_identity(
     for _ in range(3):
         decision, reservation = await state.reserve(
             request_kind=RequestKind.CHAT_RESPONSE,
-            model=claude.MODEL_ID,
+            model=anthropic_provider.MODEL_ID,
             max_cost_nano=one,
             priority=RequestPriority.IMMEDIATE_HUMAN,
             now=NOW,
@@ -1188,8 +1464,7 @@ async def test_a_repeated_request_gets_its_own_row_under_its_own_identity(
     async with pool.acquire() as connection:
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "SELECT public_id FROM playerbot_claude_budget_reservation "
-                "WHERE budget_date = %s ORDER BY id",
+                "SELECT public_id FROM playerbot_llm_budget_reservation WHERE budget_date = %s ORDER BY id",
                 (NOW.date(),),
             )
             rows = await cursor.fetchall()
@@ -1232,7 +1507,7 @@ async def test_the_state_facade_carries_every_remaining_operation(mysql_state) -
         async with connection.cursor() as cursor:
             await cursor.execute(
                 "SELECT career_version, candidate_token, spending_style "
-                "FROM playerbot_claude_career_decision WHERE bot_guid = %s",
+                "FROM playerbot_llm_career_decision WHERE bot_guid = %s",
                 (7788,),
             )
             row = await cursor.fetchone()
@@ -1242,7 +1517,7 @@ async def test_the_state_facade_carries_every_remaining_operation(mysql_state) -
 
     reserved = await state.reserve(
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("1.00"),
         priority=RequestPriority.BACKGROUND,
         now=NOW,
@@ -1252,7 +1527,7 @@ async def test_the_state_facade_carries_every_remaining_operation(mysql_state) -
     assert (await state.budget_state(now=NOW)).outstanding_nano == 0
 
 
-class _StubAdapter(claude.ClaudeAdapter):
+class _StubAdapter(anthropic_provider.AnthropicProvider):
     """Stands in for the Anthropic SDK so no HTTP request is made. Everything else is real."""
 
     reply = "A fine day for fishing."
@@ -1265,7 +1540,7 @@ class _StubAdapter(claude.ClaudeAdapter):
         return 100
 
     def generate_reply(self, request, history):
-        return self.reply, claude.UsageTotals(input_tokens=100, output_tokens=10)
+        return self.reply, provider.GenerationUsage(input_tokens=100, output_tokens=10)
 
 
 def _service_request_payload(request_id: int, bot_guid: int) -> bytes:
@@ -1323,7 +1598,7 @@ async def test_a_complete_service_request_runs_against_real_mysql(mysql_state) -
 
     request = protocol.parse_request(_service_request_payload(request_id, bot_guid), TOKEN)
     assert await state.recent_turns(bot_guid=bot_guid) == [
-        ("user", claude.build_user_message(request)),
+        ("user", generation.build_user_message(request)),
         ("assistant", _StubAdapter.reply),
     ]
 
@@ -1341,7 +1616,7 @@ async def test_a_complete_service_request_runs_against_real_mysql(mysql_state) -
         async with connection.cursor() as cursor:
             await cursor.execute(
                 "SELECT state, actual_cost_usd, request_kind, model "
-                "FROM playerbot_claude_budget_reservation WHERE budget_date = %s",
+                "FROM playerbot_llm_budget_reservation WHERE budget_date = %s",
                 (NOW.date(),),
             )
             rows = await cursor.fetchall()
@@ -1353,7 +1628,7 @@ async def test_a_complete_service_request_runs_against_real_mysql(mysql_state) -
     # A whisper is a chat response, and the model that served it is recorded because the
     # sidecar is the one that chose it.
     assert rows[0][2] == "chat_response"
-    assert rows[0][3] == claude.MODEL_ID
+    assert rows[0][3] == anthropic_provider.MODEL_ID
 
     # The pool is intact: nothing was discarded for holding a transaction open.
     assert pool.freesize == pool.size
@@ -1374,7 +1649,7 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     decision, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=budget.usd_to_nano("1.00"),
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -1387,7 +1662,7 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     # after admission because a ledger holding that much would refuse every request.
     async with connection.cursor() as cursor:
         await cursor.execute(
-            "UPDATE playerbot_claude_daily_budget SET spent_usd = %s WHERE budget_date = %s",
+            "UPDATE playerbot_llm_daily_budget SET spent_usd = %s WHERE budget_date = %s",
             (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 10_000), schema.utc_day(NOW)),
         )
     await connection.commit()
@@ -1429,7 +1704,7 @@ async def test_a_cost_that_would_overflow_the_day_total_still_opens_the_circuit(
     denied, _ = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=1,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -1452,7 +1727,7 @@ async def test_saturation_alone_is_reported_as_saturation_not_as_an_overrun(clea
     decision, reservation = await book.reserve(
         connection,
         request_kind=RequestKind.CHAT_RESPONSE,
-        model=claude.MODEL_ID,
+        model=anthropic_provider.MODEL_ID,
         max_cost_nano=reserve_amount,
         priority=RequestPriority.IMMEDIATE_HUMAN,
         now=NOW,
@@ -1462,7 +1737,7 @@ async def test_saturation_alone_is_reported_as_saturation_not_as_an_overrun(clea
 
     async with connection.cursor() as cursor:
         await cursor.execute(
-            "UPDATE playerbot_claude_daily_budget SET spent_usd = %s WHERE budget_date = %s",
+            "UPDATE playerbot_llm_daily_budget SET spent_usd = %s WHERE budget_date = %s",
             (budget.nano_to_usd_string(budget.MAX_STORABLE_NANO - 1_000), schema.utc_day(NOW)),
         )
     await connection.commit()

@@ -26,14 +26,14 @@ CONVERSATION_LOCK_BUCKETS = 256
 
 SCHEMA_STATEMENTS = (
     """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_lock (
+    CREATE TABLE IF NOT EXISTS playerbot_llm_lock (
         `lock_key` VARCHAR(64) NOT NULL,
         PRIMARY KEY (`lock_key`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
       COMMENT='Named serialization points, from a bounded key set. Never deleted.'
     """,
     """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_profile (
+    CREATE TABLE IF NOT EXISTS playerbot_llm_profile (
         `bot_guid` BIGINT UNSIGNED NOT NULL,
         `profile_version` INT UNSIGNED NOT NULL,
         `crafting_affinity` TINYINT UNSIGNED NOT NULL,
@@ -48,7 +48,7 @@ SCHEMA_STATEMENTS = (
       COMMENT='Last observed personality profile per bot, written by the worldserver.'
     """,
     """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_conversation_turn (
+    CREATE TABLE IF NOT EXISTS playerbot_llm_conversation_turn (
         `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         `bot_guid` BIGINT UNSIGNED NOT NULL,
         `role` ENUM('user','assistant') NOT NULL,
@@ -60,7 +60,7 @@ SCHEMA_STATEMENTS = (
       COMMENT='Bounded per bot conversation memory. Trimmed on write, never unbounded.'
     """,
     """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_career_decision (
+    CREATE TABLE IF NOT EXISTS playerbot_llm_career_decision (
         `bot_guid` BIGINT UNSIGNED NOT NULL,
         `career_version` INT UNSIGNED NOT NULL,
         `candidate_token` VARCHAR(64) NOT NULL,
@@ -71,7 +71,7 @@ SCHEMA_STATEMENTS = (
       COMMENT='One current career decision per bot.'
     """,
     """
-    CREATE TABLE IF NOT EXISTS playerbot_claude_ambient_attempt (
+    CREATE TABLE IF NOT EXISTS playerbot_llm_ambient_attempt (
         `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         `created_at` DATETIME NOT NULL,
         PRIMARY KEY (`id`),
@@ -83,7 +83,7 @@ SCHEMA_STATEMENTS = (
 
 # The budget tables are NOT in the list above, deliberately.
 #
-# `playerbot_claude_daily_budget`, `playerbot_claude_budget_reservation`, and the
+# `playerbot_llm_daily_budget`, `playerbot_llm_budget_reservation`, and the
 # `playerbot_social_runtime_control` row that carries the circuit breaker belong to
 # mod-playerbots and are created by its SQL revisions. The sidecar used to carry a second
 # definition of the first two here, with different column names, integer nano money
@@ -96,8 +96,8 @@ SCHEMA_STATEMENTS = (
 # to start if they are not, rather than papering over a database the schema revisions
 # never reached.
 REQUIRED_MODULE_TABLES = (
-    "playerbot_claude_daily_budget",
-    "playerbot_claude_budget_reservation",
+    "playerbot_llm_daily_budget",
+    "playerbot_llm_budget_reservation",
     "playerbot_social_runtime_control",
 )
 
@@ -105,11 +105,35 @@ REQUIRED_MODULE_TABLES = (
 # the ownership boundary is one list rather than a property of statement order, and so a
 # test can assert that a refused start left none of them behind.
 SIDECAR_OWNED_TABLES = (
+    "playerbot_llm_lock",
+    "playerbot_llm_profile",
+    "playerbot_llm_conversation_turn",
+    "playerbot_llm_career_decision",
+    "playerbot_llm_ambient_attempt",
+)
+
+LEGACY_PROVIDER_TABLES = (
+    "playerbot_claude_daily_budget",
+    "playerbot_claude_budget_reservation",
     "playerbot_claude_lock",
     "playerbot_claude_profile",
     "playerbot_claude_conversation_turn",
     "playerbot_claude_career_decision",
     "playerbot_claude_ambient_attempt",
+)
+
+NEUTRAL_BUDGET_IDENTIFIERS = (
+    "ck_llm_daily_budget_reserved",
+    "ck_llm_daily_budget_spent",
+    "uk_llm_reservation_public_id",
+    "ix_llm_reservation_day_state",
+    "ix_llm_reservation_expiry",
+    "ck_llm_reservation_max_cost",
+    "ck_llm_reservation_actual_cost",
+)
+
+LEGACY_BUDGET_IDENTIFIERS = tuple(
+    identifier.replace("_llm_", "_claude_") for identifier in NEUTRAL_BUDGET_IDENTIFIERS
 )
 
 
@@ -141,8 +165,7 @@ async def acquire_named_lock(cursor, key: str) -> None:
     """
 
     await cursor.execute(
-        "INSERT INTO playerbot_claude_lock (lock_key) VALUES (%s) "
-        "ON DUPLICATE KEY UPDATE lock_key = lock_key",
+        "INSERT INTO playerbot_llm_lock (lock_key) VALUES (%s) ON DUPLICATE KEY UPDATE lock_key = lock_key",
         (key,),
     )
 
@@ -168,15 +191,60 @@ async def ensure_schema(connection) -> None:
     # says is not ready. Refusing to touch a database that has not been migrated
     # means not touching it.
     async with connection.cursor() as cursor:
+        provider_tables = LEGACY_PROVIDER_TABLES + REQUIRED_MODULE_TABLES + SIDECAR_OWNED_TABLES
         await cursor.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = DATABASE() AND table_name IN (%s, %s, %s)",
-            REQUIRED_MODULE_TABLES,
+            "WHERE table_schema = DATABASE() "
+            "AND table_name IN (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            provider_tables,
         )
         present = {row[0] for row in await cursor.fetchall()}
+
+        budget_identifiers = LEGACY_BUDGET_IDENTIFIERS + NEUTRAL_BUDGET_IDENTIFIERS
+        await cursor.execute(
+            "SELECT constraint_name FROM information_schema.table_constraints "
+            "WHERE constraint_schema = DATABASE() "
+            "AND table_name IN ('playerbot_llm_daily_budget', 'playerbot_llm_budget_reservation') "
+            "AND constraint_name IN (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            budget_identifiers,
+        )
+        present_identifiers = {row[0] for row in await cursor.fetchall()}
+        await cursor.execute(
+            "SELECT DISTINCT index_name FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() "
+            "AND table_name = 'playerbot_llm_budget_reservation' "
+            "AND index_name IN (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            budget_identifiers,
+        )
+        present_identifiers.update(row[0] for row in await cursor.fetchall())
     await connection.commit()
 
+    legacy_present = present & set(LEGACY_PROVIDER_TABLES)
+    neutral_present = present & (set(REQUIRED_MODULE_TABLES[:2]) | set(SIDECAR_OWNED_TABLES))
+    fresh_neutral = neutral_present == set(REQUIRED_MODULE_TABLES[:2])
+    complete_neutral = neutral_present == set(REQUIRED_MODULE_TABLES[:2]) | set(SIDECAR_OWNED_TABLES)
     missing = [name for name in REQUIRED_MODULE_TABLES if name not in present]
+
+    if not legacy_present and not neutral_present and missing:
+        raise LedgerError(
+            "the mod-playerbots social schema is missing from this database "
+            f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
+        )
+
+    if legacy_present or not (fresh_neutral or complete_neutral):
+        raise LedgerError(
+            "legacy or mixed provider table layout detected; apply "
+            "2026_08_07_00_playerbot_llm_tables.sql before starting"
+        )
+
+    missing_identifiers = set(NEUTRAL_BUDGET_IDENTIFIERS) - present_identifiers
+    legacy_identifiers = set(LEGACY_BUDGET_IDENTIFIERS) & present_identifiers
+    if missing_identifiers or legacy_identifiers:
+        raise LedgerError(
+            "legacy or incomplete provider budget identifiers detected; apply "
+            "2026_08_07_00_playerbot_llm_tables.sql before starting"
+        )
+
     if missing:
         # Refused rather than created. These tables belong to the mod-playerbots SQL
         # revisions, and a sidecar that creates its own version of them is how the two
@@ -233,14 +301,14 @@ async def retire_superseded_locks(connection) -> int:
         await connection.begin()
         async with connection.cursor() as cursor:
             # No parameters, so the % is a literal rather than a placeholder.
-            await cursor.execute("DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'budget_day:%'")
+            await cursor.execute("DELETE FROM playerbot_llm_lock WHERE lock_key LIKE 'budget_day:%'")
             removed = cursor.rowcount
 
             # A conversation key at or above the bucket bound cannot have come from
             # the current code. One BELOW it is indistinguishable from a live bucket
             # key and is left alone.
             await cursor.execute(
-                "DELETE FROM playerbot_claude_lock WHERE lock_key LIKE 'conversation:%%' "
+                "DELETE FROM playerbot_llm_lock WHERE lock_key LIKE 'conversation:%%' "
                 "AND CAST(SUBSTRING(lock_key, 14) AS UNSIGNED) >= %s",
                 (CONVERSATION_LOCK_BUCKETS,),
             )

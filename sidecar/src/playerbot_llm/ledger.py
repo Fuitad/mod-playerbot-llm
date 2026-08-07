@@ -1,16 +1,16 @@
 """The MySQL budget ledger: the durable half of admission.
 
-The decisions live in :mod:`playerbot_claude.budget` and are pure. This module owns only
+The decisions live in :mod:`playerbot_llm.budget` and are pure. This module owns only
 the parts that genuinely need a database: reading committed totals under a lock, inserting
 a reservation, and settling or releasing one. That split is deliberate. A rule embedded in
 a transaction is a rule the tests can reach only through a transaction, and the arithmetic
 is the part that has to be right.
 
 The tables this writes belong to mod-playerbots, not to the sidecar. The ownership
-boundary and the startup guard that enforces it live in :mod:`playerbot_claude.schema`.
+boundary and the startup guard that enforces it live in :mod:`playerbot_llm.schema`.
 
 Concurrency rests on one named lock. Every reservation takes ``budget_day`` through
-:func:`playerbot_claude.schema.acquire_named_lock` before reading anything, so two
+:func:`playerbot_llm.schema.acquire_named_lock` before reading anything, so two
 requests deciding at the same instant cannot both see the same remaining budget and both
 spend it. One global key rather than one per date: only one day is ever being written at a
 time in practice, so a per-date key bought no concurrency and grew the lock table by a row
@@ -28,9 +28,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from playerbot_claude import budget
-from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
-from playerbot_claude.schema import LedgerError, acquire_named_lock, utc_day
+from playerbot_llm import budget
+from playerbot_llm.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
+from playerbot_llm.schema import LedgerError, acquire_named_lock, utc_day
 
 # How long a reservation may sit unsettled before another transaction may reclaim it.
 #
@@ -156,8 +156,8 @@ class BudgetLedger:
         """
 
         await cursor.execute(
-            "UPDATE playerbot_claude_daily_budget SET reserved_usd = COALESCE("
-            "(SELECT SUM(max_cost_usd) FROM playerbot_claude_budget_reservation "
+            "UPDATE playerbot_llm_daily_budget SET reserved_usd = COALESCE("
+            "(SELECT SUM(max_cost_usd) FROM playerbot_llm_budget_reservation "
             "WHERE budget_date = %s AND state = 'reserved'), 0) WHERE budget_date = %s",
             (day, day),
         )
@@ -187,12 +187,12 @@ class BudgetLedger:
         await acquire_named_lock(cursor, "budget_day")
 
         await cursor.execute(
-            "INSERT INTO playerbot_claude_daily_budget (budget_date) VALUES (%s) "
+            "INSERT INTO playerbot_llm_daily_budget (budget_date) VALUES (%s) "
             "ON DUPLICATE KEY UPDATE budget_date = budget_date",
             (day,),
         )
         await cursor.execute(
-            "SELECT spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
+            "SELECT spent_usd FROM playerbot_llm_daily_budget WHERE budget_date = %s",
             (day,),
         )
         row = await cursor.fetchone()
@@ -223,12 +223,12 @@ class BudgetLedger:
         """
 
         await cursor.execute(
-            "UPDATE playerbot_claude_budget_reservation SET state = 'expired' "
+            "UPDATE playerbot_llm_budget_reservation SET state = 'expired' "
             "WHERE budget_date = %s AND state = 'reserved' AND expires_at <= %s",
             (day, now),
         )
         await cursor.execute(
-            "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_claude_budget_reservation "
+            "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_llm_budget_reservation "
             "WHERE budget_date = %s AND state = 'reserved'",
             (day,),
         )
@@ -298,7 +298,7 @@ class BudgetLedger:
 
                 public_id = mint_public_id()
                 await cursor.execute(
-                    "INSERT INTO playerbot_claude_budget_reservation "
+                    "INSERT INTO playerbot_llm_budget_reservation "
                     "(public_id, budget_date, request_kind, priority_lane, model, max_cost_usd, "
                     "state, expires_at) VALUES (%s, %s, %s, %s, %s, %s, 'reserved', %s)",
                     (
@@ -353,7 +353,7 @@ class BudgetLedger:
                 spent_before, _ = await self._lock_day(cursor, reservation.budget_date)
 
                 await cursor.execute(
-                    "UPDATE playerbot_claude_budget_reservation "
+                    "UPDATE playerbot_llm_budget_reservation "
                     "SET state = 'completed', actual_cost_usd = %s, settled_at = %s "
                     "WHERE id = %s AND state = 'reserved'",
                     (budget.nano_to_usd_string(storable), now, reservation.reservation_id),
@@ -380,8 +380,7 @@ class BudgetLedger:
                     breach = True
 
                 await cursor.execute(
-                    "UPDATE playerbot_claude_daily_budget SET spent_usd = spent_usd + %s "
-                    "WHERE budget_date = %s",
+                    "UPDATE playerbot_llm_daily_budget SET spent_usd = spent_usd + %s WHERE budget_date = %s",
                     (Decimal(added) / budget.NANO, reservation.budget_date),
                 )
                 # This reservation has left the reserved state, so the day owes less.
@@ -428,7 +427,7 @@ class BudgetLedger:
             async with connection.cursor() as cursor:
                 await self._lock_day(cursor, reservation.budget_date)
                 await cursor.execute(
-                    "UPDATE playerbot_claude_budget_reservation SET state = 'released' "
+                    "UPDATE playerbot_llm_budget_reservation SET state = 'released' "
                     "WHERE id = %s AND state = 'reserved'",
                     (reservation.reservation_id,),
                 )
@@ -448,7 +447,7 @@ class BudgetLedger:
         day = utc_day(now)
         async with connection.cursor() as cursor:
             await cursor.execute(
-                "SELECT spent_usd FROM playerbot_claude_daily_budget WHERE budget_date = %s",
+                "SELECT spent_usd FROM playerbot_llm_daily_budget WHERE budget_date = %s",
                 (day,),
             )
             row = await cursor.fetchone()
@@ -459,7 +458,7 @@ class BudgetLedger:
             # rewritten under the lock and would otherwise still count a reservation this
             # read can already see is dead.
             await cursor.execute(
-                "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_claude_budget_reservation "
+                "SELECT COALESCE(SUM(max_cost_usd), 0) FROM playerbot_llm_budget_reservation "
                 "WHERE budget_date = %s AND state = 'reserved' AND expires_at > %s",
                 (day, now),
             )

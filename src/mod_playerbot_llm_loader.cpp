@@ -1,5 +1,5 @@
 /*
- * This file is part of the mod-playerbot-claude module.
+ * This file is part of the mod-playerbot-llm module.
  */
 
 #include "PlayerbotPersonality.h"
@@ -8,13 +8,13 @@
 // playerbots revision that bumps the version must ship a matching module update; failing
 // the build here is the compatibility guarantee.
 static_assert(PLAYERBOT_PERSONALITY_API_VERSION == 3,
-              "mod-playerbot-claude requires playerbot personality API version 3");
+              "mod-playerbot-llm requires playerbot personality API version 3");
 
-void AddClaudeChatScripts();
+void AddPlayerbotLLMScripts();
 
-// Loader entry point: the modules script loader maps the mod-playerbot-claude directory
+// Loader entry point: the modules script loader maps the mod-playerbot-llm directory
 // to this function name (dashes become underscores).
-void Addmod_playerbot_claudeScripts()
+void Addmod_playerbot_llmScripts()
 {
-    AddClaudeChatScripts();
+    AddPlayerbotLLMScripts();
 }

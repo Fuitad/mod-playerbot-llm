@@ -18,18 +18,24 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from playerbot_claude import budget, claude, ledger, protocol, state
-from playerbot_claude import store as store_module
-from playerbot_claude.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbot_llm import budget, generation, ledger, protocol, provider, state
+from playerbot_llm import store as store_module
+from playerbot_llm.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbot_llm.providers.anthropic import (
+    API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR,
+)
+from playerbot_llm.providers.anthropic import (
+    AnthropicProvider,
+)
 
 CONFIG_SECTION = "worldserver"
-CONFIG_PREFIX = "PlayerbotClaude."
+CONFIG_PREFIX = "PlayerbotLLM."
 # Environment variable *names*, not secret values.
-TOKEN_ENV_VAR = "PLAYERBOT_CLAUDE_BRIDGE_TOKEN"  # noqa: S105
-API_KEY_ENV_VAR = claude.API_KEY_ENV_VAR
+TOKEN_ENV_VAR = "PLAYERBOT_LLM_BRIDGE_TOKEN"  # noqa: S105
+API_KEY_ENV_VAR = ANTHROPIC_API_KEY_ENV_VAR
 
 # There is deliberately no maximum above the configured ceiling. A second limit in the
-# code silently ignores what the operator asked for, and PlayerbotClaude.DailyBudgetUsd
+# code silently ignores what the operator asked for, and PlayerbotLLM.DailyBudgetUsd
 # is documented as the sole ceiling.
 
 
@@ -225,7 +231,7 @@ def bridge_token_from_environment() -> str | None:
 
     The floor is for entropy and the ceiling is for the same reason every other string in
     this protocol has one: without it a very long token is copied, compared, and written
-    into every frame before anything refuses it. Mirrors ClaudeChat::BridgeTokenIsUsable.
+    into every frame before anything refuses it. Mirrors PlayerbotLLM::BridgeTokenIsUsable.
     """
 
     token = os.environ.get(TOKEN_ENV_VAR)
@@ -243,7 +249,7 @@ def doctor_report(config: SidecarConfig, budget_state: budget.BudgetState | None
     """Health summary as JSON-safe data. Never contains a secret value."""
 
     token_present = bridge_token_from_environment() is not None
-    api_key_present = bool(os.environ.get(API_KEY_ENV_VAR))
+    provider_configured = bool(os.environ.get(API_KEY_ENV_VAR))
     ok = config.enable and config.bridge_port > 0 and config.generation_allowed and token_present
 
     report: dict[str, object] = {
@@ -254,7 +260,8 @@ def doctor_report(config: SidecarConfig, budget_state: budget.BudgetState | None
         "human_budget_reserve_ratio": config.human_budget_reserve_ratio,
         "response_deadline_ms": config.response_deadline_ms,
         "bridge_token_present": token_present,
-        "anthropic_api_key_present": api_key_present,
+        "provider_name": AnthropicProvider.metadata.name,
+        "provider_configured": provider_configured,
     }
 
     if budget_state is not None:
@@ -313,7 +320,7 @@ def _request_kind_for(request: protocol.ChatRequest) -> RequestKind:
     return RequestKind.CAREER_GENERATION if request.is_career else RequestKind.CHAT_RESPONSE
 
 
-def _actual_cost_nano(usage: claude.UsageTotals, prices: tuple[str, str]) -> int:
+def _actual_cost_nano(usage: provider.GenerationUsage, prices: tuple[str, str]) -> int:
     """What a completed call really cost, from the provider's own token counts.
 
     Cache tokens are counted at the plain input rate. Nothing in this sidecar sends a
@@ -364,7 +371,7 @@ class SidecarService:
         self,
         config: SidecarConfig,
         token: str,
-        adapter: claude.ClaudeAdapter | None = None,
+        adapter: provider.GenerationProvider | None = None,
         store: state.SidecarState | None = None,
         now=None,
     ) -> None:
@@ -372,7 +379,7 @@ class SidecarService:
         self._token = token
         # The default SDK client's own timeout is capped at the response deadline so
         # a provider call cannot outlive the request that paid for it.
-        self._adapter = adapter or claude.ClaudeAdapter(
+        self._adapter = adapter or AnthropicProvider(
             timeout_seconds=config.response_deadline_ms / 1000,
             model_io_logger=_log if config.log_model_io else None,
         )
@@ -533,26 +540,26 @@ class SidecarService:
                 input_tokens = await asyncio.to_thread(
                     self._adapter.count_roleplay_assessment_input_tokens, request
                 )
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 _log(f"assessment {token}: {type(error).__name__}: {error}")
                 return None
 
-            if input_tokens > claude.MAX_INPUT_TOKENS:
+            if input_tokens > self._adapter.metadata.max_input_tokens:
                 _log(
                     f"assessment {token}: prompt is {input_tokens} tokens "
-                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                    f"(limit {self._adapter.metadata.max_input_tokens}), staying silent"
                 )
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens, self._adapter.metadata.max_output_tokens("roleplay_assessment"), *input_prices
             )
             # Human social work: a player just spoke and the coordinator is holding their reply
             # opportunity on this answer. The kind is its own enumerator so an assessment is
             # visible as an additional model call rather than hidden inside generation cost.
             decision, reservation = await store.reserve(
                 request_kind=RequestKind.MODERATION_CLASSIFICATION,
-                model=claude.MODEL_ID,
+                model=self._adapter.metadata.model,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.IMMEDIATE_HUMAN,
                 now=now,
@@ -563,7 +570,7 @@ class SidecarService:
 
             try:
                 completion, usage = await asyncio.to_thread(self._adapter.assess_roleplay, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 # Malformed output and provider failure land together: billed if the model ran,
                 # settled either way, and never replaced by a guessed category.
                 outcome = await self._account_for_failure(store, reservation, error)
@@ -604,26 +611,26 @@ class SidecarService:
 
             try:
                 input_tokens = await asyncio.to_thread(self._adapter.count_memory_input_tokens, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 _log(f"memory {token}: {type(error).__name__}: {error}")
                 return None
 
-            if input_tokens > claude.MAX_INPUT_TOKENS:
+            if input_tokens > self._adapter.metadata.max_input_tokens:
                 _log(
                     f"memory {token}: prompt is {input_tokens} tokens "
-                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                    f"(limit {self._adapter.metadata.max_input_tokens}), staying silent"
                 )
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens, self._adapter.metadata.max_output_tokens("memory"), *input_prices
             )
             # The background lane, for the same reason a biography uses it: the conversation has
             # already ended, so this must never take the slice held for a player who just spoke
             # and is watching for an answer.
             decision, reservation = await store.reserve(
                 request_kind=RequestKind.MEMORY_EXTRACTION,
-                model=claude.MODEL_ID,
+                model=self._adapter.metadata.model,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.BACKGROUND,
                 now=now,
@@ -634,7 +641,7 @@ class SidecarService:
 
             try:
                 candidates, usage = await asyncio.to_thread(self._adapter.generate_memories, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 # A refused candidate lands here alongside a provider failure. Both were billed
                 # if the model ran, both are settled, and neither is retried: the gate refused
                 # this reading of this conversation, and the text is already gone on the far side.
@@ -682,26 +689,26 @@ class SidecarService:
 
             try:
                 input_tokens = await asyncio.to_thread(self._adapter.count_biography_input_tokens, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 _log(f"biography {token}: {type(error).__name__}: {error}")
                 return None
 
-            if input_tokens > claude.MAX_INPUT_TOKENS:
+            if input_tokens > self._adapter.metadata.max_input_tokens:
                 _log(
                     f"biography {token}: prompt is {input_tokens} tokens "
-                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                    f"(limit {self._adapter.metadata.max_input_tokens}), staying silent"
                 )
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.BIOGRAPHY_MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens, self._adapter.metadata.max_output_tokens("biography"), *input_prices
             )
             # The background lane, deliberately. Nobody is waiting on a player profile, so it must
             # never spend the slice held for a player who just said something and is watching
             # for an answer. This is Key Decision 2 expressed where it is actually enforced.
             decision, reservation = await store.reserve(
                 request_kind=RequestKind.BACKSTORY_GENERATION,
-                model=claude.MODEL_ID,
+                model=self._adapter.metadata.model,
                 max_cost_nano=max_cost_nano,
                 priority=RequestPriority.BACKGROUND,
                 now=now,
@@ -712,7 +719,7 @@ class SidecarService:
 
             try:
                 fields, usage = await asyncio.to_thread(self._adapter.generate_biography, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 # Covers a refused player profile as well as a provider failure. Both were billed if
                 # the model ran, both are settled, and both leave the coordinator to time the
                 # request out rather than being told to try again immediately: a bot that just
@@ -757,23 +764,23 @@ class SidecarService:
 
             try:
                 input_tokens = await asyncio.to_thread(self._adapter.count_social_input_tokens, request)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 _log(f"social {token}: {type(error).__name__}: {error}")
                 return None
 
-            if input_tokens > claude.MAX_INPUT_TOKENS:
+            if input_tokens > self._adapter.metadata.max_input_tokens:
                 _log(
                     f"social {token}: prompt is {input_tokens} tokens "
-                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                    f"(limit {self._adapter.metadata.max_input_tokens}), staying silent"
                 )
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens, self._adapter.metadata.max_output_tokens("social"), *input_prices
             )
             decision, reservation = await store.reserve(
                 request_kind=RequestKind.CHAT_RESPONSE,
-                model=claude.MODEL_ID,
+                model=self._adapter.metadata.model,
                 max_cost_nano=max_cost_nano,
                 priority=_social_priority_for(request),
                 now=now,
@@ -784,7 +791,7 @@ class SidecarService:
 
             try:
                 reply, emote_id, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
-            except claude.ClaudeInvalidOutputError as error:
+            except provider.GenerationInvalidOutputError as error:
                 # Generated, billed, and refused by the gate. The money is settled from the
                 # usage the provider reported when it is available, exactly as a rejected
                 # chat completion is, and the coordinator is asked for one more attempt.
@@ -798,7 +805,7 @@ class SidecarService:
                     token=self._token,
                     regenerate=True,
                 )
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 outcome = await self._account_for_failure(store, reservation, error)
                 _log(f"social {token}: {type(error).__name__}: {error} ({outcome})")
                 return None
@@ -851,23 +858,25 @@ class SidecarService:
 
             try:
                 input_tokens = await asyncio.to_thread(self._adapter.count_input_tokens, request, history)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 _log(f"request {request.request_id}: {type(error).__name__}: {error}")
                 return None
 
-            if input_tokens > claude.MAX_INPUT_TOKENS:
+            if input_tokens > self._adapter.metadata.max_input_tokens:
                 _log(
                     f"request {request.request_id}: prompt is {input_tokens} tokens "
-                    f"(limit {claude.MAX_INPUT_TOKENS}), staying silent"
+                    f"(limit {self._adapter.metadata.max_input_tokens}), staying silent"
                 )
                 return None
 
             max_cost_nano = budget.conservative_max_cost_nano(
-                input_tokens, claude.MAX_OUTPUT_TOKENS, *input_prices
+                input_tokens,
+                self._adapter.metadata.max_output_tokens("career" if request.is_career else "chat"),
+                *input_prices,
             )
             decision, reservation = await store.reserve(
                 request_kind=_request_kind_for(request),
-                model=claude.MODEL_ID,
+                model=self._adapter.metadata.model,
                 max_cost_nano=max_cost_nano,
                 priority=_priority_for(request),
                 now=now,
@@ -878,7 +887,7 @@ class SidecarService:
 
             try:
                 reply, usage = await asyncio.to_thread(self._adapter.generate_reply, request, history)
-            except claude.ClaudeError as error:
+            except provider.GenerationError as error:
                 outcome = await self._account_for_failure(store, reservation, error)
                 _log(f"request {request.request_id}: {type(error).__name__}: {error} ({outcome})")
                 return None
@@ -914,7 +923,7 @@ class SidecarService:
                 return None
 
             if request.is_career:
-                choice = claude.CareerReply.model_validate_json(reply)
+                choice = generation.CareerReply.model_validate_json(reply)
                 await store.record_career_decision(
                     bot_guid=request.bot_guid,
                     career_version=request.career_content.career_version,
@@ -926,7 +935,7 @@ class SidecarService:
                 await store.append_turn(
                     bot_guid=request.bot_guid,
                     role="user",
-                    content=claude.build_user_message(request),
+                    content=generation.build_user_message(request),
                     now=settled_at,
                 )
                 await store.append_turn(
@@ -937,7 +946,7 @@ class SidecarService:
         return protocol.encode_response(request.request_id, reply, self._token)
 
     async def _account_for_failure(
-        self, store: state.SidecarState, reservation: ledger.Reservation, error: claude.ClaudeError
+        self, store: state.SidecarState, reservation: ledger.Reservation, error: provider.GenerationError
     ) -> str:
         """Decides what a failed generation owes, and returns what was done for the log.
 
@@ -958,7 +967,7 @@ class SidecarService:
            releasing it would spend money the ledger never recorded.
         """
 
-        if claude.billing_is_impossible(error):
+        if error.billing_status is provider.GenerationBillingStatus.IMPOSSIBLE:
             await store.release(reservation=reservation)
             return "reservation released, nothing was generated"
 
@@ -1026,7 +1035,7 @@ class SidecarService:
 async def serve(
     config: SidecarConfig,
     token: str,
-    adapter: claude.ClaudeAdapter | None = None,
+    adapter: provider.GenerationProvider | None = None,
     store: state.SidecarState | None = None,
     database: PlayerbotsDatabaseSettings | None = None,
 ) -> None:
@@ -1069,7 +1078,7 @@ async def serve(
 
 
 def _log(message: str) -> None:
-    print(f"playerbot-claude: {message}", file=sys.stderr, flush=True)
+    print(f"playerbot-llm: {message}", file=sys.stderr, flush=True)
 
 
 async def _with_state(config: SidecarConfig, database: PlayerbotsDatabaseSettings, work):
@@ -1085,9 +1094,9 @@ async def _with_state(config: SidecarConfig, database: PlayerbotsDatabaseSetting
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="playerbot-claude")
+    parser = argparse.ArgumentParser(prog="playerbot-llm")
     parser.add_argument("command", choices=["serve", "doctor", "profile"])
-    parser.add_argument("--config", required=True, help="Path to mod_playerbot_claude.conf")
+    parser.add_argument("--config", required=True, help="Path to mod_playerbot_llm.conf")
     parser.add_argument(
         "--playerbots-config",
         required=True,
@@ -1160,7 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not config.enable or config.bridge_port <= 0:
-        _log("disabled by configuration (PlayerbotClaude.Enable / BridgePort); refusing to start")
+        _log("disabled by configuration (PlayerbotLLM.Enable / BridgePort); refusing to start")
         return 1
 
     try:

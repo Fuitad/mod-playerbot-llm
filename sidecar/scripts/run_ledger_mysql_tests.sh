@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-CONTAINER=playerbot-claude-ledger-itest
+CONTAINER=playerbot-llm-ledger-itest
 PORT=33062
-DATABASE=playerbot_claude_ledger_itest
+DATABASE=playerbot_llm_ledger_itest
 PASSWORD=itest
 IMAGE=mysql:8.0
 
@@ -58,7 +58,7 @@ fi
 # mysqladmin answers slightly before the server accepts real work.
 sleep 5
 
-export PLAYERBOT_CLAUDE_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${DATABASE}"
+export PLAYERBOT_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${DATABASE}"
 
 cd "${SIDECAR}"
 uv run python -m pytest tests/test_ledger_mysql.py -q -m mysql

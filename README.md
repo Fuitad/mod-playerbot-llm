@@ -1,6 +1,6 @@
-# mod-playerbot-claude
+# mod-playerbot-llm
 
-A private AzerothCore module that gives [mod-playerbots](https://github.com/Fuitad/mod-playerbots) bots short, in character Claude Haiku dialogue and one bounded profession career choice. The model has no tools and receives no live game state. Playerbot code supplies opaque legal candidates and validates the response. Chat failures end in silence. Career failures use the deterministic playerbot fallback.
+A private AzerothCore module that gives [mod-playerbots](https://github.com/Fuitad/mod-playerbots) bots short, in character dialogue and one bounded profession career choice. The current Anthropic adapter uses Claude Haiku 4.5. The model has no tools and receives no live game state. Playerbot code supplies opaque legal candidates and validates the response. Chat failures end in silence. Career failures use the deterministic playerbot fallback.
 
 ## Compatibility
 
@@ -9,7 +9,7 @@ This module is developed against one exact revision of the private `Fuitad/mod-p
 Verify before building:
 
 ```bash
-test "$(cat modules/mod-playerbot-claude/PLAYERBOTS_REVISION)" = "$(git -C modules/mod-playerbots rev-parse HEAD)"
+test "$(cat modules/mod-playerbot-llm/PLAYERBOTS_REVISION)" = "$(git -C modules/mod-playerbots rev-parse HEAD)"
 ```
 
 The module consumes the versioned personality contract (`PLAYERBOT_PERSONALITY_API_VERSION == 2`) from mod-playerbots. Configuration fails with a clear error when mod-playerbots is missing, and compilation fails when the personality API version changes.
@@ -23,52 +23,52 @@ Requirements:
 
 ## Install
 
-1. Clone this repository into `modules/mod-playerbot-claude`, next to `modules/mod-playerbots`.
+1. Clone this repository into `modules/mod-playerbot-llm`, next to `modules/mod-playerbots`.
 2. Verify the pinned revision (command above).
-3. Configure and build worldserver as usual. The module registers itself through `mod-playerbot-claude.cmake`.
+3. Configure and build worldserver as usual. The module registers itself through `mod-playerbot-llm.cmake`.
 4. Install the sidecar environment:
 
 ```bash
-cd modules/mod-playerbot-claude/sidecar
+cd modules/mod-playerbot-llm/sidecar
 uv sync --locked
 ```
 
-5. Copy `conf/mod_playerbot_claude.conf.dist` to your config directory as `mod_playerbot_claude.conf` and edit it. Everything ships disabled.
+5. Copy `conf/mod_playerbot_llm.conf.dist` to your config directory as `mod_playerbot_llm.conf` and edit it. Everything ships disabled.
 
 ## Configuration
 
-All keys live in `mod_playerbot_claude.conf` and are read by both worldserver and the sidecar. See the `.dist` file for full documentation.
+All keys live in `mod_playerbot_llm.conf` and are read by both worldserver and the sidecar. See the `.dist` file for full documentation.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `PlayerbotClaude.Enable` | `0` | Master switch for the worldserver hooks. |
-| `PlayerbotClaude.AmbientWorldEnable` | `0` | **Legacy.** Ambient World chatter, for a server running with `AiPlayerbot.SocialChat.Enable = 0`. Inert while social chat is on. |
-| `PlayerbotClaude.AmbientMaxMessagesPerHour` | `6` | **Legacy.** Rolling hourly limit for the setting above. Effective range is `1` through `6`: worldserver accepts up to `60`, but the sidecar declines every attempt above `6`, so a larger value yields silence rather than more chatter. |
-| `PlayerbotClaude.BridgePort` | `0` | Loopback TCP port shared by worldserver and sidecar. `0` disables both. |
-| `PlayerbotClaude.DailyBudgetUsd` | `5` | The daily UTC ceiling shared by all Claude generation. The configured value is the only ceiling. |
-| `PlayerbotClaude.HumanBudgetReserveRatio` | `0.25` | Share of the ceiling reserved for work a player is waiting on. Valid from `0` through `1`. |
-| `PlayerbotClaude.InputUsdPerMTok` | `1.00` | Price per million input tokens (Claude Haiku 4.5). |
-| `PlayerbotClaude.OutputUsdPerMTok` | `5.00` | Price per million output tokens (Claude Haiku 4.5). |
-| `PlayerbotClaude.ResponseDeadlineMs` | `10000` | How long a pending conversation or career choice waits. |
-| `PlayerbotClaude.LogModelIO` | `0` | Logs complete model prompts and raw replies for temporary local diagnostics. |
-| `PlayerbotClaude.QueueSize` | `16` | Bounded queue between the world thread and the bridge worker. |
-| `PlayerbotClaude.GroupCooldownSeconds` | `120` | Minimum seconds between milestone reactions per group. |
+| `PlayerbotLLM.Enable` | `0` | Master switch for the worldserver hooks. |
+| `PlayerbotLLM.AmbientWorldEnable` | `0` | **Legacy.** Ambient World chatter, for a server running with `AiPlayerbot.SocialChat.Enable = 0`. Inert while social chat is on. |
+| `PlayerbotLLM.AmbientMaxMessagesPerHour` | `6` | **Legacy.** Rolling hourly limit for the setting above. Effective range is `1` through `6`: worldserver accepts up to `60`, but the sidecar declines every attempt above `6`, so a larger value yields silence rather than more chatter. |
+| `PlayerbotLLM.BridgePort` | `0` | Loopback TCP port shared by worldserver and sidecar. `0` disables both. |
+| `PlayerbotLLM.DailyBudgetUsd` | `5` | The daily UTC ceiling shared by all provider generation. The configured value is the only ceiling. |
+| `PlayerbotLLM.HumanBudgetReserveRatio` | `0.25` | Share of the ceiling reserved for work a player is waiting on. Valid from `0` through `1`. |
+| `PlayerbotLLM.InputUsdPerMTok` | `1.00` | Price per million input tokens for the configured provider. |
+| `PlayerbotLLM.OutputUsdPerMTok` | `5.00` | Price per million output tokens for the configured provider. |
+| `PlayerbotLLM.ResponseDeadlineMs` | `10000` | How long a pending conversation or career choice waits. |
+| `PlayerbotLLM.LogModelIO` | `0` | Logs complete model prompts and raw replies for temporary local diagnostics. |
+| `PlayerbotLLM.QueueSize` | `16` | Bounded queue between the world thread and the bridge worker. |
+| `PlayerbotLLM.GroupCooldownSeconds` | `120` | Minimum seconds between milestone reactions per group. |
 
 Secrets are never read from configuration files:
 
-- `PLAYERBOT_CLAUDE_BRIDGE_TOKEN` authenticates the loopback connection. Both processes require it and refuse to start when it is missing or shorter than 32 bytes. It never appears in logs, storage, or output.
-- `MOD_PLAYERBOT_CLAUDE_APIKEY` is the Anthropic API key, read only by the sidecar. The global `ANTHROPIC_API_KEY` variable is deliberately ignored so a machine-wide key can never be used implicitly by this module.
+- `PLAYERBOT_LLM_BRIDGE_TOKEN` authenticates the loopback connection. Both processes require it and refuse to start when it is missing or shorter than 32 bytes. It never appears in logs, storage, or output.
+- `MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY` is the Anthropic API key, read only by the Anthropic adapter. The global `ANTHROPIC_API_KEY` variable is deliberately ignored so a machine-wide key can never be used implicitly by this module.
 
 ## Operation
 
 Start the sidecar before (or alongside) worldserver:
 
 ```bash
-cd modules/mod-playerbot-claude/sidecar
-export PLAYERBOT_CLAUDE_BRIDGE_TOKEN=...   # >= 32 bytes
-export MOD_PLAYERBOT_CLAUDE_APIKEY=sk-ant-...
-uv run playerbot-claude serve \
-  --config /path/to/mod_playerbot_claude.conf \
+cd modules/mod-playerbot-llm/sidecar
+export PLAYERBOT_LLM_BRIDGE_TOKEN=...   # >= 32 bytes
+export MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY=sk-ant-...
+uv run playerbot-llm serve \
+  --config /path/to/mod_playerbot_llm.conf \
   --playerbots-config /path/to/playerbots.conf
 ```
 
@@ -77,8 +77,8 @@ uv run playerbot-claude serve \
 Health check (never prints a secret, exits nonzero when misconfigured):
 
 ```bash
-uv run playerbot-claude doctor \
-  --config /path/to/mod_playerbot_claude.conf \
+uv run playerbot-llm doctor \
+  --config /path/to/mod_playerbot_llm.conf \
   --playerbots-config /path/to/playerbots.conf
 ```
 
@@ -87,8 +87,8 @@ The report includes today's settled, outstanding, and remaining amounts, the pro
 Inspect the observed personality profile of a bot that has spoken through the bridge:
 
 ```bash
-uv run playerbot-claude profile \
-  --config /path/to/mod_playerbot_claude.conf \
+uv run playerbot-llm profile \
+  --config /path/to/mod_playerbot_llm.conf \
   --playerbots-config /path/to/playerbots.conf \
   --bot-guid 42
 ```
@@ -101,7 +101,7 @@ Which of the two modes below is in force is decided entirely by `AiPlayerbot.Soc
 
 mod-playerbots owns the conversation. Its coordinator watches zone General, say, party, and whispers, decides which opportunities are worth answering and who answers them, and asks this module for the line. There is no prefix and no command: bots take part in ordinary conversation, and a whisper to a bot is answered because it was addressed to that bot.
 
-This module's own whisper, party, and ambient hooks stand down completely in this mode, so one message can never produce two unrelated answers chosen by two different rules. `PlayerbotClaude.AmbientWorldEnable` is reported as ignored in the log rather than silently skipped, and no bot chatter reaches the World channel from either module.
+This module's own whisper, party, and ambient hooks stand down completely in this mode, so one message can never produce two unrelated answers chosen by two different rules. `PlayerbotLLM.AmbientWorldEnable` is reported as ignored in the log rather than silently skipped, and no bot chatter reaches the World channel from either module.
 
 See the interactive social chat section of the mod-playerbots README for the surfaces, the opt out commands, retention, and moderation.
 
@@ -117,9 +117,9 @@ Every failure in this path (no provider, refusal, budget, timeout, malformed out
 
 Legacy compatibility only. This is what a realm that has not turned interactive social chat on still gets, described so an operator upgrading from it knows what changes. It is not the intended configuration and nothing below is part of Social.
 
-- **Whispers** reach Claude the same way they always did: a whisper mod-playerbots does not recognize as a bot command becomes conversation, while known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens.
-- **Party chat** reaches Claude only when a message is explicitly marked for it, so ordinary group conversation never leaves the machine. Interactive social chat replaces that boundary entirely: it reads party chat directly and decides for itself, and no marker exists or is needed.
-- **World chatter** is the one surface Social never uses. The legacy ambient path can speak in the World channel, gated on `PlayerbotClaude.AmbientWorldEnable` and on canned broadcasts being off, bounded by a rolling hourly limit, and re-checked against the human, the bot, and channel membership immediately before speech. With interactive social chat on it is inert and the setting is logged as ignored. Zone General, say, party, and whispers are the only surfaces Social ever uses.
+- **Whispers** reach the generation provider the same way they always did: a whisper mod-playerbots does not recognize as a bot command becomes conversation, while known commands (`follow`, `grind`, item links, and every other chat trigger) still execute as commands and cost no tokens.
+- **Party chat** reaches the generation provider only when a message is explicitly marked for it, so ordinary group conversation never leaves the machine. Interactive social chat replaces that boundary entirely: it reads party chat directly and decides for itself, and no marker exists or is needed.
+- **World chatter** is the one surface Social never uses. The legacy ambient path can speak in the World channel, gated on `PlayerbotLLM.AmbientWorldEnable` and on canned broadcasts being off, bounded by a rolling hourly limit, and re-checked against the human, the bot, and channel membership immediately before speech. With interactive social chat on it is inert and the setting is logged as ignored. Zone General, say, party, and whispers are the only surfaces Social ever uses.
 
 ### Either way
 
@@ -158,7 +158,7 @@ A career request sends the bot name, personality values, and opaque candidate de
 
 Never sent, on any path: account names, IP addresses, positions, inventories, combat state, the bridge token, or recognized bot commands. Character GUIDs are sent on exactly one path, memory extraction, for the reason given above; no other request carries one.
 
-Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. With interactive social chat off, party and group chat leave only when explicitly marked for Claude, so whisper traffic is the only thing that leaves unmarked. With it on, mod-playerbots decides what is sent on all four surfaces and a character can opt out of the feature entirely with `.playerbots social off`.
+Whispers are already one-to-one text addressed to a specific bot; every whisper the command system does not consume is treated as conversation with that bot and leaves the machine. With interactive social chat off, party and group chat leave only when explicitly marked for generation, so whisper traffic is the only thing that leaves unmarked. With it on, mod-playerbots decides what is sent on all four surfaces and a character can opt out of the feature entirely with `.playerbots social off`.
 
 ## Budgeting
 
@@ -167,9 +167,9 @@ Cost per reply is `(input_tokens * InputUsdPerMTok + output_tokens * OutputUsdPe
 - 2,500 input plus 80 output tokens: `0.0029 USD`
 - 4,095 input plus 96 output tokens (the worst case; input is capped at 4,095 and output at 96 tokens): `0.004575 USD`
 
-`PlayerbotClaude.DailyBudgetUsd = 5` is an emergency ceiling for all Claude features together. A measured day with about 7,700 input tokens and 610 output tokens costs approximately `0.01075 USD` at the configured rates, so the default is roughly 465 times observed usage and is not a spending target.
+`PlayerbotLLM.DailyBudgetUsd = 5` is an emergency ceiling for all generation features together. A measured day with about 7,700 input tokens and 610 output tokens costs approximately `0.01075 USD` at the configured rates, so the default is roughly 465 times observed usage and is not a spending target.
 
-The configured value is the only ceiling. No policy maximum sits above it: a large configured budget is honoured as configured. The one hard limit is physical, not policy. The ledger records money in `DECIMAL(12, 6)` columns, so a ceiling above `999999.999999` USD per day is one the ledger could not enforce, and it is refused rather than quietly clamped. Missing, negative, zero, or unrecordable values disable generation, as does a price of zero. The removed `PlayerbotClaude.BudgetUsd` key is ignored.
+The configured value is the only ceiling. No policy maximum sits above it: a large configured budget is honoured as configured. The one hard limit is physical, not policy. The ledger records money in `DECIMAL(12, 6)` columns, so a ceiling above `999999.999999` USD per day is one the ledger could not enforce, and it is refused rather than quietly clamped. Missing, negative, zero, or unrecordable values disable generation, as does a price of zero. The removed `PlayerbotLLM.BudgetUsd` key is ignored.
 
 The ceiling is per UTC calendar day, rolling over at one instant regardless of server timezone or daylight saving. Arithmetic runs in integer nano-USD (1 USD = 1,000,000,000), so no float rounding can accumulate into the ledger, and amounts are stored to six decimal places. A single reservation or settlement is rounded up to the nearest millionth of a dollar, always in the direction that protects the budget.
 
@@ -184,7 +184,7 @@ How one request spends:
    - A timeout or a provider error carries no usage and nothing can be concluded, so the reservation is left alone.
 5. Anything left outstanding, including from a sidecar that died mid-request, stays charged at its maximum until a later transaction reclaims it, ten minutes after it was created. A completion arriving after that reclaim is refused rather than charged twice.
 
-`PlayerbotClaude.HumanBudgetReserveRatio` protects a share of the ceiling for work somebody is waiting on: whispers, party lines, and social replies. Ambient World chatter and career selection are background work and are denied once the remainder reaches the reserve, while a human request may still use it. Human work is protected from background work; it is not exempt from the ceiling itself. `0` disables the protection and `1` stops background generation entirely.
+`PlayerbotLLM.HumanBudgetReserveRatio` protects a share of the ceiling for work somebody is waiting on: whispers, party lines, and social replies. Ambient World chatter and career selection are background work and are denied once the remainder reaches the reserve, while a human request may still use it. Human work is protected from background work; it is not exempt from the ceiling itself. `0` disables the protection and `1` stops background generation entirely.
 
 If the provider ever reports a cost above what was reserved, the budget circuit breaker opens: the ceiling has already been crossed by an amount nobody authorised, the true figure is recorded, and every later request is denied until the breaker is cleared. The breaker lives on the social runtime control row rather than on the day, so it does not reopen by itself at UTC rollover. An impossible cost report is not a fact about one calendar day.
 
@@ -194,18 +194,18 @@ The sidecar keeps its state in the shared `acore_playerbots` database. It create
 
 | Table | Holds |
 | --- | --- |
-| `playerbot_claude_profile` | The latest observed personality profile per bot |
-| `playerbot_claude_conversation_turn` | The most recent 12 conversation turns per bot, trimmed on every write |
-| `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps for the rolling hourly gate |
-| `playerbot_claude_career_decision` | The current validated career decision per bot |
-| `playerbot_claude_lock` | Named serialization points, from a bounded key set |
+| `playerbot_llm_profile` | The latest observed personality profile per bot |
+| `playerbot_llm_conversation_turn` | The most recent 12 conversation turns per bot, trimmed on every write |
+| `playerbot_llm_ambient_attempt` | Accepted ambient attempt timestamps for the rolling hourly gate |
+| `playerbot_llm_career_decision` | The current validated career decision per bot |
+| `playerbot_llm_lock` | Named serialization points, from a bounded key set |
 
 Three more tables it writes to belong to mod-playerbots and are created by that module's SQL revisions, not by the sidecar:
 
 | Table | Holds |
 | --- | --- |
-| `playerbot_claude_daily_budget` | One row per UTC day: the reserved and spent decimal totals |
-| `playerbot_claude_budget_reservation` | One row per attempt, with its request kind, model, maximum, and settled cost |
+| `playerbot_llm_daily_budget` | One row per UTC day: the reserved and spent decimal totals |
+| `playerbot_llm_budget_reservation` | One row per attempt, with its request kind, model, maximum, and settled cost |
 | `playerbot_social_runtime_control` | The operator controls, including the budget circuit breaker |
 
 The sidecar refuses to start when those three are missing, naming them, rather than creating its own version. Apply `modules/mod-playerbots/data/sql/playerbots/updates` to the Playerbots database first.
@@ -214,9 +214,9 @@ The conversation turns are the only table holding player text. No secrets are ev
 
 Sharing the Playerbots database rather than a private file means the budget survives a sidecar restart, holds across two sidecars pointed at one realm, and is backed up by whatever already backs up that database.
 
-To delete the data the sidecar owns, stop it and drop the five tables in the first list; it recreates them empty on next start. Dropping the three in the second list needs the module's SQL revisions reapplied before the sidecar will start again. To delete only player text, `TRUNCATE TABLE playerbot_claude_conversation_turn`. Anthropic's own data handling is governed by their API terms.
+To delete the data the sidecar owns, stop it and drop the five tables in the first list; it recreates them empty on next start. Dropping the three in the second list needs the module's SQL revisions reapplied before the sidecar will start again. To delete only player text, `TRUNCATE TABLE playerbot_llm_conversation_turn`. Anthropic's own data handling is governed by their API terms.
 
-Upgrading from a version that kept its own file: nothing is migrated, and no code reads it. Delete it once the sidecar starts successfully against MySQL. A leftover `PlayerbotClaude.SidecarDatabase` line in the config is ignored.
+Upgrading from a version that kept its own file: nothing is migrated, and no code reads it. Delete it once the sidecar starts successfully against MySQL. A leftover `PlayerbotLLM.SidecarDatabase` line in the config is ignored.
 
 ## Development
 

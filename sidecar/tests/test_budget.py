@@ -10,8 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from playerbot_claude import budget
-from playerbot_claude.budget import (
+from playerbot_llm import budget
+from playerbot_llm.budget import (
     AdmissionDecision,
     BudgetConfigurationError,
     BudgetState,
@@ -76,7 +76,7 @@ def test_a_ceiling_the_ledger_cannot_record_is_refused_rather_than_clamped() -> 
         budget.validate_daily_ceiling(Decimal(budget.MAX_STORABLE_NANO + 1) / budget.NANO)
 
     # And it constrains nothing anybody would configure for a realm: just under a million
-    # dollars of Claude usage in a single UTC day.
+    # dollars of generation usage in a single UTC day.
     assert budget.validate_daily_ceiling("999999") > 0
 
 

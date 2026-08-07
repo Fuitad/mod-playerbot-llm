@@ -1,9 +1,9 @@
 /*
- * This file is part of the mod-playerbot-claude module.
+ * This file is part of the mod-playerbot-llm module.
  */
 
-#ifndef MOD_PLAYERBOT_CLAUDE_CLAUDECHAT_H
-#define MOD_PLAYERBOT_CLAUDE_CLAUDECHAT_H
+#ifndef MOD_PLAYERBOT_LLM_H
+#define MOD_PLAYERBOT_LLM_H
 
 #include "PlayerbotPersonality.h"
 #include "PlayerbotCareerPlan.h"
@@ -24,12 +24,12 @@
 #include <utility>
 #include <vector>
 
-// Bounded bridge between world-thread game hooks and the loopback Claude sidecar.
+// Bounded bridge between world-thread game hooks and the loopback LLM sidecar.
 //
 // Trust boundaries: requests carry only immutable value snapshots (GUID counters, names,
 // profiles, strings, timestamps). No live game pointer or game API ever crosses into the
 // bridge worker. Responses carry text only; nothing in a response can invoke gameplay.
-namespace ClaudeChat
+namespace PlayerbotLLM
 {
     /*
      * Bumped to 5 so every social and biography request carries the bot level and active gameplay
@@ -184,7 +184,7 @@ namespace ClaudeChat
      * The highest active_expansion value the wire defines: 0 classic, 1 burning crusade, 2 wrath.
      * The worldserver chooses the value; this bound is what makes a byte outside those three a
      * refusal here rather than a number the sidecar has to guess a meaning for. Checked against the
-     * game's own expansion enum where SharedDefines is visible (ClaudeChat.cpp).
+     * game's own expansion enum where SharedDefines is visible (PlayerbotLLM.cpp).
      */
     inline constexpr uint8 MAX_SOCIAL_ACTIVE_EXPANSION = 2;
 
@@ -360,7 +360,7 @@ namespace ClaudeChat
     /*
      * How long a social exchange may stay outstanding, given what the operator configured.
      *
-     * `PlayerbotClaude.ResponseDeadlineMs` has only a floor, so nothing stops it being set above the
+     * `PlayerbotLLM.ResponseDeadlineMs` has only a floor, so nothing stops it being set above the
      * coordinator's own provider timeout. Past that point the coordinator has already abandoned the
      * request as timed out while this side still holds the slot, so the transport would sit at its
      * bound refusing new work on behalf of requests nobody is waiting for. The coordinator's timeout
@@ -589,7 +589,7 @@ namespace ClaudeChat
     // already invalid UTF-8 is cut at its first invalid byte.
     std::string TruncateUtf8Bytes(std::string text, size_t maxBytes);
 
-    // Reads PLAYERBOT_CLAUDE_BRIDGE_TOKEN. Fails closed (nullopt) when the variable is
+    // Reads PLAYERBOT_LLM_BRIDGE_TOKEN. Fails closed (nullopt) when the variable is
     // missing or shorter than MIN_BRIDGE_TOKEN_BYTES.
     std::optional<std::string> BridgeTokenFromEnvironment();
 
@@ -778,11 +778,11 @@ namespace ClaudeChat
 
     // --- Explicit chat capture ---
 
-    // Whisper routing: explicit "llm <text>" always goes to Claude (even command-shaped
+    // Whisper routing: explicit "llm <text>" always goes to LLM (even command-shaped
     // text); a malformed explicit attempt ("llm", "llm ") stays silent. Unprefixed text
-    // goes to Claude only when the playerbot command system does not recognize it, so
+    // goes to LLM only when the playerbot command system does not recognize it, so
     // commands keep costing nothing.
-    std::optional<std::string> WhisperClaudeText(std::string const& message, bool isKnownPlayerbotCommand);
+    std::optional<std::string> WhisperLLMText(std::string const& message, bool isKnownPlayerbotCommand);
 
     // "llm <message>" in a direct whisper: returns the message. Anything else, including
     // different case or leading whitespace, is not a capture.
@@ -926,14 +926,14 @@ namespace ClaudeChat
     // TryEnqueue and DrainResponses; they never wait for network or disk I/O. Stop closes
     // the socket so shutdown never waits out a read deadline. Failed or expired requests
     // are dropped without a fabricated response.
-    class ClaudeBridge
+    class Bridge
     {
     public:
-        explicit ClaudeBridge(BridgeConfig config);
-        ~ClaudeBridge();
+        explicit Bridge(BridgeConfig config);
+        ~Bridge();
 
-        ClaudeBridge(ClaudeBridge const&) = delete;
-        ClaudeBridge& operator=(ClaudeBridge const&) = delete;
+        Bridge(Bridge const&) = delete;
+        Bridge& operator=(Bridge const&) = delete;
 
         void Start();
         void Stop();
@@ -995,19 +995,19 @@ namespace ClaudeChat
     inline constexpr std::size_t MAX_OUTSTANDING_SOCIAL_REQUESTS =
         PLAYERBOT_SOCIAL_MAX_PENDING_BOTS * PLAYERBOT_SOCIAL_MAX_PENDING_PER_BOT;
 
-    class ClaudeSocialTransport
+    class SocialTransport
     {
     public:
         // Capped here rather than at the call site, so the invariant stays with the class that
         // depends on it and a later caller cannot reintroduce the mismatch.
-        ClaudeSocialTransport(ClaudeBridge& bridge, std::string bridgeToken, int64 requestDeadlineMs)
+        SocialTransport(Bridge& bridge, std::string bridgeToken, int64 requestDeadlineMs)
             : _bridge(bridge), _bridgeToken(std::move(bridgeToken)),
               _requestDeadlineMs(SocialRequestDeadlineMs(requestDeadlineMs))
         {
         }
 
-        ClaudeSocialTransport(ClaudeSocialTransport const&) = delete;
-        ClaudeSocialTransport& operator=(ClaudeSocialTransport const&) = delete;
+        SocialTransport(SocialTransport const&) = delete;
+        SocialTransport& operator=(SocialTransport const&) = delete;
 
         /*
          * Opens an exchange and hands the request to the bridge.
@@ -1089,11 +1089,11 @@ namespace ClaudeChat
             int64 expiresAtSteadyMs = 0;
         };
 
-        ClaudeBridge& _bridge;
+        Bridge& _bridge;
         std::string _bridgeToken;
         int64 _requestDeadlineMs = 0;
         std::map<uint64, Outstanding> _exchanges;
     };
 }
 
-#endif  // MOD_PLAYERBOT_CLAUDE_CLAUDECHAT_H
+#endif  // MOD_PLAYERBOT_LLM_H

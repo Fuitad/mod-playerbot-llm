@@ -5,10 +5,10 @@ Three processes, two trust boundaries, one direction of trust: the game validate
 ```
 worldserver (C++)                     sidecar (Python)              Anthropic API
 +---------------------+   loopback    +--------------------+   TLS  +-----------+
-| world thread        |     TCP       | asyncio server     | -----> | Claude    |
-|  ClaudeChatScripts  | <-----------> |  protocol.py       | <----- | Haiku 4.5 |
-| bridge worker       |  length-      |  claude.py         |        +-----------+
-|  ClaudeChat/Bridge  |  prefixed     |  budget.py         |
+| world thread        |     TCP       | asyncio server     | -----> | provider  |
+|  PlayerbotLLMScripts| <-----------> |  protocol.py       | <----- | adapter   |
+| bridge worker       |  length-      |  generation.py     |        +-----------+
+|  PlayerbotLLM/Bridge|  prefixed     |  budget.py         |
 +---------------------+  JSON frames  |  ledger.py         |
                                       |  store.py          |
                                       |  schema.py         |
@@ -32,12 +32,12 @@ never duplicated into the sidecar's own configuration.
 
 All game state lives on the world thread. The bridge worker thread never touches it.
 
-- `ClaudeChatScripts.cpp` runs only on the world thread. It observes supported chat and milestone events, owns the legacy ambient cadence, and implements the optional playerbot career and social providers. Chat requests contain immutable names, personality values, and text. Career requests contain immutable personality values plus opaque legal candidates. No pointers cross the thread boundary.
-- `ClaudeChat.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
+- `PlayerbotLLMScripts.cpp` runs only on the world thread. It observes supported chat and milestone events, owns the legacy ambient cadence, and implements the optional playerbot career and social providers. Chat requests contain immutable names, personality values, and text. Career requests contain immutable personality values plus opaque legal candidates. No pointers cross the thread boundary.
+- `PlayerbotLLM.cpp` runs the bridge worker (`std::jthread`). It owns the socket, serializes requests, and parses responses. Queues in both directions are bounded (`QueueSize`); a full queue rejects new work immediately.
 - Delivery happens back on the world thread during world update. The bot GUID is re-resolved through `ObjectAccessor` immediately before speaking; if the bot is gone, offline, or the deadline (`ResponseDeadlineMs`) has passed, the response is dropped. World delivery also requires a human to remain connected, an alive bot outside combat, and a current World channel. `SayToWorld` failure is inspected and produces no fallback text.
-- Which mode is in force is decided by `AiPlayerbot.SocialChat.Enable`. While it is on, this module registers with the coordinator and the legacy whisper, party, and ambient hooks stand down, so one message can never produce two answers chosen by two different rules. `PlayerbotClaude.AmbientWorldEnable` is then reported as ignored in the log rather than silently skipped.
+- Which mode is in force is decided by `AiPlayerbot.SocialChat.Enable`. While it is on, this module registers with the coordinator and the legacy whisper, party, and ambient hooks stand down, so one message can never produce two answers chosen by two different rules. `PlayerbotLLM.AmbientWorldEnable` is then reported as ignored in the log rather than silently skipped.
 - The gate is read at two different cadences on purpose. Provider registration reads it once at startup, because `SetSocialProvider` is the worldserver's registration seam and a provider that appeared and vanished as an operator toggled a config would leave outstanding requests pointing at nothing; turning the feature on or off therefore takes effect at the next startup. The legacy hooks and the ambient limiter re-read it every tick, so a gate that becomes live-controllable silences them immediately rather than at the next restart. Both directions fail toward silence.
-- Legacy ambient mode, for a server with the social gate off, additionally requires `AiPlayerbot.EnableBroadcasts = 0`. When canned broadcasts remain enabled, only ambient scheduling is disabled. Whisper, party, and milestone Claude behavior remains available.
+- Legacy ambient mode, for a server with the social gate off, additionally requires `AiPlayerbot.EnableBroadcasts = 0`. When canned broadcasts remain enabled, only ambient scheduling is disabled. Whisper, party, and milestone generation remains available.
 - The model cannot act. Chat responses contain one `message`. Career responses contain one candidate token and one spending style. Playerbot code validates the response against its pending request and legal candidate set before persisting it.
 
 ## Wire protocol (loopback TCP)
@@ -50,9 +50,9 @@ All game state lives on the world thread. The bridge worker thread never touches
 - The structured social context carries two required trusted fields the worldserver chose: `prompt_mode` (`ordinary`, `decline_roleplay`, `acknowledge_roleplay`, `authorized_roleplay`) and `active_expansion` (`0` classic, `1` burning crusade, `2` wrath). The bridge refuses to serialize a request whose mode or expansion is outside those sets, and the sidecar refuses a structured context without them and keeps the ordinary prompt, so no untrusted string can select a mode. Only `authorized_roleplay` lifts the ordinary player voice, an authorized context may not carry fictional player identity fields, and the worldserver rescans the finished authorized line before delivery, refusing it when it needs later expansion content or the bot has entered combat.
 - Response kind is declared rather than inferred from shape. Career and social answers travel the same socket, and the chat and social payloads are additionally mutually exclusive by field count, so a career decision cannot arrive as a line to speak.
 - Every string bound in this protocol is a UTF-8 BYTE budget, enforced on both sides. Pydantic's `max_length` counts characters, so each bounded string carries an explicit byte validator beside it.
-- `SocialExchange` owns one social request from submission to verdict, and `ClaudeChatState` implements the worldserver's `PlayerbotSocialProvider` interface and registers itself through `SetSocialProvider` while the gate is on. It deregisters on shutdown, so the coordinator never holds a provider whose bridge has gone.
+- `SocialExchange` owns one social request from submission to verdict, and `PlayerbotLLMState` implements the worldserver's `PlayerbotSocialProvider` interface and registers itself through `SetSocialProvider` while the gate is on. It deregisters on shutdown, so the coordinator never holds a provider whose bridge has gone.
 - Ambient uses channel `world` and event kind `4`. Its trusted combination requires speaker GUID `0`, an empty speaker name, subject ID `0`, and marker `ambient_world`. Direct requests reject the empty speaker identity.
-- Every payload carries the bridge token from `PLAYERBOT_CLAUDE_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
+- Every payload carries the bridge token from `PLAYERBOT_LLM_BRIDGE_TOKEN`. Both sides compare it in constant time. A mismatch closes the connection without revealing the expected value. Both processes fail closed at startup when the token is missing or shorter than 32 bytes.
 - The socket binds to 127.0.0.1 only. The token exists to stop other local processes from injecting bot speech or draining budget.
 
 ## Sidecar (Python)
@@ -60,11 +60,11 @@ All game state lives on the world thread. The bridge worker thread never touches
 - `app.py` serializes all budget bookkeeping behind one lock, so socket concurrency can never race the ledger: record profile, count tokens, reserve, generate, settle, append memory. Ambient acceptance is persisted before token counting, so provider or counting failure still consumes the conservative rolling hourly slot.
 - The entire pipeline (queueing included) runs under an end-to-end `ResponseDeadlineMs` deadline, and the SDK client's own timeout is capped at the same value. A request that cannot finish in time is dropped silently; its reservation stays charged at maximum, and the dead exchange never enters conversation memory.
 - One residual overlap exists by design: a deadline cancellation releases the lock while the abandoned synchronous SDK call finishes in its worker thread (Python cannot interrupt it; the capped client timeout bounds it). This is safe because httpx clients are thread-safe and an abandoned call can never settle or write memory, but it does mean a new provider call may start while the abandoned one is still physically in flight.
-- `claude.py` is the only file that talks to Anthropic. The model gets no tools. Chat uses structured output with one bounded `message`. Career selection uses a separate structured output schema with one offered token and one allowed spending style.
+- `providers/anthropic.py` is the current adapter and the only file that talks to Anthropic. The model gets no tools. Chat uses structured output with one bounded `message`. Career selection uses a separate structured output schema with one offered token and one allowed spending style.
 - Career generation receives no conversation history or human text. The prompt describes only the personality and opaque candidate properties. `app.py` records a diagnostic decision after validation but never makes it authoritative.
 - Ambient generation receives only bot identity and personality plus a fixed observation instruction. The adapter discards any supplied history, and `app.py` neither reads nor appends conversation turns for ambient requests.
 - Roleplay assessment is classification only: the prompt forbids chatting or roleplaying, the conversation text is fenced as untrusted data, and the structured output is the six kind vocabulary plus capabilities. It is admitted under the same ledger as everything else, as classification work carrying the human priority of the reply it precedes. Every failure path (admission, provider, deadline, malformed output) answers with silence, and the worldserver's own timeout then resumes ordinary social behavior.
-- The API key is read from `MOD_PLAYERBOT_CLAUDE_APIKEY` only and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
+- The API key is read from `MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY` only by the Anthropic adapter and passed to the SDK explicitly. The SDK's implicit `ANTHROPIC_API_KEY` fallback is disabled by construction, so a machine-wide key can never be used by this module.
 
 ## Budget ledger
 
@@ -110,7 +110,7 @@ Anything left outstanding stays charged at its maximum until another transaction
 
 The legacy ambient rate gate uses the same strategy. It stores each accepted attempt before token counting, so a failing provider cannot be retried without limit, retains active attempts across restart, rejects above the configured limit from `1` through `6`, and removes attempts at the exact one hour boundary. Nothing reaches it while the social gate is on, because the limiter is never configured alongside the coordinator.
 
-The two sides disagree on that ceiling, and the sidecar is the one that decides. `MAX_AMBIENT_MESSAGES_PER_HOUR` is `60` in `ClaudeChat.h` and `6` in `store.py`, so worldserver will schedule attempts at a configured rate the sidecar then declines one by one. The effect is silence rather than overspend, which is why it is documented as an effective ceiling of `6` rather than repaired here: changing either constant is a behaviour change to the legacy path and does not belong in a documentation synchronization.
+The two sides disagree on that ceiling, and the sidecar is the one that decides. `MAX_AMBIENT_MESSAGES_PER_HOUR` is `60` in `PlayerbotLLM.h` and `6` in `store.py`, so worldserver will schedule attempts at a configured rate the sidecar then declines one by one. The effect is silence rather than overspend, which is why it is documented as an effective ceiling of `6` rather than repaired here: changing either constant is a behaviour change to the legacy path and does not belong in a documentation synchronization.
 
 ## Storage schema
 
@@ -120,13 +120,13 @@ Two owners, and the split matters. The sidecar creates the five tables it alone 
 
 | Table | Contents | Bound | Created by |
 | --- | --- | --- | --- |
-| `playerbot_claude_profile` | Latest observed trusted profile per bot | One row per bot | sidecar |
-| `playerbot_claude_conversation_turn` | Rolling dialogue memory | 12 turns per bot, trimmed on write | sidecar |
-| `playerbot_claude_ambient_attempt` | Accepted ambient attempt timestamps | Rolling one hour | sidecar |
-| `playerbot_claude_career_decision` | Validated opaque career response diagnostics | Latest row per bot | sidecar |
-| `playerbot_claude_lock` | Named serialization points | Bounded key set, never deleted | sidecar |
-| `playerbot_claude_daily_budget` | Reserved and spent decimal totals | One row per UTC day | mod-playerbots |
-| `playerbot_claude_budget_reservation` | One row per attempt, with request kind, model, maximum, and settled cost | Unique on the minted `req_` public id | mod-playerbots |
+| `playerbot_llm_profile` | Latest observed trusted profile per bot | One row per bot | sidecar |
+| `playerbot_llm_conversation_turn` | Rolling dialogue memory | 12 turns per bot, trimmed on write | sidecar |
+| `playerbot_llm_ambient_attempt` | Accepted ambient attempt timestamps | Rolling one hour | sidecar |
+| `playerbot_llm_career_decision` | Validated opaque career response diagnostics | Latest row per bot | sidecar |
+| `playerbot_llm_lock` | Named serialization points | Bounded key set, never deleted | sidecar |
+| `playerbot_llm_daily_budget` | Reserved and spent decimal totals | One row per UTC day | mod-playerbots |
+| `playerbot_llm_budget_reservation` | One row per attempt, with request kind, model, maximum, and settled cost | Unique on the minted `req_` public id | mod-playerbots |
 | `playerbot_social_runtime_control` | Operator controls, including the budget circuit breaker | Singleton row | mod-playerbots |
 
 That split is not tidiness. Both definitions used `CREATE TABLE IF NOT EXISTS`, so whichever ran first won and the other silently did nothing, and on a deployed realm that was the module. Every write the sidecar made to a column only its own definition had would have failed at runtime and nowhere else. The sidecar's ledger tests apply the module's revision files rather than a copy of them, so a column renamed there fails in the run that renames it.

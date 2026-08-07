@@ -3,10 +3,10 @@
 Two things live here and they are deliberately separate. :class:`SidecarState` is the
 narrow set of operations the request path depends on. :class:`MySqlSidecarState` is the
 only production implementation, and it is pure delegation: it acquires a connection,
-hands it to :mod:`playerbot_claude.ledger`, and returns what comes back.
+hands it to :mod:`playerbot_llm.ledger`, and returns what comes back.
 
 The delegation is kept free of decisions on purpose. Every rule about money lives in
-:mod:`playerbot_claude.budget` as pure arithmetic, and every rule about transactions
+:mod:`playerbot_llm.budget` as pure arithmetic, and every rule about transactions
 lives in the ledger where a real MySQL proves it. A rule invented in this layer would be
 a rule no test executes, because the unit tests substitute a double for exactly this
 interface.
@@ -21,14 +21,14 @@ from typing import TYPE_CHECKING, Protocol
 
 import aiomysql
 
-from playerbot_claude import ledger, protocol, schema
-from playerbot_claude import store as store_module
-from playerbot_claude.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
+from playerbot_llm import ledger, protocol, schema
+from playerbot_llm import store as store_module
+from playerbot_llm.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
 
 if TYPE_CHECKING:
     # Only for typing: app imports this module, so importing it back at runtime would
     # be circular. The settings object is app's to parse and this module's to consume.
-    from playerbot_claude.app import PlayerbotsDatabaseSettings
+    from playerbot_llm.app import PlayerbotsDatabaseSettings
 
 # Small on purpose. Every request already serializes behind the service's generation
 # lock, so the pool exists for reconnection and not for parallelism.

@@ -42,7 +42,7 @@ jobs:
       CORE_REPOSITORY: Fuitad/azerothcore-wotlk
       CORE_REF: Playerbot
     steps:
-      - name: Check out mod-playerbot-claude
+      - name: Check out mod-playerbot-llm
         uses: actions/checkout@v4
         with:
           path: module
@@ -64,7 +64,7 @@ jobs:
           # Presence check only. The value is never printed and is used solely by the
           # private checkout below. The key pair must be a READ-ONLY deploy key
           # installed on Fuitad/mod-playerbots, stored as the PLAYERBOTS_DEPLOY_KEY
-          # Actions secret of Fuitad/mod-playerbot-claude.
+          # Actions secret of Fuitad/mod-playerbot-llm.
           if [ -z "$PLAYERBOTS_DEPLOY_KEY" ]; then
             echo "The PLAYERBOTS_DEPLOY_KEY secret is not configured" >&2
             exit 1
@@ -90,7 +90,7 @@ jobs:
         run: test "$(git -C azerothcore/modules/mod-playerbots rev-parse HEAD)" = "${{ steps.pin.outputs.revision }}"
 
       - name: Place this module in the core tree
-        run: cp -R module azerothcore/modules/mod-playerbot-claude
+        run: cp -R module azerothcore/modules/mod-playerbot-llm
 
       - name: Install build dependencies
         run: |

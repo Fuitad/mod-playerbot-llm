@@ -16,7 +16,8 @@ from dataclasses import dataclass
 import pytest
 from fakes import FakeState
 
-from playerbot_claude import app, claude, protocol
+from playerbot_llm import app, protocol, provider
+from playerbot_llm.providers import anthropic as anthropic_provider
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -46,7 +47,7 @@ def request_payload(request_id: int = 7, message: str = "What do you enjoy doing
     ).encode()
 
 
-class FakeAdapter(claude.ClaudeAdapter):
+class FakeAdapter(anthropic_provider.AnthropicProvider):
     def __init__(self) -> None:
         # Deliberately no super().__init__(): the fake never builds a real client.
         self.reply = "A fine day for fishing."
@@ -57,16 +58,16 @@ class FakeAdapter(claude.ClaudeAdapter):
     def count_input_tokens(self, request: protocol.ChatRequest, history: list[tuple[str, str]]) -> int:
         # Content-driven so concurrent server processing cannot race test state.
         if "oversized" in request.message:
-            return claude.MAX_INPUT_TOKENS + 1
+            return anthropic_provider.MAX_INPUT_TOKENS + 1
 
         return self.input_tokens
 
     def generate_reply(
         self, request: protocol.ChatRequest, history: list[tuple[str, str]]
-    ) -> tuple[str, claude.UsageTotals]:
+    ) -> tuple[str, provider.GenerationUsage]:
         self.requests.append(request)
         self.histories.append(list(history))
-        return self.reply, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=10)
+        return self.reply, provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10)
 
 
 @dataclass
@@ -246,13 +247,13 @@ class AssessingAdapter(FakeAdapter):
 
     def assess_roleplay(
         self, request: protocol.RoleplayAssessmentRequest
-    ) -> tuple[protocol.RoleplayAssessmentCompletion, claude.UsageTotals]:
+    ) -> tuple[protocol.RoleplayAssessmentCompletion, provider.GenerationUsage]:
         if "explode" in request.current_line:
-            raise claude.ClaudeProviderError("provider unavailable")
+            raise provider.GenerationProviderError("provider unavailable")
         if "malformed" in request.current_line:
-            raise claude.ClaudeInvalidOutputError(
+            raise provider.GenerationInvalidOutputError(
                 "model output did not match the roleplay assessment schema",
-                claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=4),
+                provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=4),
             )
         if "slow" in request.current_line:
             import time
@@ -260,7 +261,7 @@ class AssessingAdapter(FakeAdapter):
             time.sleep(0.4)
 
         self.assessments.append(request)
-        return self.completion, claude.UsageTotals(input_tokens=self.input_tokens, output_tokens=8)
+        return self.completion, provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=8)
 
 
 @dataclass
@@ -320,7 +321,7 @@ async def test_assessment_round_trips_with_authenticated_correlation() -> None:
         assert harness.adapter.assessments[0].current_line == "care to share a tale?"
 
         # Admitted as human social work, and its cost reported exactly once, as its own call.
-        from playerbot_claude import budget as budget_module
+        from playerbot_llm import budget as budget_module
 
         assert harness.store.reserved_priorities == [budget_module.RequestPriority.IMMEDIATE_HUMAN]
         assert harness.store.reserved_kinds == [budget_module.RequestKind.MODERATION_CLASSIFICATION]

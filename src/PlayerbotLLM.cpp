@@ -1,8 +1,8 @@
 /*
- * This file is part of the mod-playerbot-claude module.
+ * This file is part of the mod-playerbot-llm module.
  */
 
-#include "ClaudeChat.h"
+#include "PlayerbotLLM.h"
 
 #include "SharedDefines.h"
 #include "utf8.h"
@@ -20,7 +20,7 @@ using boost::asio::ip::tcp;
 
 // The wire's expansion ceiling is the game's, stated once in SharedDefines. Two spellings of "the
 // last expansion" would drift exactly when a later core bump made the difference matter.
-static_assert(ClaudeChat::MAX_SOCIAL_ACTIVE_EXPANSION == EXPANSION_WRATH_OF_THE_LICH_KING,
+static_assert(PlayerbotLLM::MAX_SOCIAL_ACTIVE_EXPANSION == EXPANSION_WRATH_OF_THE_LICH_KING,
               "the wire's active_expansion ceiling must match the game's last expansion");
 
 namespace
@@ -101,19 +101,19 @@ namespace
         AppendEscapedJsonString(out, value);
     }
 
-    std::string ChatChannelName(ClaudeChat::ChatChannel channel)
+    std::string ChatChannelName(PlayerbotLLM::ChatChannel channel)
     {
         switch (channel)
         {
-            case ClaudeChat::ChatChannel::Whisper:
+            case PlayerbotLLM::ChatChannel::Whisper:
                 return "whisper";
-            case ClaudeChat::ChatChannel::Party:
+            case PlayerbotLLM::ChatChannel::Party:
                 return "party";
-            case ClaudeChat::ChatChannel::World:
+            case PlayerbotLLM::ChatChannel::World:
                 return "world";
-            case ClaudeChat::ChatChannel::Career:
+            case PlayerbotLLM::ChatChannel::Career:
                 return "career";
-            case ClaudeChat::ChatChannel::Social:
+            case PlayerbotLLM::ChatChannel::Social:
                 return "social";
             default:
                 break;
@@ -410,7 +410,7 @@ namespace
     }
 }
 
-std::string ClaudeChat::TruncateUtf8Bytes(std::string text, size_t maxBytes)
+std::string PlayerbotLLM::TruncateUtf8Bytes(std::string text, size_t maxBytes)
 {
     if (text.size() > maxBytes)
         text.resize(maxBytes);
@@ -422,16 +422,16 @@ std::string ClaudeChat::TruncateUtf8Bytes(std::string text, size_t maxBytes)
     return text;
 }
 
-int64 ClaudeChat::SteadyNowMs()
+int64 PlayerbotLLM::SteadyNowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
-std::optional<std::string> ClaudeChat::BridgeTokenFromEnvironment()
+std::optional<std::string> PlayerbotLLM::BridgeTokenFromEnvironment()
 {
-    char const* raw = std::getenv("PLAYERBOT_CLAUDE_BRIDGE_TOKEN");
+    char const* raw = std::getenv("PLAYERBOT_LLM_BRIDGE_TOKEN");
     if (!raw)
         return std::nullopt;
 
@@ -445,7 +445,7 @@ std::optional<std::string> ClaudeChat::BridgeTokenFromEnvironment()
     return token;
 }
 
-std::optional<std::vector<uint8>> ClaudeChat::EncodeFrame(std::string const& payload)
+std::optional<std::vector<uint8>> PlayerbotLLM::EncodeFrame(std::string const& payload)
 {
     if (payload.size() > MAX_FRAME_PAYLOAD_BYTES)
         return std::nullopt;
@@ -461,7 +461,7 @@ std::optional<std::vector<uint8>> ClaudeChat::EncodeFrame(std::string const& pay
     return frame;
 }
 
-std::optional<uint32> ClaudeChat::DecodeFrameLength(std::array<uint8, FRAME_HEADER_BYTES> const& header)
+std::optional<uint32> PlayerbotLLM::DecodeFrameLength(std::array<uint8, FRAME_HEADER_BYTES> const& header)
 {
     uint32 const length = (static_cast<uint32>(header[0]) << 24) | (static_cast<uint32>(header[1]) << 16) |
                           (static_cast<uint32>(header[2]) << 8) | static_cast<uint32>(header[3]);
@@ -471,7 +471,7 @@ std::optional<uint32> ClaudeChat::DecodeFrameLength(std::array<uint8, FRAME_HEAD
     return length;
 }
 
-std::optional<std::string> ClaudeChat::SerializeRequest(ChatRequest const& request, std::string const& token)
+std::optional<std::string> PlayerbotLLM::SerializeRequest(ChatRequest const& request, std::string const& token)
 {
     /*
      * Every string is checked here as well as in the sidecar. Relying on the far side means an
@@ -520,7 +520,7 @@ std::optional<std::string> ClaudeChat::SerializeRequest(ChatRequest const& reque
     return out;
 }
 
-std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::string const& payload,
+std::optional<PlayerbotLLM::ChatResponse> PlayerbotLLM::ParseResponsePayload(std::string const& payload,
                                                                         std::string const& expectedToken)
 {
     std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
@@ -567,7 +567,7 @@ std::optional<ClaudeChat::ChatResponse> ClaudeChat::ParseResponsePayload(std::st
     return response;
 }
 
-bool ClaudeChat::ResponseKindIsValid(ResponseKind kind)
+bool PlayerbotLLM::ResponseKindIsValid(ResponseKind kind)
 {
     switch (kind)
     {
@@ -585,7 +585,7 @@ bool ClaudeChat::ResponseKindIsValid(ResponseKind kind)
     return false;
 }
 
-char const* ClaudeChat::ResponseKindName(ResponseKind kind)
+char const* PlayerbotLLM::ResponseKindName(ResponseKind kind)
 {
     switch (kind)
     {
@@ -608,7 +608,7 @@ char const* ClaudeChat::ResponseKindName(ResponseKind kind)
     return "unknown";
 }
 
-std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::string const& name)
+std::optional<PlayerbotLLM::ResponseKind> PlayerbotLLM::ResponseKindFromName(std::string const& name)
 {
     // Exact match only. A prefix or case insensitive match would let "social_draft" or "Career" be
     // accepted as something the sender did not say.
@@ -628,19 +628,19 @@ std::optional<ClaudeChat::ResponseKind> ClaudeChat::ResponseKindFromName(std::st
     return std::nullopt;
 }
 
-bool ClaudeChat::BridgeTokenIsUsable(std::string const& token)
+bool PlayerbotLLM::BridgeTokenIsUsable(std::string const& token)
 {
     return token.size() >= MIN_BRIDGE_TOKEN_BYTES && token.size() <= MAX_BRIDGE_TOKEN_BYTES;
 }
 
-bool ClaudeChat::ActorIsAbsent(Actor const& actor)
+bool PlayerbotLLM::ActorIsAbsent(Actor const& actor)
 {
     // Every field, not just the guid. A zero guid with a name attached is an orphan that still
     // travels and still describes somebody who is not there.
     return actor.guidCounter == 0 && actor.name.empty() && !actor.human;
 }
 
-bool ClaudeChat::ActorIsUsable(Actor const& actor)
+bool PlayerbotLLM::ActorIsUsable(Actor const& actor)
 {
     // A nameless or unnamed actor cannot describe a real character, and an unbounded name is not a
     // bounded frame. Both are refused before anything is serialized.
@@ -667,7 +667,7 @@ bool ClaudeChat::ActorIsUsable(Actor const& actor)
     return utf8::distance(actor.name.begin(), actor.name.end()) <= MAX_ACTOR_NAME_CHARACTERS;
 }
 
-bool ClaudeChat::SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome)
+bool PlayerbotLLM::SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome)
 {
     switch (outcome)
     {
@@ -682,7 +682,7 @@ bool ClaudeChat::SocialExchangeOutcomeIsValid(SocialExchangeOutcome outcome)
     return false;
 }
 
-ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::string const& payload,
+PlayerbotLLM::SocialExchangeOutcome PlayerbotLLM::SocialExchange::Classify(std::string const& payload,
                                                                        std::string const& expectedToken,
                                                                        SocialResponse& out)
 {
@@ -715,12 +715,12 @@ ClaudeChat::SocialExchangeOutcome ClaudeChat::SocialExchange::Classify(std::stri
     return SocialExchangeOutcome::Deliver;
 }
 
-bool ClaudeChat::ClaudeSocialTransport::Submit(SocialRequest const& request)
+bool PlayerbotLLM::SocialTransport::Submit(SocialRequest const& request)
 {
     return SubmitAt(request, SteadyNowMs());
 }
 
-bool ClaudeChat::ClaudeSocialTransport::SubmitAt(SocialRequest const& request, int64 nowMs)
+bool PlayerbotLLM::SocialTransport::SubmitAt(SocialRequest const& request, int64 nowMs)
 {
     /*
      * Every refusal here is immediate and final, which is the point. The coordinator reads a false
@@ -754,12 +754,12 @@ bool ClaudeChat::ClaudeSocialTransport::SubmitAt(SocialRequest const& request, i
     return true;
 }
 
-std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Drain()
+std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransport::Drain()
 {
     return Resolve(_bridge.DrainSocialResponses(), SteadyNowMs());
 }
 
-std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSocialTransport::Resolve(
+std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransport::Resolve(
     std::vector<SocialRawResponse> const& responses, int64 nowMs)
 {
     std::vector<Completed> completed;
@@ -890,23 +890,23 @@ std::vector<ClaudeChat::ClaudeSocialTransport::Completed> ClaudeChat::ClaudeSoci
     return completed;
 }
 
-bool ClaudeChat::SocialEmoteIsSupported(uint32 emoteId)
+bool PlayerbotLLM::SocialEmoteIsSupported(uint32 emoteId)
 {
     return std::find(SOCIAL_EMOTE_IDS.begin(), SOCIAL_EMOTE_IDS.end(), emoteId) != SOCIAL_EMOTE_IDS.end();
 }
 
-int64 ClaudeChat::SocialRequestDeadlineMs(int64 configuredDeadlineMs)
+int64 PlayerbotLLM::SocialRequestDeadlineMs(int64 configuredDeadlineMs)
 {
     return std::min<int64>(configuredDeadlineMs,
                            static_cast<int64>(PLAYERBOT_SOCIAL_PROVIDER_TIMEOUT_SECONDS) * 1000);
 }
 
-bool ClaudeChat::SocialAdmissionLaneIsValid(SocialAdmissionLane lane)
+bool PlayerbotLLM::SocialAdmissionLaneIsValid(SocialAdmissionLane lane)
 {
     return lane == SocialAdmissionLane::ImmediateHuman || lane == SocialAdmissionLane::Background;
 }
 
-char const* ClaudeChat::SocialAdmissionLaneName(SocialAdmissionLane lane)
+char const* PlayerbotLLM::SocialAdmissionLaneName(SocialAdmissionLane lane)
 {
     switch (lane)
     {
@@ -921,7 +921,7 @@ char const* ClaudeChat::SocialAdmissionLaneName(SocialAdmissionLane lane)
     return "unknown";
 }
 
-bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
+bool PlayerbotLLM::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
 {
     /*
      * Refused before anything is written. The sidecar enforces these too, but a bound checked only
@@ -1005,7 +1005,7 @@ namespace
     }
 }  // namespace
 
-bool ClaudeChat::BiographyRequestIsUsable(BiographyRequest const& request, std::string const& token)
+bool PlayerbotLLM::BiographyRequestIsUsable(BiographyRequest const& request, std::string const& token)
 {
     if (!BridgeTokenIsUsable(token))
         return false;
@@ -1030,7 +1030,7 @@ bool ClaudeChat::BiographyRequestIsUsable(BiographyRequest const& request, std::
     return true;
 }
 
-std::optional<std::string> ClaudeChat::SerializeBiographyRequest(BiographyRequest const& request,
+std::optional<std::string> PlayerbotLLM::SerializeBiographyRequest(BiographyRequest const& request,
                                                                  std::string const& token)
 {
     if (!BiographyRequestIsUsable(request, token))
@@ -1097,13 +1097,13 @@ namespace
         std::size_t written = 0;
         for (std::string const& value : values)
         {
-            if (written >= ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRIES)
+            if (written >= PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRIES)
                 break;
 
             if (!first)
                 out += ',';
             AppendEscapedJsonString(
-                out, value.substr(0, Utf8PrefixLength(value, ClaudeChat::MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
+                out, value.substr(0, Utf8PrefixLength(value, PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
             first = false;
             ++written;
         }
@@ -1155,7 +1155,7 @@ namespace
     }
 }
 
-std::optional<std::string> ClaudeChat::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
+std::optional<std::string> PlayerbotLLM::EncodeSocialContext(PlayerbotSocialRequestContext const& context)
 {
     /*
      * The authority gate comes before any assembly. A mode or expansion outside the wire's
@@ -1296,7 +1296,7 @@ std::optional<std::string> ClaudeChat::EncodeSocialContext(PlayerbotSocialReques
     return out;
 }
 
-std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
+std::string PlayerbotLLM::EncodeStarterContext(std::string const& subject)
 {
     if (subject.empty())
         return std::string();
@@ -1314,7 +1314,7 @@ std::string ClaudeChat::EncodeStarterContext(std::string const& subject)
     return out;
 }
 
-std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest const& request,
+std::optional<std::string> PlayerbotLLM::SerializeSocialRequest(SocialRequest const& request,
                                                                std::string const& token)
 {
     if (!SocialRequestIsUsable(request, token))
@@ -1348,7 +1348,7 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
     return out;
 }
 
-std::optional<ClaudeChat::BiographyResponse> ClaudeChat::ParseBiographyResponsePayload(
+std::optional<PlayerbotLLM::BiographyResponse> PlayerbotLLM::ParseBiographyResponsePayload(
     std::string const& payload, std::string const& expectedToken, uint64 expectedRequestToken,
     uint64 expectedBotGuidCounter)
 {
@@ -1425,7 +1425,7 @@ std::optional<ClaudeChat::BiographyResponse> ClaudeChat::ParseBiographyResponseP
     return response;
 }
 
-std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload(std::string const& payload,
+std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePayload(std::string const& payload,
                                                                                  std::string const& expectedToken,
                                                                                  uint64 expectedRequestToken,
                                                                                  uint64 expectedBotGuidCounter)
@@ -1540,7 +1540,7 @@ std::optional<ClaudeChat::SocialResponse> ClaudeChat::ParseSocialResponsePayload
     return response;
 }
 
-std::optional<std::string> ClaudeChat::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
+std::optional<std::string> PlayerbotLLM::SerializeCareerRequestContent(PlayerbotCareerPlanRequest const& request)
 {
     // Refused whole rather than emitted with one bad candidate in it, so a single oversize summary
     // cannot make the entire legal set unusable on the far side.
@@ -1575,7 +1575,7 @@ std::optional<std::string> ClaudeChat::SerializeCareerRequestContent(PlayerbotCa
     return out;
 }
 
-std::optional<ClaudeChat::CareerDecision> ClaudeChat::ParseCareerDecision(std::string const& content)
+std::optional<PlayerbotLLM::CareerDecision> PlayerbotLLM::ParseCareerDecision(std::string const& content)
 {
     std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(content).Parse();
     if (!fields || fields->size() != 2u)
@@ -1603,7 +1603,7 @@ namespace
     constexpr uint64 AMBIENT_NAMESPACE = 0x414D4249454E5400ULL;
 }
 
-std::optional<uint64> ClaudeChat::SelectMilestoneSpeaker(MilestoneEventId const& eventId,
+std::optional<uint64> PlayerbotLLM::SelectMilestoneSpeaker(MilestoneEventId const& eventId,
                                                          std::vector<SpeakerCandidate> candidates)
 {
     if (candidates.empty())
@@ -1636,7 +1636,7 @@ std::optional<uint64> ClaudeChat::SelectMilestoneSpeaker(MilestoneEventId const&
     return candidates.back().guidCounter;
 }
 
-std::optional<uint64> ClaudeChat::SelectAmbientSpeaker(uint64 occurrence,
+std::optional<uint64> PlayerbotLLM::SelectAmbientSpeaker(uint64 occurrence,
                                                        std::vector<SpeakerCandidate> candidates)
 {
     if (candidates.empty())
@@ -1666,7 +1666,7 @@ std::optional<uint64> ClaudeChat::SelectAmbientSpeaker(uint64 occurrence,
     return candidates.back().guidCounter;
 }
 
-ClaudeChat::AmbientCadence::AmbientCadence(uint32 messagesPerHour, int64 startMs)
+PlayerbotLLM::AmbientCadence::AmbientCadence(uint32 messagesPerHour, int64 startMs)
 {
     if (!messagesPerHour || messagesPerHour > MAX_AMBIENT_MESSAGES_PER_HOUR)
         return;
@@ -1675,12 +1675,12 @@ ClaudeChat::AmbientCadence::AmbientCadence(uint32 messagesPerHour, int64 startMs
     _nextDueMs = startMs + _intervalMs;
 }
 
-bool ClaudeChat::AmbientCadence::IsValid() const
+bool PlayerbotLLM::AmbientCadence::IsValid() const
 {
     return _intervalMs > 0;
 }
 
-bool ClaudeChat::AmbientCadence::TryConsumeDueSlot(int64 nowMs)
+bool PlayerbotLLM::AmbientCadence::TryConsumeDueSlot(int64 nowMs)
 {
     if (!IsValid() || nowMs < _nextDueMs)
         return false;
@@ -1689,7 +1689,7 @@ bool ClaudeChat::AmbientCadence::TryConsumeDueSlot(int64 nowMs)
     return true;
 }
 
-bool ClaudeChat::ShouldEnqueueAmbient(bool humanOnline,
+bool PlayerbotLLM::ShouldEnqueueAmbient(bool humanOnline,
                                       std::vector<AmbientCandidateSnapshot> const& candidates)
 {
     if (!humanOnline)
@@ -1702,19 +1702,19 @@ bool ClaudeChat::ShouldEnqueueAmbient(bool humanOnline,
     });
 }
 
-bool ClaudeChat::LegacyConversationalHookAllowed(bool socialGateEnabled)
+bool PlayerbotLLM::LegacyConversationalHookAllowed(bool socialGateEnabled)
 {
     // One line, but named rather than inlined at four call sites: the rule is "the coordinator owns
     // responder selection while it is on", and a bare `!gate.enabled` at each hook does not say so.
     return !socialGateEnabled;
 }
 
-bool ClaudeChat::LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled)
+bool PlayerbotLLM::LegacyAmbientWorldAllowed(bool ambientConfigured, bool socialGateEnabled)
 {
     return ambientConfigured && !socialGateEnabled;
 }
 
-bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
+bool PlayerbotLLM::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
 {
     for (MilestoneEventId const& seen : _order)
         if (seen == eventId)
@@ -1729,7 +1729,7 @@ bool ClaudeChat::RecentEventIdSet::Insert(MilestoneEventId const& eventId)
 
 // --- Explicit chat capture ---
 
-std::optional<std::string> ClaudeChat::WhisperClaudeText(std::string const& message,
+std::optional<std::string> PlayerbotLLM::WhisperLLMText(std::string const& message,
                                                          bool isKnownPlayerbotCommand)
 {
     // An explicit llm attempt always wins (even for command-shaped text), and a
@@ -1747,7 +1747,7 @@ std::optional<std::string> ClaudeChat::WhisperClaudeText(std::string const& mess
     return message;
 }
 
-std::optional<std::string> ClaudeChat::ParseLlmWhisper(std::string const& message)
+std::optional<std::string> PlayerbotLLM::ParseLlmWhisper(std::string const& message)
 {
     static constexpr char PREFIX[] = "llm ";
     if (message.rfind(PREFIX, 0) != 0)
@@ -1760,7 +1760,7 @@ std::optional<std::string> ClaudeChat::ParseLlmWhisper(std::string const& messag
     return text;
 }
 
-std::optional<std::pair<std::string, std::string>> ClaudeChat::ParseLlmParty(std::string const& message)
+std::optional<std::pair<std::string, std::string>> PlayerbotLLM::ParseLlmParty(std::string const& message)
 {
     std::optional<std::string> const remainder = ParseLlmWhisper(message);
     if (!remainder)
@@ -1780,7 +1780,7 @@ std::optional<std::pair<std::string, std::string>> ClaudeChat::ParseLlmParty(std
 
 // --- Delivery policy ---
 
-bool ClaudeChat::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snapshot)
+bool PlayerbotLLM::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snapshot)
 {
     if (snapshot.expired)
         return false;
@@ -1802,7 +1802,7 @@ bool ClaudeChat::ShouldDeliver(ChatChannel channel, DeliverySnapshot const& snap
     return true;
 }
 
-bool ClaudeChat::GroupCooldownTracker::TryBegin(uint64 groupId, int64 nowMs, int64 cooldownMs)
+bool PlayerbotLLM::GroupCooldownTracker::TryBegin(uint64 groupId, int64 nowMs, int64 cooldownMs)
 {
     auto it = _lastBeginMs.find(groupId);
     if (it != _lastBeginMs.end() && nowMs - it->second < cooldownMs)
@@ -1814,7 +1814,7 @@ bool ClaudeChat::GroupCooldownTracker::TryBegin(uint64 groupId, int64 nowMs, int
 
 // --- Bridge worker ---
 
-struct ClaudeChat::ClaudeBridge::Impl
+struct PlayerbotLLM::Bridge::Impl
 {
     explicit Impl(BridgeConfig bridgeConfig)
         : config(std::move(bridgeConfig)), requests(config.queueCapacity), responses(config.queueCapacity),
@@ -2116,16 +2116,16 @@ struct ClaudeChat::ClaudeBridge::Impl
     }
 };
 
-ClaudeChat::ClaudeBridge::ClaudeBridge(BridgeConfig config) : _impl(std::make_unique<Impl>(std::move(config)))
+PlayerbotLLM::Bridge::Bridge(BridgeConfig config) : _impl(std::make_unique<Impl>(std::move(config)))
 {
 }
 
-ClaudeChat::ClaudeBridge::~ClaudeBridge()
+PlayerbotLLM::Bridge::~Bridge()
 {
     Stop();
 }
 
-void ClaudeChat::ClaudeBridge::Start()
+void PlayerbotLLM::Bridge::Start()
 {
     if (_impl->started.exchange(true))
         return;
@@ -2133,7 +2133,7 @@ void ClaudeChat::ClaudeBridge::Start()
     _impl->worker = std::jthread([impl = _impl.get()](std::stop_token stopToken) { impl->Run(stopToken); });
 }
 
-void ClaudeChat::ClaudeBridge::Stop()
+void PlayerbotLLM::Bridge::Stop()
 {
     if (_impl->stopped.exchange(true))
         return;
@@ -2150,7 +2150,7 @@ void ClaudeChat::ClaudeBridge::Stop()
         _impl->worker.join();
 }
 
-bool ClaudeChat::ClaudeBridge::TryEnqueue(ChatRequest request)
+bool PlayerbotLLM::Bridge::TryEnqueue(ChatRequest request)
 {
     if (_impl->stopped.load())
         return false;
@@ -2162,7 +2162,7 @@ bool ClaudeChat::ClaudeBridge::TryEnqueue(ChatRequest request)
     return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
-bool ClaudeChat::ClaudeBridge::TryEnqueueSocial(SocialRequest request, int64 expiresAtSteadyMs)
+bool PlayerbotLLM::Bridge::TryEnqueueSocial(SocialRequest request, int64 expiresAtSteadyMs)
 {
     if (_impl->stopped.load())
         return false;
@@ -2173,7 +2173,7 @@ bool ClaudeChat::ClaudeBridge::TryEnqueueSocial(SocialRequest request, int64 exp
     return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
-std::vector<ClaudeChat::ChatResponse> ClaudeChat::ClaudeBridge::DrainResponses()
+std::vector<PlayerbotLLM::ChatResponse> PlayerbotLLM::Bridge::DrainResponses()
 {
     std::vector<ChatResponse> drained;
     ChatResponse response;
@@ -2183,7 +2183,7 @@ std::vector<ClaudeChat::ChatResponse> ClaudeChat::ClaudeBridge::DrainResponses()
     return drained;
 }
 
-bool ClaudeChat::ClaudeBridge::TryEnqueueBiography(BiographyRequest request, int64 expiresAtSteadyMs)
+bool PlayerbotLLM::Bridge::TryEnqueueBiography(BiographyRequest request, int64 expiresAtSteadyMs)
 {
     if (_impl->stopped.load())
         return false;
@@ -2194,7 +2194,7 @@ bool ClaudeChat::ClaudeBridge::TryEnqueueBiography(BiographyRequest request, int
     return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
-std::vector<ClaudeChat::BiographyResponse> ClaudeChat::ClaudeBridge::DrainBiographyResponses()
+std::vector<PlayerbotLLM::BiographyResponse> PlayerbotLLM::Bridge::DrainBiographyResponses()
 {
     std::vector<BiographyResponse> drained;
     BiographyResponse response;
@@ -2204,7 +2204,7 @@ std::vector<ClaudeChat::BiographyResponse> ClaudeChat::ClaudeBridge::DrainBiogra
     return drained;
 }
 
-bool ClaudeChat::ClaudeBridge::TryEnqueueMemory(MemoryRequest request, int64 expiresAtSteadyMs)
+bool PlayerbotLLM::Bridge::TryEnqueueMemory(MemoryRequest request, int64 expiresAtSteadyMs)
 {
     if (_impl->stopped.load())
         return false;
@@ -2215,7 +2215,7 @@ bool ClaudeChat::ClaudeBridge::TryEnqueueMemory(MemoryRequest request, int64 exp
     return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
-std::vector<ClaudeChat::MemoryResponse> ClaudeChat::ClaudeBridge::DrainMemoryResponses()
+std::vector<PlayerbotLLM::MemoryResponse> PlayerbotLLM::Bridge::DrainMemoryResponses()
 {
     std::vector<MemoryResponse> drained;
     MemoryResponse response;
@@ -2225,7 +2225,7 @@ std::vector<ClaudeChat::MemoryResponse> ClaudeChat::ClaudeBridge::DrainMemoryRes
     return drained;
 }
 
-std::vector<ClaudeChat::SocialRawResponse> ClaudeChat::ClaudeBridge::DrainSocialResponses()
+std::vector<PlayerbotLLM::SocialRawResponse> PlayerbotLLM::Bridge::DrainSocialResponses()
 {
     std::vector<SocialRawResponse> drained;
     SocialRawResponse response;
@@ -2235,7 +2235,7 @@ std::vector<ClaudeChat::SocialRawResponse> ClaudeChat::ClaudeBridge::DrainSocial
     return drained;
 }
 
-bool ClaudeChat::MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token)
+bool PlayerbotLLM::MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token)
 {
     if (!BridgeTokenIsUsable(token))
         return false;
@@ -2282,7 +2282,7 @@ bool ClaudeChat::MemoryRequestIsUsable(MemoryRequest const& request, std::string
     return true;
 }
 
-std::optional<std::string> ClaudeChat::SerializeMemoryRequest(MemoryRequest const& request,
+std::optional<std::string> PlayerbotLLM::SerializeMemoryRequest(MemoryRequest const& request,
                                                               std::string const& token)
 {
     if (!MemoryRequestIsUsable(request, token))
@@ -2334,7 +2334,7 @@ std::optional<std::string> ClaudeChat::SerializeMemoryRequest(MemoryRequest cons
     return out;
 }
 
-std::optional<ClaudeChat::MemoryResponse> ClaudeChat::ParseMemoryResponsePayload(
+std::optional<PlayerbotLLM::MemoryResponse> PlayerbotLLM::ParseMemoryResponsePayload(
     std::string const& payload, std::string const& expectedToken, uint64 expectedRequestToken,
     uint64 expectedBotGuidCounter)
 {
@@ -2450,7 +2450,7 @@ std::optional<ClaudeChat::MemoryResponse> ClaudeChat::ParseMemoryResponsePayload
 
 // --- Roleplay assessment lane ---
 
-char const* ClaudeChat::RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability)
+char const* PlayerbotLLM::RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability)
 {
     using Capability = VanillaOnlyRules::RoleplayContentCapability;
 
@@ -2481,7 +2481,7 @@ char const* ClaudeChat::RoleplayContentCapabilityName(VanillaOnlyRules::Roleplay
     return "invalid";
 }
 
-std::optional<VanillaOnlyRules::RoleplayContentCapability> ClaudeChat::RoleplayContentCapabilityFromName(
+std::optional<VanillaOnlyRules::RoleplayContentCapability> PlayerbotLLM::RoleplayContentCapabilityFromName(
     std::string const& name)
 {
     using Capability = VanillaOnlyRules::RoleplayContentCapability;
@@ -2511,7 +2511,7 @@ std::optional<VanillaOnlyRules::RoleplayContentCapability> ClaudeChat::RoleplayC
     return std::nullopt;
 }
 
-std::optional<PlayerbotRoleplayAssessmentKind> ClaudeChat::RoleplayAssessmentKindFromName(std::string const& name)
+std::optional<PlayerbotRoleplayAssessmentKind> PlayerbotLLM::RoleplayAssessmentKindFromName(std::string const& name)
 {
     if (name == "ordinary")
         return PlayerbotRoleplayAssessmentKind::Ordinary;
@@ -2529,7 +2529,7 @@ std::optional<PlayerbotRoleplayAssessmentKind> ClaudeChat::RoleplayAssessmentKin
     return std::nullopt;
 }
 
-bool ClaudeChat::RoleplayAssessmentRequestIsUsable(RoleplayAssessmentRequest const& request,
+bool PlayerbotLLM::RoleplayAssessmentRequestIsUsable(RoleplayAssessmentRequest const& request,
                                                    std::string const& token)
 {
     if (!BridgeTokenIsUsable(token) || request.assessmentToken == 0)
@@ -2553,7 +2553,7 @@ bool ClaudeChat::RoleplayAssessmentRequestIsUsable(RoleplayAssessmentRequest con
     return true;
 }
 
-std::optional<std::string> ClaudeChat::SerializeRoleplayAssessmentRequest(RoleplayAssessmentRequest const& request,
+std::optional<std::string> PlayerbotLLM::SerializeRoleplayAssessmentRequest(RoleplayAssessmentRequest const& request,
                                                                           std::string const& token)
 {
     if (!RoleplayAssessmentRequestIsUsable(request, token))
@@ -2585,7 +2585,7 @@ std::optional<std::string> ClaudeChat::SerializeRoleplayAssessmentRequest(Rolepl
     return out;
 }
 
-std::optional<ClaudeChat::RoleplayAssessmentResponse> ClaudeChat::ParseRoleplayAssessmentResponsePayload(
+std::optional<PlayerbotLLM::RoleplayAssessmentResponse> PlayerbotLLM::ParseRoleplayAssessmentResponsePayload(
     std::string const& payload, std::string const& expectedToken, uint64 expectedAssessmentToken)
 {
     std::optional<std::map<std::string, FlatJsonValue>> fields = FlatJsonParser(payload).Parse();
@@ -2669,7 +2669,7 @@ std::optional<ClaudeChat::RoleplayAssessmentResponse> ClaudeChat::ParseRoleplayA
     return response;
 }
 
-bool ClaudeChat::RoleplayAssessmentExchange::Open(uint64 assessmentToken, int64 expiresAtSteadyMs)
+bool PlayerbotLLM::RoleplayAssessmentExchange::Open(uint64 assessmentToken, int64 expiresAtSteadyMs)
 {
     if (assessmentToken == 0 || _deadlines.size() >= MAX_OUTSTANDING_ROLEPLAY_ASSESSMENTS)
         return false;
@@ -2677,7 +2677,7 @@ bool ClaudeChat::RoleplayAssessmentExchange::Open(uint64 assessmentToken, int64 
     return _deadlines.emplace(assessmentToken, expiresAtSteadyMs).second;
 }
 
-ClaudeChat::RoleplayAssessmentOutcome ClaudeChat::RoleplayAssessmentExchange::Settle(uint64 assessmentToken,
+PlayerbotLLM::RoleplayAssessmentOutcome PlayerbotLLM::RoleplayAssessmentExchange::Settle(uint64 assessmentToken,
                                                                                     int64 nowMs)
 {
     auto const found = _deadlines.find(assessmentToken);
@@ -2690,7 +2690,7 @@ ClaudeChat::RoleplayAssessmentOutcome ClaudeChat::RoleplayAssessmentExchange::Se
     return nowMs <= expiresAtMs ? RoleplayAssessmentOutcome::Deliver : RoleplayAssessmentOutcome::Abandon;
 }
 
-std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::ExpireDue(int64 nowMs)
+std::vector<uint64> PlayerbotLLM::RoleplayAssessmentExchange::ExpireDue(int64 nowMs)
 {
     std::vector<uint64> expired;
     for (auto it = _deadlines.begin(); it != _deadlines.end();)
@@ -2709,7 +2709,7 @@ std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::ExpireDue(int64 nowM
     return expired;
 }
 
-std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::Clear()
+std::vector<uint64> PlayerbotLLM::RoleplayAssessmentExchange::Clear()
 {
     std::vector<uint64> outstanding;
     outstanding.reserve(_deadlines.size());
@@ -2720,7 +2720,7 @@ std::vector<uint64> ClaudeChat::RoleplayAssessmentExchange::Clear()
     return outstanding;
 }
 
-bool ClaudeChat::ClaudeBridge::TryEnqueueRoleplayAssessment(RoleplayAssessmentRequest request,
+bool PlayerbotLLM::Bridge::TryEnqueueRoleplayAssessment(RoleplayAssessmentRequest request,
                                                             int64 expiresAtSteadyMs)
 {
     if (_impl->stopped.load())
@@ -2732,7 +2732,7 @@ bool ClaudeChat::ClaudeBridge::TryEnqueueRoleplayAssessment(RoleplayAssessmentRe
     return _impl->requests.TryPush(Impl::QueuedRequest{std::move(request), expiresAtSteadyMs});
 }
 
-std::vector<ClaudeChat::RoleplayAssessmentResponse> ClaudeChat::ClaudeBridge::DrainRoleplayAssessmentResponses()
+std::vector<PlayerbotLLM::RoleplayAssessmentResponse> PlayerbotLLM::Bridge::DrainRoleplayAssessmentResponses()
 {
     std::vector<RoleplayAssessmentResponse> drained;
     RoleplayAssessmentResponse response;
