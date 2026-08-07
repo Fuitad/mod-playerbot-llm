@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import warnings
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1114,6 +1115,28 @@ async def test_the_state_facade_reserves_settles_and_reports(mysql_state) -> Non
     after = await state.budget_state(now=NOW)
     assert after.outstanding_nano == 0
     assert after.settled_nano == one // 4
+
+
+async def test_the_state_facade_settles_decimal_costs_without_database_warnings(mysql_state) -> None:
+    state, _ = mysql_state
+    maximum = budget.usd_to_nano("1.00")
+    costs = [budget.usd_to_nano("0.149573"), budget.usd_to_nano("0.001810")]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for actual_cost in costs:
+            decision, reservation = await state.reserve(
+                request_kind=RequestKind.CHAT_RESPONSE,
+                model=claude.MODEL_ID,
+                max_cost_nano=maximum,
+                priority=RequestPriority.IMMEDIATE_HUMAN,
+                now=NOW,
+            )
+            assert decision is AdmissionDecision.ADMITTED
+            assert reservation is not None
+            assert await state.settle(reservation=reservation, actual_cost_nano=actual_cost, now=NOW) is True
+
+    assert (await state.budget_state(now=NOW)).settled_nano == sum(costs)
 
 
 async def test_the_state_facade_never_leaks_a_transaction_back_into_the_pool(mysql_state) -> None:

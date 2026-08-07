@@ -382,7 +382,7 @@ class BudgetLedger:
                 await cursor.execute(
                     "UPDATE playerbot_claude_daily_budget SET spent_usd = spent_usd + %s "
                     "WHERE budget_date = %s",
-                    (budget.nano_to_usd_string(added), reservation.budget_date),
+                    (Decimal(added) / budget.NANO, reservation.budget_date),
                 )
                 # This reservation has left the reserved state, so the day owes less.
                 await self._refresh_reserved_usd(cursor, reservation.budget_date)
