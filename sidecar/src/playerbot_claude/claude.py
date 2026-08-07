@@ -308,6 +308,8 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
     # future value has already collapsed to None by here and selects ordinary voice. No string
     # a player typed can reach this variable.
     mode = context.prompt_mode if context is not None else "ordinary"
+    active_expansion = context.active_expansion if context is not None else 0
+    expansion = _ACTIVE_EXPANSION_NAMES[active_expansion]
 
     identity_rules = ""
     if context is not None and context.fictional_identity_request is not None:
@@ -345,9 +347,8 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         # The validator already refused an authorized context carrying fictional identity
         # fields, so identity_rules is necessarily empty here; the premise swap below is the
         # ONLY line the mode changes, and every safety rule survives it verbatim.
-        expansion = _ACTIVE_EXPANSION_NAMES[context.active_expansion if context is not None else 0]
         premise = (
-            f"You are {request.bot_name}, a player on a Wrath of the Lich King MMORPG server, "
+            f"You are {request.bot_name}, a level {request.bot_level} player in {expansion}, "
             f"chatting over {channel}, and for this one reply you are playing along in "
             f"character in a roleplay scene other players started. {audience}\n"
         )
@@ -379,8 +380,8 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
             )
 
         premise = (
-            f"You are {request.bot_name}, an ordinary player on a Wrath of the Lich King MMORPG "
-            f"server, chatting over {channel}. {audience}\n"
+            f"You are {request.bot_name}, an ordinary player at level {request.bot_level} in "
+            f"{expansion}, chatting over {channel}. {audience}\n"
         )
         voice_rules = (
             "- Speak like a person playing the game, not roleplaying an Azeroth character. Use "
@@ -402,6 +403,14 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         f"{answer_rule}"
         f"{identity_rules}"
         f"{voice_rules}"
+        f"- Every gameplay claim about you must be possible for a level {request.bot_level} "
+        f"character in {expansion}. Later expansion and higher-level content are unavailable.\n"
+        "- Your persona describes voice and durable preferences. It is not evidence of your "
+        "current activity, possessions, achievements, or unlocked content.\n"
+        "- Do not claim that you completed, unlocked, own, or are currently farming any level, "
+        "quest, dungeon, raid, gear, or profession unless a STARTER explicitly supplies that "
+        "fact about you.\n"
+        "- A claim about another player's activity belongs to that player. Never adopt it as your own.\n"
         "- You cannot perform any game action: no movement, combat, casting, trading, or item use. "
         "Never promise or announce actions; you only talk.\n"
         f"{identity_boundary}"
@@ -1466,9 +1475,12 @@ def build_biography_system_prompt(request: protocol.BiographyRequest) -> str:
             f"race {request.race_id}, class {request.class_id}, gender {request.gender_id}"
         )
 
+    expansion = _ACTIVE_EXPANSION_NAMES[request.active_expansion]
+
     return (
         f"Create a compact player profile for {request.character_name}, whose current character "
-        f"is a {gender} {race} {character_class}. This is a fictional player persona, not an "
+        f"is a level {request.bot_level} {gender} {race} {character_class} in {expansion}. "
+        "This is a fictional player persona, not an "
         "in-world backstory and not a real person's identity.\n"
         "Rules:\n"
         "- Fill every field with one short phrase or sentence, at most 240 bytes. These are profile "
@@ -1476,11 +1488,15 @@ def build_biography_system_prompt(request: protocol.BiographyRequest) -> str:
         "- Keep the player ordinary. Do not write an Azeroth childhood, family, homeland, title, "
         "rank, faction loyalty, personal lore relationship, or heroic deed.\n"
         "- Use the compatibility fields this way: origin is the general play approach; motivation "
-        "is the current gameplay goal; formative_experience is how this persona learned the game; "
+        "is the durable play motivation; formative_experience is how this persona learned the game; "
         "interests and aversions are game activities; preferred_topics are chat topics; mannerisms "
         "are chat habits; values are group-play priorities.\n"
         "- Zones, factions, professions, and lore may appear only as game content the player likes, "
         "dislikes, or discusses.\n"
+        f"- Every gameplay reference must be possible for a level {request.bot_level} character in "
+        f"{expansion}. Never name later expansion or higher-level content.\n"
+        "- Do not claim current, completed, unlocked, farmed, or owned quests, dungeons, raids, gear, "
+        "levels, achievements, or professions. Keep every field durable across future play sessions.\n"
         "- Never invent real-world personal details such as a legal name, age, job, family, "
         "location, contact information, or credentials.\n"
         "- Do not restate the name, race, class, or gender in any field. They are already known.\n"

@@ -32,11 +32,11 @@
 namespace ClaudeChat
 {
     /*
-     * Bumped to 3 for the social protocol: a typed actor, a response kind, and a social request
-     * variant. A sidecar speaking 2 is rejected outright rather than partially understood, which is
-     * what "fail closed on a mismatched protocol" means here.
+     * Bumped to 5 so every social and biography request carries the bot level and active gameplay
+     * expansion needed to prevent impossible claims. An older sidecar is rejected outright rather
+     * than partially understood.
      */
-    inline constexpr uint32 SCHEMA_VERSION = 4;
+    inline constexpr uint32 SCHEMA_VERSION = 5;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -155,6 +155,7 @@ namespace ClaudeChat
     {
         uint64 socialRequestToken = 0;
         Actor bot;
+        uint8 botLevel = 0;
         Actor subject;
         SocialAdmissionLane admissionLane = SocialAdmissionLane::Unknown;
         uint8 speakOnChannel = 0;
@@ -177,6 +178,7 @@ namespace ClaudeChat
      * MAX_SOCIAL_CONTEXT_ENTRIES. A longer list is refused there rather than trimmed.
      */
     inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRIES = 12;
+    inline constexpr uint8 MAX_SOCIAL_BOT_LEVEL = 80;
 
     /*
      * The highest active_expansion value the wire defines: 0 classic, 1 burning crusade, 2 wrath.
@@ -428,6 +430,8 @@ namespace ClaudeChat
         uint8 raceId = 0;
         uint8 classId = 0;
         uint8 genderId = 0;
+        uint8 botLevel = 0;
+        uint8 activeContentExpansion = 0;
     };
 
     [[nodiscard]] bool BiographyRequestIsUsable(BiographyRequest const& request, std::string const& token);

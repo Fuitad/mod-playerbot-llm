@@ -18,6 +18,7 @@
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "VanillaOnlyRules.h"
 
 #include "Bot/Personality/PlayerbotPersonalityMgr.h"
 #include "Bot/Social/PlayerbotSocialMgr.h"
@@ -274,6 +275,7 @@ namespace
             request.bot.guidCounter = botGuidCounter;
             request.bot.name = bot->GetName();
             request.bot.human = !GET_PLAYERBOT_AI(bot);
+            request.botLevel = bot->GetLevel();
             switch (priority)
             {
                 case PlayerbotSocialRequestPriority::DirectHumanEngagement:
@@ -356,6 +358,8 @@ namespace
             request.raceId = raceId;
             request.classId = classId;
             request.genderId = genderId;
+            request.botLevel = bot->GetLevel();
+            request.activeContentExpansion = VanillaOnlyRules::ActiveContentExpansion();
 
             if (!ClaudeChat::BiographyRequestIsUsable(request, _bridgeToken))
                 return false;

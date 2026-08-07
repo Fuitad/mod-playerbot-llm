@@ -215,7 +215,7 @@ TEST(ClaudeChatProtocolTest, FrameLengthDecodeRejectsOversizedLength)
 TEST(ClaudeChatProtocolTest, RequestSerializesToExactContractJson)
 {
     std::string const expected =
-        "{\"schema_version\":4,"
+        "{\"schema_version\":5,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":7,"
         "\"channel\":\"whisper\","
@@ -265,7 +265,7 @@ TEST(ClaudeChatProtocolTest, AmbientRequestSerializesToExactContractJson)
     request.occurrence = 9;
 
     std::string const expected =
-        "{\"schema_version\":4,"
+        "{\"schema_version\":5,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":8,"
         "\"channel\":\"world\","
@@ -955,6 +955,7 @@ TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     ClaudeChat::SocialRequest request;
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
     request.subject = SocialActor(900, "Deszy", true);
     request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.speakOnChannel = 2;
@@ -969,6 +970,7 @@ TEST(ClaudeChatSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     EXPECT_NE(payload.find("\"bot_guid\":500"), std::string::npos);
     EXPECT_NE(payload.find("\"bot_name\":\"Grimbold\""), std::string::npos);
     EXPECT_NE(payload.find("\"bot_human\":0"), std::string::npos);
+    EXPECT_NE(payload.find("\"bot_level\":6"), std::string::npos);
     EXPECT_NE(payload.find("\"subject_guid\":900"), std::string::npos);
     EXPECT_NE(payload.find("\"subject_name\":\"Deszy\""), std::string::npos);
     EXPECT_NE(payload.find("\"subject_human\":1"), std::string::npos);
@@ -1097,14 +1099,14 @@ TEST(ClaudeChatSocialProtocolTest, TheProtocolVersionMovedSoAnOlderSidecarIsRefu
      * Fail closed on a mismatched protocol: a sidecar speaking the previous version is rejected
      * outright rather than partially understood.
      *
-     * Task 10A moved this to 4 to carry the biography and memory kinds. The assertion on the
+     * This change moved the protocol to 5 to carry gameplay authority. The assertion on the
      * constant is the tripwire that makes the bump deliberate, and it is deliberately paired with
      * the behaviour it is supposed to produce. On its own it only proved the constant had a value
      * somebody had typed, which is not the same claim as "an older sidecar is refused".
      */
-    EXPECT_EQ(ClaudeChat::SCHEMA_VERSION, 4u);
+    EXPECT_EQ(ClaudeChat::SCHEMA_VERSION, 5u);
 
-    std::string const previous = "{\"schema_version\":3,\"token\":\"" + TEST_TOKEN +
+    std::string const previous = "{\"schema_version\":4,\"token\":\"" + TEST_TOKEN +
                                  "\",\"request_id\":1,\"message\":\"hi\"}";
     EXPECT_FALSE(ClaudeChat::ParseResponsePayload(previous, TEST_TOKEN).has_value());
 }
@@ -1116,7 +1118,7 @@ TEST(ClaudeChatSocialProtocolTest, ALegacyChatAnswerIsNotASocialAnswerAndViceVer
      * fed the other's payload even if a caller mixed them up.
      */
     EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(
-                     "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
                      SOCIAL_TOKEN, 77, 500)
                      .has_value());
     EXPECT_FALSE(ClaudeChat::ParseResponsePayload(SocialPayload(), SOCIAL_TOKEN).has_value());
@@ -1216,6 +1218,7 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
     ClaudeChat::SocialRequest good;
     good.socialRequestToken = 77;
     good.bot = SocialActor(500, "Grimbold", false);
+    good.botLevel = 6;
     good.subject = SocialActor(900, "Deszy", true);
     good.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     good.threadPublicId = "thr_00000000000000000000000000000001";
@@ -1232,6 +1235,8 @@ TEST(ClaudeChatSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFrameI
              {"no token", [](ClaudeChat::SocialRequest& r) { r.socialRequestToken = 0; }},
              {"unusable bot", [](ClaudeChat::SocialRequest& r) { r.bot.guidCounter = 0; }},
              {"human bot", [](ClaudeChat::SocialRequest& r) { r.bot.human = true; }},
+             {"zero bot level", [](ClaudeChat::SocialRequest& r) { r.botLevel = 0; }},
+             {"bot level above cap", [](ClaudeChat::SocialRequest& r) { r.botLevel = 81; }},
              {"unknown admission lane",
               [](ClaudeChat::SocialRequest& r) { r.admissionLane = ClaudeChat::SocialAdmissionLane::Unknown; }},
              {"unusable subject", [](ClaudeChat::SocialRequest& r) { r.subject.name = std::string(200, 'a'); }},
@@ -1266,9 +1271,11 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestSerializesToExactContractJso
     request.raceId = 3;
     request.classId = 1;
     request.genderId = 0;
+    request.botLevel = 6;
+    request.activeContentExpansion = 0;
 
     std::string const expected =
-        "{\"schema_version\":4,"
+        "{\"schema_version\":5,"
         "\"token\":\"" + SOCIAL_TOKEN + "\","
         "\"kind\":\"biography\","
         "\"biography_request_token\":4242,"
@@ -1276,7 +1283,9 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestSerializesToExactContractJso
         "\"character_name\":\"Grimbold\","
         "\"race_id\":3,"
         "\"class_id\":1,"
-        "\"gender_id\":0}";
+        "\"gender_id\":0,"
+        "\"bot_level\":6,"
+        "\"active_expansion\":0}";
 
     auto const encoded = ClaudeChat::SerializeBiographyRequest(request, SOCIAL_TOKEN);
     ASSERT_TRUE(encoded.has_value());
@@ -1296,6 +1305,8 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestWithoutATokenIsNeverBuilt)
     good.biographyRequestToken = 4242;
     good.botGuidCounter = 500;
     good.characterName = "Grimbold";
+    good.botLevel = 6;
+    good.activeContentExpansion = 0;
     ASSERT_TRUE(ClaudeChat::SerializeBiographyRequest(good, SOCIAL_TOKEN).has_value());
 
     for (auto const& [name, mutate] :
@@ -1303,6 +1314,10 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyRequestWithoutATokenIsNeverBuilt)
              {"no request token", [](ClaudeChat::BiographyRequest& r) { r.biographyRequestToken = 0; }},
              {"no bot", [](ClaudeChat::BiographyRequest& r) { r.botGuidCounter = 0; }},
              {"no name", [](ClaudeChat::BiographyRequest& r) { r.characterName.clear(); }},
+             {"zero bot level", [](ClaudeChat::BiographyRequest& r) { r.botLevel = 0; }},
+             {"bot level above cap", [](ClaudeChat::BiographyRequest& r) { r.botLevel = 81; }},
+             {"invalid active expansion",
+              [](ClaudeChat::BiographyRequest& r) { r.activeContentExpansion = 3; }},
              {"long name",
               [](ClaudeChat::BiographyRequest& r) { r.characterName = std::string(200, 'a'); }}})
     {
@@ -1347,7 +1362,7 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyResponseIsReadFromTheBytesTheSideca
      * network, so the frame was flattened rather than the parser widened.
      */
     std::string const payload =
-        "{\"schema_version\":4,"
+        "{\"schema_version\":5,"
         "\"token\":\"" + SOCIAL_TOKEN + "\","
         "\"kind\":\"biography\","
         "\"biography_request_token\":4242,"
@@ -1385,7 +1400,7 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyResponseForSomebodyElsesRequestIsRe
      * request, or for a different bot, must be refused rather than handed to whoever is waiting.
      */
     auto const build = [](uint64 requestToken, uint64 botGuid, std::string const& kind) {
-        std::string out = "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN + "\",\"kind\":\"" + kind +
+        std::string out = "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN + "\",\"kind\":\"" + kind +
                           "\",\"biography_request_token\":" + std::to_string(requestToken) +
                           ",\"bot_guid\":" + std::to_string(botGuid) + ",";
         out +=
@@ -1425,7 +1440,7 @@ TEST(ClaudeChatSocialProtocolTest, ABiographyResponseCarryingAnythingExtraIsRefu
      * unknown key is how an instruction field would arrive, and a missing one is a biography with
      * a hole in it, so both refuse the frame instead of being dropped or defaulted.
      */
-    std::string const head = "{\"schema_version\":4,\"token\":\"" + SOCIAL_TOKEN +
+    std::string const head = "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN +
                              "\",\"kind\":\"biography\",\"biography_request_token\":4242,\"bot_guid\":500,";
     std::string const body =
         "\"origin\":\"a\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
@@ -1551,6 +1566,7 @@ TEST(ClaudeChatSocialProtocolTest, ASubjectIsEitherFullyPresentOrFullyAbsent)
     ClaudeChat::SocialRequest request;
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
     request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.threadPublicId = "thr_00000000000000000000000000000001";
 
@@ -1578,6 +1594,7 @@ TEST(ClaudeChatSocialProtocolTest, AnUnusableBridgeTokenRefusesTheRequest)
     ClaudeChat::SocialRequest request;
     request.socialRequestToken = 77;
     request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
     request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
     request.threadPublicId = "thr_00000000000000000000000000000001";
 
@@ -1646,7 +1663,7 @@ TEST(ClaudeChatSocialProtocolTest, ResponseParsersBoundTheTokenExplicitly)
 
     EXPECT_FALSE(ClaudeChat::ParseSocialResponsePayload(SocialPayload(), tooLong, 77, 500).has_value());
     EXPECT_FALSE(ClaudeChat::ParseResponsePayload(
-                     "{\"schema_version\":4,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":5,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
                      tooLong)
                      .has_value());
 
@@ -1663,6 +1680,7 @@ namespace
         ClaudeChat::SocialRequest request;
         request.socialRequestToken = requestToken;
         request.bot = SocialActor(botGuid, "Grimbold", false);
+        request.botLevel = 6;
         request.subject = SocialActor(900, "Deszy", true);
         request.admissionLane = ClaudeChat::SocialAdmissionLane::ImmediateHuman;
         request.speakOnChannel = static_cast<uint8>(PlayerbotSocialChannel::Party);
@@ -2303,7 +2321,7 @@ namespace
     std::string MemoryReplyPayload(std::size_t count, uint64 requestToken = 91, uint64 botGuid = 500,
                                    std::string const& kind = "memory")
     {
-        std::string out = "{\"schema_version\":4,\"token\":\"" + std::string(SOCIAL_TOKEN) +
+        std::string out = "{\"schema_version\":5,\"token\":\"" + std::string(SOCIAL_TOKEN) +
                           "\",\"kind\":\"" + kind + "\",\"memory_request_token\":" +
                           std::to_string(requestToken) + ",\"bot_guid\":" + std::to_string(botGuid) +
                           ",\"thread_id\":\"thr_00000000000000000000000000000001\",\"memory_count\":" +

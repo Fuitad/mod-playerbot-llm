@@ -931,8 +931,8 @@ bool ClaudeChat::SocialRequestIsUsable(SocialRequest const& request, std::string
     if (!BridgeTokenIsUsable(token))
         return false;
 
-    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot) || request.bot.human ||
-        !SocialAdmissionLaneIsValid(request.admissionLane))
+    if (request.socialRequestToken == 0 || !ActorIsUsable(request.bot) || request.bot.human || request.botLevel == 0 ||
+        request.botLevel > MAX_SOCIAL_BOT_LEVEL || !SocialAdmissionLaneIsValid(request.admissionLane))
         return false;
 
     /*
@@ -1018,7 +1018,8 @@ bool ClaudeChat::BiographyRequestIsUsable(BiographyRequest const& request, std::
     if (request.biographyRequestToken == 0)
         return false;
 
-    if (request.botGuidCounter == 0)
+    if (request.botGuidCounter == 0 || request.botLevel == 0 || request.botLevel > MAX_SOCIAL_BOT_LEVEL ||
+        request.activeContentExpansion > MAX_SOCIAL_ACTIVE_EXPANSION)
         return false;
 
     // The name reaches the TRUSTED half of the prompt, because the bot has to be told who it is,
@@ -1047,6 +1048,8 @@ std::optional<std::string> ClaudeChat::SerializeBiographyRequest(BiographyReques
     AppendJsonField(out, "race_id", static_cast<uint64>(request.raceId));
     AppendJsonField(out, "class_id", static_cast<uint64>(request.classId));
     AppendJsonField(out, "gender_id", static_cast<uint64>(request.genderId));
+    AppendJsonField(out, "bot_level", static_cast<uint64>(request.botLevel));
+    AppendJsonField(out, "active_expansion", static_cast<uint64>(request.activeContentExpansion));
     out += '}';
     return out;
 }
@@ -1333,6 +1336,7 @@ std::optional<std::string> ClaudeChat::SerializeSocialRequest(SocialRequest cons
     AppendJsonField(out, "bot_guid", request.bot.guidCounter);
     AppendJsonField(out, "bot_name", request.bot.name);
     AppendJsonField(out, "bot_human", request.bot.human ? uint64{1} : uint64{0});
+    AppendJsonField(out, "bot_level", static_cast<uint64>(request.botLevel));
     AppendJsonField(out, "subject_guid", request.subject.guidCounter);
     AppendJsonField(out, "subject_name", request.subject.name);
     AppendJsonField(out, "subject_human", request.subject.human ? uint64{1} : uint64{0});

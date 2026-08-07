@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -316,7 +316,7 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     channel: Literal["whisper", "party", "world", "career", "social"]
@@ -456,13 +456,14 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     bot_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
     bot_human: Literal[0, 1]
+    bot_level: Annotated[int, Field(ge=1, le=80)]
     subject_guid: Annotated[int, Field(ge=0, le=_UINT64_MAX)]
     subject_name: Annotated[str, StringConstraints(max_length=MAX_ACTOR_NAME_BYTES)]
     subject_human: Literal[0, 1]
@@ -731,7 +732,7 @@ class RoleplayAssessmentRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     token: str
     kind: Literal["roleplay_assessment"]
     roleplay_assessment_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -907,7 +908,7 @@ class BiographyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     token: str
     kind: Literal["biography"]
     biography_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -916,6 +917,8 @@ class BiographyRequest(BaseModel):
     race_id: Annotated[int, Field(ge=0, le=255)]
     class_id: Annotated[int, Field(ge=0, le=255)]
     gender_id: Annotated[int, Field(ge=0, le=255)]
+    bot_level: Annotated[int, Field(ge=1, le=80)]
+    active_expansion: Annotated[int, Field(ge=0, le=MAX_SOCIAL_ACTIVE_EXPANSION)]
 
     @field_validator("token")
     @classmethod
@@ -1152,7 +1155,7 @@ class MemoryRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     token: str
     kind: Literal["memory"]
     memory_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]

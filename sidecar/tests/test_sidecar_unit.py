@@ -30,7 +30,7 @@ FIXED_NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 
 # Byte-for-byte copy of the C++ RequestSerializesToExactContractJson fixture.
 CPP_REQUEST_FIXTURE = (
-    '{"schema_version":4,'
+    '{"schema_version":5,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":7,'
     '"channel":"whisper",'
@@ -52,7 +52,7 @@ CPP_REQUEST_FIXTURE = (
 
 # Byte-for-byte copy of the C++ AmbientRequestSerializesToExactContractJson fixture.
 CPP_AMBIENT_REQUEST_FIXTURE = (
-    '{"schema_version":4,'
+    '{"schema_version":5,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"request_id":8,'
     '"channel":"world",'
@@ -204,7 +204,7 @@ def test_accepts_exact_cpp_ambient_fixture() -> None:
 
 def test_rejects_invalid_utf8_payload() -> None:
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_request(b'{"schema_version":4,"bad":"\xff"}', TEST_TOKEN)
+        protocol.parse_request(b'{"schema_version":5,"bad":"\xff"}', TEST_TOKEN)
 
 
 def test_rejects_non_object_payload() -> None:
@@ -391,7 +391,7 @@ def test_response_payload_matches_cpp_accepted_shape() -> None:
     payload = protocol.encode_response(7, "I enjoy fishing.", TEST_TOKEN)
     # Byte-for-byte the shape the C++ ValidResponseRoundTrips fixture accepts.
     assert payload == (
-        b'{"schema_version":4,"token":"0123456789abcdef0123456789abcdef",'
+        b'{"schema_version":5,"token":"0123456789abcdef0123456789abcdef",'
         b'"request_id":7,"message":"I enjoy fishing."}'
     )
 
@@ -1674,6 +1674,7 @@ def _social_request_payload(**overrides: object) -> bytes:
         "bot_guid": 500,
         "bot_name": "Grimbold",
         "bot_human": 0,
+        "bot_level": 6,
         "subject_guid": 900,
         "subject_name": "Deszy",
         "subject_human": 1,
@@ -1697,6 +1698,8 @@ def _biography_request_payload(**overrides: object) -> bytes:
         "race_id": 3,
         "class_id": 1,
         "gender_id": 0,
+        "bot_level": 6,
+        "active_expansion": 0,
     }
     payload.update(overrides)
     return json.dumps(payload).encode("utf-8")
@@ -1712,6 +1715,30 @@ def test_biography_request_round_trips() -> None:
     assert request.race_id == 3
     assert request.class_id == 1
     assert request.gender_id == 0
+    assert request.bot_level == 6
+    assert request.active_expansion == 0
+
+
+def test_gameplay_claim_authority_is_required_on_social_and_biography_requests() -> None:
+    social = json.loads(_social_request_payload())
+    del social["bot_level"]
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(json.dumps(social).encode("utf-8"), TEST_TOKEN)
+
+    for field in ("bot_level", "active_expansion"):
+        biography = json.loads(_biography_request_payload())
+        del biography[field]
+        with pytest.raises(protocol.ProtocolError):
+            protocol.parse_biography_request(json.dumps(biography).encode("utf-8"), TEST_TOKEN)
+
+    for level in (0, 81):
+        with pytest.raises(protocol.ProtocolError):
+            protocol.parse_social_request(_social_request_payload(bot_level=level), TEST_TOKEN)
+        with pytest.raises(protocol.ProtocolError):
+            protocol.parse_biography_request(_biography_request_payload(bot_level=level), TEST_TOKEN)
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_biography_request(_biography_request_payload(active_expansion=3), TEST_TOKEN)
 
 
 def test_a_biography_request_carries_a_token_to_echo_back() -> None:
@@ -1752,6 +1779,7 @@ def test_social_request_round_trips() -> None:
     assert request.social_request_token == 77
     assert request.bot_guid == 500
     assert request.bot_human == 0
+    assert request.bot_level == 6
     assert request.subject_human == 1
     assert request.admission_lane == "immediate_human"
 
@@ -2380,6 +2408,9 @@ def test_every_ordinary_voice_mode_keeps_the_ordinary_player_premise() -> None:
     ordinary = _system_for(_context(prompt_mode="ordinary", active_expansion=0))
     assert "an ordinary player" in ordinary
     assert "not roleplaying an Azeroth character" in ordinary
+    assert "level 6" in ordinary
+    assert "classic World of Warcraft" in ordinary
+    assert "Wrath of the Lich King MMORPG server" not in ordinary
     assert "decline" not in ordinary.casefold()
 
     decline = _system_for(_context(prompt_mode="decline_roleplay", active_expansion=0))
@@ -2393,6 +2424,14 @@ def test_every_ordinary_voice_mode_keeps_the_ordinary_player_premise() -> None:
     assert "not roleplaying an Azeroth character" in acknowledge
     assert "without entering character" in acknowledge
     assert "never mock" in acknowledge
+
+
+def test_social_prompt_forbids_adopting_impossible_gameplay_claims() -> None:
+    system = _system_for(_context(prompt_mode="ordinary", active_expansion=0))
+
+    assert "another player's activity" in system
+    assert "not evidence of your current activity" in system
+    assert "Do not claim" in system
 
 
 def test_authorized_mode_performs_in_character_and_keeps_every_safety_rule() -> None:
@@ -3439,6 +3478,10 @@ def test_a_biography_prompt_tells_the_bot_who_it_actually_is() -> None:
     assert "player profile" in prompt
     assert "not an in-world backstory" in prompt
     assert "Write a compact backstory" not in prompt
+    assert "level 6" in prompt
+    assert "classic World of Warcraft" in prompt
+    assert "current gameplay goal" not in prompt
+    assert "durable play motivation" in prompt
 
 
 def test_an_unknown_race_or_class_is_refused_rather_than_named() -> None:
@@ -3719,7 +3762,7 @@ async def test_a_biography_reservation_covers_its_larger_response_envelope(tmp_p
 # Byte-for-byte copy of the C++ RoleplayProtocolTest RequestSerializesToExactContractJson fixture,
 # with the test token substituted.
 CPP_ASSESSMENT_FIXTURE = (
-    '{"schema_version":4,'
+    '{"schema_version":5,'
     '"token":"0123456789abcdef0123456789abcdef",'
     '"kind":"roleplay_assessment",'
     '"roleplay_assessment_request_token":91,'
@@ -3852,7 +3895,7 @@ def test_assessment_response_payload_matches_cpp_accepted_shape() -> None:
     assert (
         payload
         == (
-            '{"schema_version":4,'
+            '{"schema_version":5,'
             f'"token":"{TEST_TOKEN}",'
             '"kind":"roleplay_assessment",'
             '"roleplay_assessment_request_token":91,'
