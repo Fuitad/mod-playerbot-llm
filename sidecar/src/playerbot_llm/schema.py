@@ -19,6 +19,7 @@ belongs to one of them invites a second one for the other.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 
 # How many named locks the per bot conversation trim spreads across. Bounded so the lock
 # table cannot grow with the bot roster; wide enough that unrelated bots rarely collide.
@@ -136,9 +137,207 @@ LEGACY_BUDGET_IDENTIFIERS = tuple(
     identifier.replace("_llm_", "_claude_") for identifier in NEUTRAL_BUDGET_IDENTIFIERS
 )
 
+PROVIDER_COLUMN_SHAPES = {
+    "playerbot_llm_daily_budget": (
+        ("budget_date", "date", "NO", None, False, False),
+        ("reserved_usd", "decimal(12,6)", "NO", "0", False, False),
+        ("spent_usd", "decimal(12,6)", "NO", "0", False, False),
+        ("created_at", "timestamp", "NO", "current_timestamp", False, False),
+        ("updated_at", "timestamp", "NO", "current_timestamp", False, True),
+    ),
+    "playerbot_llm_budget_reservation": (
+        ("id", "bigint unsigned", "NO", None, True, False),
+        ("public_id", "char(36)", "NO", None, False, False),
+        ("budget_date", "date", "NO", None, False, False),
+        (
+            "request_kind",
+            "enum('chat_response','backstory_generation','memory_extraction',"
+            "'moderation_classification','career_generation')",
+            "NO",
+            None,
+            False,
+            False,
+        ),
+        (
+            "priority_lane",
+            "enum('unspecified','direct_human','mixed_human_bot','career_generation',"
+            "'bot_only_continuation','new_starter','background_extraction')",
+            "NO",
+            "unspecified",
+            False,
+            False,
+        ),
+        ("model", "varchar(64)", "NO", None, False, False),
+        ("max_cost_usd", "decimal(12,6)", "NO", None, False, False),
+        ("actual_cost_usd", "decimal(12,6)", "YES", None, False, False),
+        (
+            "state",
+            "enum('reserved','completed','released','expired')",
+            "NO",
+            "reserved",
+            False,
+            False,
+        ),
+        ("created_at", "timestamp", "NO", "current_timestamp", False, False),
+        ("expires_at", "datetime", "NO", None, False, False),
+        ("settled_at", "datetime", "YES", None, False, False),
+    ),
+    "playerbot_llm_lock": (("lock_key", "varchar(64)", "NO", None, False, False),),
+    "playerbot_llm_profile": (
+        ("bot_guid", "bigint unsigned", "NO", None, False, False),
+        ("profile_version", "int unsigned", "NO", None, False, False),
+        ("crafting_affinity", "tinyint unsigned", "NO", None, False, False),
+        ("gathering_affinity", "tinyint unsigned", "NO", None, False, False),
+        ("exploration_affinity", "tinyint unsigned", "NO", None, False, False),
+        ("sociability", "tinyint unsigned", "NO", None, False, False),
+        ("voice", "varchar(32)", "NO", None, False, False),
+        ("bot_name", "varchar(48)", "NO", None, False, False),
+        ("updated_at", "datetime", "NO", None, False, False),
+    ),
+    "playerbot_llm_conversation_turn": (
+        ("id", "bigint unsigned", "NO", None, True, False),
+        ("bot_guid", "bigint unsigned", "NO", None, False, False),
+        ("role", "enum('user','assistant')", "NO", None, False, False),
+        ("content", "text", "NO", None, False, False),
+        ("created_at", "datetime", "NO", None, False, False),
+    ),
+    "playerbot_llm_career_decision": (
+        ("bot_guid", "bigint unsigned", "NO", None, False, False),
+        ("career_version", "int unsigned", "NO", None, False, False),
+        ("candidate_token", "varchar(64)", "NO", None, False, False),
+        ("spending_style", "varchar(32)", "NO", None, False, False),
+        ("updated_at", "datetime", "NO", None, False, False),
+    ),
+    "playerbot_llm_ambient_attempt": (
+        ("id", "bigint unsigned", "NO", None, True, False),
+        ("created_at", "datetime", "NO", None, False, False),
+    ),
+}
+
+PROVIDER_INDEX_SHAPES = {
+    "playerbot_llm_daily_budget": {
+        "PRIMARY": (False, ("budget_date",)),
+    },
+    "playerbot_llm_budget_reservation": {
+        "PRIMARY": (False, ("id",)),
+        "uk_llm_reservation_public_id": (False, ("public_id",)),
+        "ix_llm_reservation_day_state": (True, ("budget_date", "state")),
+        "ix_llm_reservation_expiry": (True, ("state", "expires_at")),
+    },
+    "playerbot_llm_lock": {"PRIMARY": (False, ("lock_key",))},
+    "playerbot_llm_profile": {"PRIMARY": (False, ("bot_guid",))},
+    "playerbot_llm_conversation_turn": {
+        "PRIMARY": (False, ("id",)),
+        "ix_bot": (True, ("bot_guid", "id")),
+    },
+    "playerbot_llm_career_decision": {"PRIMARY": (False, ("bot_guid",))},
+    "playerbot_llm_ambient_attempt": {
+        "PRIMARY": (False, ("id",)),
+        "ix_created": (True, ("created_at",)),
+    },
+}
+
+PROVIDER_CHECK_SHAPES = {
+    "playerbot_llm_daily_budget": {
+        "ck_llm_daily_budget_reserved": "reserved_usd>=0",
+        "ck_llm_daily_budget_spent": "spent_usd>=0",
+    },
+    "playerbot_llm_budget_reservation": {
+        "ck_llm_reservation_max_cost": "max_cost_usd>=0",
+        "ck_llm_reservation_actual_cost": "actual_cost_usdisnulloractual_cost_usd>=0",
+    },
+}
+
 
 class LedgerError(RuntimeError):
     """The database could not complete an operation it was asked to perform."""
+
+
+def _normalized_default(value: object) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).lower().replace("()", "")
+    try:
+        if Decimal(text) == 0:
+            return "0"
+    except InvalidOperation:
+        pass
+    return text
+
+
+def _normalized_check(value: object) -> str:
+    return "".join(character for character in str(value).lower() if character not in "`() \t\r\n")
+
+
+async def _validate_provider_table_shapes(connection, tables: set[str]) -> None:
+    if not tables:
+        return
+
+    placeholders = ", ".join("%s" for _ in tables)
+    parameters = tuple(sorted(tables))
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            "SELECT table_name, column_name, column_type, is_nullable, column_default, extra "  # noqa: S608
+            "FROM information_schema.columns WHERE table_schema = DATABASE() "
+            f"AND table_name IN ({placeholders}) ORDER BY table_name, ordinal_position",
+            parameters,
+        )
+        column_rows = await cursor.fetchall()
+        await cursor.execute(
+            "SELECT table_name, index_name, non_unique, seq_in_index, column_name "  # noqa: S608
+            "FROM information_schema.statistics WHERE table_schema = DATABASE() "
+            f"AND table_name IN ({placeholders}) ORDER BY table_name, index_name, seq_in_index",
+            parameters,
+        )
+        index_rows = await cursor.fetchall()
+        await cursor.execute(
+            "SELECT tc.table_name, cc.constraint_name, cc.check_clause "  # noqa: S608
+            "FROM information_schema.table_constraints AS tc "
+            "JOIN information_schema.check_constraints AS cc "
+            "ON cc.constraint_schema = tc.constraint_schema "
+            "AND cc.constraint_name = tc.constraint_name "
+            "WHERE tc.constraint_schema = DATABASE() AND tc.constraint_type = 'CHECK' "
+            f"AND tc.table_name IN ({placeholders}) ORDER BY tc.table_name, cc.constraint_name",
+            parameters,
+        )
+        check_rows = await cursor.fetchall()
+
+    actual_columns: dict[str, list[tuple[str, str, str, str | None, bool, bool]]] = {}
+    for table, name, column_type, nullable, default, extra in column_rows:
+        normalized_extra = str(extra).lower()
+        actual_columns.setdefault(table, []).append(
+            (
+                name,
+                str(column_type).lower(),
+                nullable,
+                _normalized_default(default),
+                "auto_increment" in normalized_extra,
+                "on update current_timestamp" in normalized_extra,
+            )
+        )
+
+    actual_indexes: dict[str, dict[str, tuple[bool, tuple[str, ...]]]] = {}
+    index_parts: dict[tuple[str, str], list[str]] = {}
+    index_uniqueness: dict[tuple[str, str], bool] = {}
+    for table, name, non_unique, _sequence, column in index_rows:
+        index_parts.setdefault((table, name), []).append(column)
+        index_uniqueness[(table, name)] = bool(non_unique)
+    for (table, name), columns in index_parts.items():
+        actual_indexes.setdefault(table, {})[name] = (index_uniqueness[(table, name)], tuple(columns))
+
+    actual_checks: dict[str, dict[str, str]] = {}
+    for table, name, clause in check_rows:
+        actual_checks.setdefault(table, {})[name] = _normalized_check(clause)
+
+    for table in sorted(tables):
+        expected_columns = list(PROVIDER_COLUMN_SHAPES[table])
+        if actual_columns.get(table) != expected_columns:
+            raise LedgerError(f"unexpected provider table shape: {table} columns")
+        if actual_indexes.get(table, {}) != PROVIDER_INDEX_SHAPES[table]:
+            raise LedgerError(f"unexpected provider table shape: {table} indexes")
+        if actual_checks.get(table, {}) != PROVIDER_CHECK_SHAPES.get(table, {}):
+            raise LedgerError(f"unexpected provider table shape: {table} checks")
 
 
 async def acquire_named_lock(cursor, key: str) -> None:
@@ -256,6 +455,8 @@ async def ensure_schema(connection) -> None:
             f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
         )
 
+    await _validate_provider_table_shapes(connection, neutral_present)
+
     async with connection.cursor() as cursor:
         # Every start after the first would otherwise print one "table already
         # exists" note per table. The driver surfaces those as Python warnings on
@@ -269,18 +470,23 @@ async def ensure_schema(connection) -> None:
         finally:
             await cursor.execute("SET sql_notes = 1")
 
-        # The retired key shapes are deliberately NOT deleted here.
-        #
-        # An earlier version cleaned them up automatically, which is unsafe during a
-        # restart: an old sidecar still running against this database is using
-        # `budget_day:<date>` and `conversation:<bot_guid>` as its live locks, and
-        # removing them mid-flight strips its mutual exclusion and reintroduces the
-        # missing row race for it. A cosmetic tidy is not worth that.
-        #
-        # Leaving them is safe and still bounded: after the upgrade nothing creates
-        # a key of either shape, so the residue is a fixed historical set rather
-        # than a table that keeps growing. `retire_superseded_locks` below removes
-        # it when an operator knows no old process remains.
+    await _validate_provider_table_shapes(
+        connection,
+        set(REQUIRED_MODULE_TABLES[:2]) | set(SIDECAR_OWNED_TABLES),
+    )
+
+    # The retired key shapes are deliberately NOT deleted here.
+    #
+    # An earlier version cleaned them up automatically, which is unsafe during a
+    # restart: an old sidecar still running against this database is using
+    # `budget_day:<date>` and `conversation:<bot_guid>` as its live locks, and
+    # removing them mid-flight strips its mutual exclusion and reintroduces the
+    # missing row race for it. A cosmetic tidy is not worth that.
+    #
+    # Leaving them is safe and still bounded: after the upgrade nothing creates
+    # a key of either shape, so the residue is a fixed historical set rather
+    # than a table that keeps growing. `retire_superseded_locks` below removes
+    # it when an operator knows no old process remains.
 
     await connection.commit()
 

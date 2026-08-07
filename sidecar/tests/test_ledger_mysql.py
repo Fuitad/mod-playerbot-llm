@@ -81,6 +81,54 @@ PROVIDER_TABLE_SUFFIXES = (
     "career_decision",
     "ambient_attempt",
 )
+MALFORMED_PROVIDER_TABLE_MUTATIONS = (
+    (
+        "daily_budget_column",
+        "ALTER TABLE playerbot_llm_daily_budget MODIFY reserved_usd DECIMAL(11, 6) NOT NULL DEFAULT 0",
+    ),
+    (
+        "reservation_column",
+        "ALTER TABLE playerbot_llm_budget_reservation MODIFY model VARCHAR(63) NOT NULL",
+    ),
+    (
+        "lock_column",
+        "ALTER TABLE playerbot_llm_lock MODIFY lock_key VARCHAR(63) NOT NULL",
+    ),
+    (
+        "profile_column",
+        "ALTER TABLE playerbot_llm_profile MODIFY bot_name VARCHAR(47) NOT NULL",
+    ),
+    (
+        "conversation_column",
+        "ALTER TABLE playerbot_llm_conversation_turn MODIFY content VARCHAR(255) NOT NULL",
+    ),
+    (
+        "career_column",
+        "ALTER TABLE playerbot_llm_career_decision MODIFY candidate_token VARCHAR(63) NOT NULL",
+    ),
+    (
+        "ambient_column",
+        "ALTER TABLE playerbot_llm_ambient_attempt MODIFY created_at DATETIME(1) NOT NULL",
+    ),
+    (
+        "reservation_default",
+        "ALTER TABLE playerbot_llm_budget_reservation "
+        "MODIFY state ENUM('reserved', 'completed', 'released', 'expired') "
+        "NOT NULL DEFAULT 'released'",
+    ),
+    (
+        "reservation_index",
+        "ALTER TABLE playerbot_llm_budget_reservation "
+        "DROP INDEX ix_llm_reservation_day_state, "
+        "ADD KEY ix_llm_reservation_day_state (state, budget_date)",
+    ),
+    (
+        "daily_budget_constraint",
+        "ALTER TABLE playerbot_llm_daily_budget "
+        "DROP CHECK ck_llm_daily_budget_reserved, "
+        "ADD CONSTRAINT ck_llm_daily_budget_reserved CHECK (reserved_usd >= -1)",
+    ),
+)
 
 if not SQL_REVISIONS:  # pragma: no cover - a moved module directory, not a test outcome
     raise RuntimeError("no social schema revisions found; the module path moved")
@@ -495,6 +543,49 @@ async def test_sidecar_refuses_a_mixed_schema_before_creating_neutral_tables() -
             connection.close()
 
         assert await _provider_table_snapshot(database) == before
+
+
+@pytest.mark.parametrize(("case", "mutation"), MALFORMED_PROVIDER_TABLE_MUTATIONS)
+async def test_migration_refuses_malformed_legacy_table_shapes_before_ddl(case: str, mutation: str) -> None:
+    async with _isolated_database(f"badmig_{case}") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _create_legacy_sidecar_schema(database)
+        legacy_mutation = mutation.replace("playerbot_llm_", "playerbot_claude_").replace("_llm_", "_claude_")
+        await _execute_statements(database, (legacy_mutation,))
+        before = await _provider_table_snapshot(database)
+
+        with pytest.raises(OperationalError, match="unexpected_table_shape"):
+            await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+
+        assert await _provider_table_snapshot(database) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"),
+    MALFORMED_PROVIDER_TABLE_MUTATIONS,
+)
+async def test_sidecar_refuses_malformed_neutral_table_shapes(case: str, mutation: str) -> None:
+    async with _isolated_database(f"malformed_{case}") as database:
+        await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+
+        settings = _settings()
+        connection = await aiomysql.connect(
+            host=settings.host,
+            port=settings.port,
+            user=settings.user,
+            password=settings.password,
+            db=database,
+            autocommit=False,
+        )
+        try:
+            await schema.ensure_schema(connection)
+            await _execute_statements(database, (mutation,))
+
+            with pytest.raises(schema.LedgerError, match="unexpected provider table shape"):
+                await schema.ensure_schema(connection)
+        finally:
+            connection.close()
 
 
 async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger) -> None:
