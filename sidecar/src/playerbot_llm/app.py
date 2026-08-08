@@ -30,6 +30,7 @@ CONFIG_SECTION = "worldserver"
 CONFIG_PREFIX = "PlayerbotLLM."
 # Environment variable *names*, not secret values.
 TOKEN_ENV_VAR = "PLAYERBOT_LLM_BRIDGE_TOKEN"  # noqa: S105
+BOT_PURGE_POLL_SECONDS = 5.0
 
 # There is deliberately no maximum above the configured ceiling. A second limit in the
 # code silently ignores what the operator asked for, and PlayerbotLLM.DailyBudgetUsd
@@ -383,6 +384,15 @@ class SidecarService:
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
         self._generation_lock = asyncio.Lock()
+
+    async def purge_pending_bot_data(self) -> int:
+        """Drain durable bot purge intents without overlapping state writes."""
+
+        if self._store is None:
+            return 0
+
+        async with self._generation_lock:
+            return await self._store.purge_pending_bot_data()
 
     async def process_payload(self, payload: bytes) -> bytes | None:
         """Returns the response payload, or None when the bot must stay silent.
@@ -1028,6 +1038,12 @@ class SidecarService:
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         try:
+            try:
+                await self.purge_pending_bot_data()
+            except state.DatabaseUnavailable as error:
+                _log(f"connection {peer}: bot purge deferred after {type(error).__name__}, closing")
+                return
+
             while True:
                 try:
                     payload = await protocol.read_frame(reader)
@@ -1056,6 +1072,28 @@ class SidecarService:
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+
+
+async def run_bot_purge_worker(
+    service: SidecarService,
+    stop: asyncio.Event,
+    *,
+    poll_seconds: float = BOT_PURGE_POLL_SECONDS,
+) -> None:
+    """Retry durable bot purge intents while the bridge is otherwise idle."""
+
+    while not stop.is_set():
+        try:
+            purged = await service.purge_pending_bot_data()
+            if purged:
+                _log(f"purged sidecar data for {purged} deleted bots")
+        except state.DatabaseUnavailable as error:
+            _log(f"bot purge deferred after {type(error).__name__}")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+        except TimeoutError:
+            pass
 
 
 async def serve(
@@ -1094,8 +1132,10 @@ async def serve(
         address = server.sockets[0].getsockname() if server.sockets else ("127.0.0.1", 0)
         _log(f"listening on 127.0.0.1:{address[1]}")
 
-        async with server:
-            await stop.wait()
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(run_bot_purge_worker(service, stop))
+            async with server:
+                await stop.wait()
     finally:
         if pool is not None:
             await state.close_pool(pool)

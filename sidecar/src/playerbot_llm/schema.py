@@ -100,6 +100,7 @@ REQUIRED_MODULE_TABLES = (
     "playerbot_llm_daily_budget",
     "playerbot_llm_budget_reservation",
     "playerbot_social_runtime_control",
+    "playerbot_llm_bot_purge",
 )
 
 # The other half of that split: the tables SCHEMA_STATEMENTS above creates. Named here so
@@ -182,6 +183,12 @@ PROVIDER_COLUMN_SHAPES = {
         ("expires_at", "datetime", "NO", None, False, False),
         ("settled_at", "datetime", "YES", None, False, False),
     ),
+    "playerbot_llm_bot_purge": (
+        ("bot_guid", "bigint unsigned", "NO", None, False, False),
+        ("acknowledged_at", "timestamp", "YES", None, False, False),
+        ("created_at", "timestamp", "NO", "current_timestamp", False, False),
+        ("updated_at", "timestamp", "NO", "current_timestamp", False, True),
+    ),
     "playerbot_llm_lock": (("lock_key", "varchar(64)", "NO", None, False, False),),
     "playerbot_llm_profile": (
         ("bot_guid", "bigint unsigned", "NO", None, False, False),
@@ -223,6 +230,10 @@ PROVIDER_INDEX_SHAPES = {
         "uk_llm_reservation_public_id": (False, ("public_id",)),
         "ix_llm_reservation_day_state": (True, ("budget_date", "state")),
         "ix_llm_reservation_expiry": (True, ("state", "expires_at")),
+    },
+    "playerbot_llm_bot_purge": {
+        "PRIMARY": (False, ("bot_guid",)),
+        "ix_llm_bot_purge_pending": (True, ("acknowledged_at", "bot_guid")),
     },
     "playerbot_llm_lock": {"PRIMARY": (False, ("lock_key",))},
     "playerbot_llm_profile": {"PRIMARY": (False, ("bot_guid",))},
@@ -394,7 +405,7 @@ async def ensure_schema(connection) -> None:
         await cursor.execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = DATABASE() "
-            "AND table_name IN (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "AND table_name IN (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             provider_tables,
         )
         present = {row[0] for row in await cursor.fetchall()}
@@ -455,7 +466,10 @@ async def ensure_schema(connection) -> None:
             f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
         )
 
-    await _validate_provider_table_shapes(connection, neutral_present)
+    validated_tables = set(neutral_present)
+    if "playerbot_llm_bot_purge" in present:
+        validated_tables.add("playerbot_llm_bot_purge")
+    await _validate_provider_table_shapes(connection, validated_tables)
 
     async with connection.cursor() as cursor:
         # Every start after the first would otherwise print one "table already
@@ -472,7 +486,7 @@ async def ensure_schema(connection) -> None:
 
     await _validate_provider_table_shapes(
         connection,
-        set(REQUIRED_MODULE_TABLES[:2]) | set(SIDECAR_OWNED_TABLES),
+        set(REQUIRED_MODULE_TABLES[:2]) | {"playerbot_llm_bot_purge"} | set(SIDECAR_OWNED_TABLES),
     )
 
     # The retired key shapes are deliberately NOT deleted here.

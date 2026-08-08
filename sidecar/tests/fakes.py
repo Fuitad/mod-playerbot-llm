@@ -50,6 +50,10 @@ class FakeState:
         self.settlements: list[tuple[ledger.Reservation, int]] = []
         self._next_id = 1
 
+    async def purge_pending_bot_data(self) -> int:
+        self.calls.append("purge_pending_bot_data")
+        return 0
+
     async def try_begin_ambient(self, *, messages_per_hour: int, now: datetime) -> bool:
         self.calls.append("try_begin_ambient")
         allowed = min(messages_per_hour, self.ambient_allowance)

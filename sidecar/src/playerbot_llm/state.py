@@ -54,6 +54,8 @@ class SidecarState(Protocol):
     ordering decisions rather than re-testing MySQL.
     """
 
+    async def purge_pending_bot_data(self) -> int: ...
+
     async def try_begin_ambient(self, *, messages_per_hour: int, now: datetime) -> bool: ...
 
     async def record_profile(self, request: protocol.ChatRequest, *, now: datetime) -> None: ...
@@ -102,6 +104,10 @@ class MySqlSidecarState:
         self._pool = pool
         self._ledger = book
         self._store = store
+
+    async def purge_pending_bot_data(self) -> int:
+        async with self._connection() as connection:
+            return await self._store.purge_pending_bot_data(connection)
 
     @asynccontextmanager
     async def _connection(self):

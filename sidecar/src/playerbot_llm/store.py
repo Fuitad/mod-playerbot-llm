@@ -40,6 +40,43 @@ class SidecarStore:
     a pool, so the caller decides connection lifetime.
     """
 
+    async def purge_pending_bot_data(self, connection) -> int:
+        """Deletes every queued bot's owned rows, acknowledging each transaction last."""
+
+        purged = 0
+        while True:
+            try:
+                await connection.begin()
+                async with connection.cursor() as cursor:
+                    await acquire_named_lock(cursor, "bot_purge")
+                    await cursor.execute(
+                        "SELECT bot_guid FROM playerbot_llm_bot_purge WHERE acknowledged_at IS NULL "
+                        "ORDER BY bot_guid LIMIT 1 FOR UPDATE"
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        await connection.commit()
+                        return purged
+
+                    bot_guid = int(row[0])
+                    for table in (
+                        "playerbot_llm_profile",
+                        "playerbot_llm_conversation_turn",
+                        "playerbot_llm_career_decision",
+                    ):
+                        await cursor.execute(f"DELETE FROM `{table}` WHERE bot_guid = %s", (bot_guid,))  # noqa: S608
+
+                    await cursor.execute(
+                        "UPDATE playerbot_llm_bot_purge SET acknowledged_at = CURRENT_TIMESTAMP "
+                        "WHERE bot_guid = %s",
+                        (bot_guid,),
+                    )
+                await connection.commit()
+                purged += 1
+            except Exception:
+                await connection.rollback()
+                raise
+
     async def record_profile(
         self,
         connection,

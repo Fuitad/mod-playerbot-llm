@@ -14,7 +14,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 import anthropic
 import httpx
@@ -1136,6 +1136,61 @@ async def test_the_service_refuses_a_bad_token_before_touching_anything(tmp_path
 
     assert adapter.requests == []
     assert store.calls == []
+
+
+async def test_bot_purge_worker_gates_connections_retries_and_stops(tmp_path) -> None:
+    class GateState(FakeState):
+        def __init__(self, ceiling_nano: int) -> None:
+            super().__init__(ceiling_nano)
+            self.purge_calls = 0
+
+        async def purge_pending_bot_data(self) -> int:
+            self.purge_calls += 1
+            return 0
+
+    class RetryState(GateState):
+        def __init__(self, ceiling_nano: int) -> None:
+            super().__init__(ceiling_nano)
+            self.succeeded = asyncio.Event()
+
+        async def purge_pending_bot_data(self) -> int:
+            self.purge_calls += 1
+            if self.purge_calls == 1:
+                raise OSError("database unavailable")
+
+            self.succeeded.set()
+            return 0
+
+    class ClosedWriter:
+        def get_extra_info(self, _name):
+            return None
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    config = app.SidecarConfig.load(write_conf(tmp_path, CONF_TEXT))
+    gate_state = GateState(config.budget_nano)
+    service = app.SidecarService(config=config, token=TEST_TOKEN, store=gate_state)
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+
+    await service.handle_connection(reader, cast(asyncio.StreamWriter, ClosedWriter()))
+
+    assert gate_state.purge_calls == 1
+
+    retry_state = RetryState(config.budget_nano)
+    retry_service = app.SidecarService(config=config, token=TEST_TOKEN, store=retry_state)
+    stop = asyncio.Event()
+    worker = asyncio.create_task(app.run_bot_purge_worker(retry_service, stop, poll_seconds=0.01))
+
+    await asyncio.wait_for(retry_state.succeeded.wait(), timeout=1)
+    stop.set()
+    await asyncio.wait_for(worker, timeout=1)
+
+    assert retry_state.purge_calls == 2
 
 
 async def test_the_service_makes_no_generation_call_without_a_budget(tmp_path) -> None:

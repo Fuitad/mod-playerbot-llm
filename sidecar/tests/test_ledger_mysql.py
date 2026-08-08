@@ -72,6 +72,7 @@ LEGACY_SOCIAL_REVISIONS = (
     PLAYERBOTS_UPDATES / "2026_08_04_00_playerbot_budget_lane_unspecified.sql",
 )
 LLM_TABLE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_07_00_playerbot_llm_tables.sql"
+BOT_PURGE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_08_00_playerbot_llm_bot_purge.sql"
 PROVIDER_TABLE_SUFFIXES = (
     "daily_budget",
     "budget_reservation",
@@ -156,6 +157,17 @@ async def _connect() -> aiomysql.Connection:
     )
 
 
+def _settings_for(database: str) -> PlayerbotsDatabaseSettings:
+    settings = _settings()
+    return PlayerbotsDatabaseSettings(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        database=database,
+    )
+
+
 async def _apply_revisions(database: str, revisions: tuple[Path, ...]) -> None:
     settings = _settings()
     connection = await aiomysql.connect(
@@ -218,6 +230,7 @@ async def _provider_table_snapshot(database: str) -> dict[str, int]:
                 "SELECT table_name FROM information_schema.tables "
                 "WHERE table_schema = DATABASE() "
                 "AND (table_name LIKE 'playerbot_llm_%' OR table_name LIKE 'playerbot_claude_%') "
+                "AND table_name <> 'playerbot_llm_bot_purge' "
                 "ORDER BY table_name"
             )
             names = [row[0] for row in await cursor.fetchall()]
@@ -287,16 +300,18 @@ async def _apply_deployed_schema() -> None:
             await cursor.execute(
                 "SELECT COUNT(1) FROM information_schema.tables "
                 "WHERE table_schema = DATABASE() "
-                "AND table_name IN ('playerbot_llm_daily_budget', 'playerbot_llm_budget_reservation')"
+                "AND table_name IN "
+                "('playerbot_llm_daily_budget', 'playerbot_llm_budget_reservation', "
+                "'playerbot_llm_bot_purge')"
             )
-            neutral_budget_tables = (await cursor.fetchone())[0]
+            required_tables = (await cursor.fetchone())[0]
 
         # The AzerothCore updater records completed revisions and never replays an old
         # CREATE TABLE after a later revision renamed that table. This fixture used to
         # replay every historical file before every test, which would recreate the two
         # retired names beside the migrated tables. Apply the revision chain once, just
         # as the real updater does.
-        if neutral_budget_tables == 2:
+        if required_tables == 3:
             return
 
         for revision in SQL_REVISIONS:
@@ -414,7 +429,7 @@ async def test_starting_against_a_database_without_the_module_schema_is_refused(
 async def test_fresh_migration_runs_before_sidecar_schema_initialization() -> None:
     async with _isolated_database("fresh_llm_migration") as database:
         await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
-        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION, BOT_PURGE_MIGRATION))
 
         settings = _settings()
         connection = await aiomysql.connect(
@@ -438,7 +453,10 @@ async def test_fresh_migration_runs_before_sidecar_schema_initialization() -> No
         finally:
             connection.close()
 
-        assert tables == set(schema.REQUIRED_MODULE_TABLES[:2]) | set(schema.SIDECAR_OWNED_TABLES)
+        assert tables == (
+            set(schema.REQUIRED_MODULE_TABLES) - {"playerbot_social_runtime_control"}
+            | set(schema.SIDECAR_OWNED_TABLES)
+        )
 
 
 async def test_full_legacy_migration_preserves_every_provider_table_and_row() -> None:
@@ -522,7 +540,7 @@ async def test_unrecognized_partial_table_layout_is_refused_before_ddl(mutation:
 async def test_sidecar_refuses_a_mixed_schema_before_creating_neutral_tables() -> None:
     async with _isolated_database("mixed_sidecar_start") as database:
         await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
-        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION, BOT_PURGE_MIGRATION))
         legacy_lock_statement = schema.SCHEMA_STATEMENTS[0].replace("playerbot_llm_", "playerbot_claude_")
         await _execute_statements(database, (legacy_lock_statement,))
         before = await _provider_table_snapshot(database)
@@ -567,7 +585,7 @@ async def test_migration_refuses_malformed_legacy_table_shapes_before_ddl(case: 
 async def test_sidecar_refuses_malformed_neutral_table_shapes(case: str, mutation: str) -> None:
     async with _isolated_database(f"malformed_{case}") as database:
         await _apply_revisions(database, LEGACY_SOCIAL_REVISIONS)
-        await _apply_revisions(database, (LLM_TABLE_MIGRATION,))
+        await _apply_revisions(database, (LLM_TABLE_MIGRATION, BOT_PURGE_MIGRATION))
 
         settings = _settings()
         connection = await aiomysql.connect(
@@ -586,6 +604,138 @@ async def test_sidecar_refuses_malformed_neutral_table_shapes(case: str, mutatio
                 await schema.ensure_schema(connection)
         finally:
             connection.close()
+
+
+async def test_purge_pending_bot_data_deletes_only_queued_bot_rows_and_acknowledges() -> None:
+    async with _isolated_database("bot_purge_scope") as database:
+        await _apply_revisions(database, tuple(SQL_REVISIONS))
+        state, pool = await state_module.open_state(
+            _settings_for(database), ceiling_nano=CEILING, reserve_ratio=QUARTER
+        )
+        try:
+            async with pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    for bot_guid, bot_name in ((42, "Target"), (73, "Survivor")):
+                        await cursor.execute(
+                            "INSERT INTO playerbot_llm_profile "
+                            "(bot_guid, profile_version, crafting_affinity, gathering_affinity, "
+                            "exploration_affinity, sociability, voice, bot_name, updated_at) "
+                            "VALUES (%s, 3, 1, 2, 3, 4, 'warm', %s, %s)",
+                            (bot_guid, bot_name, NOW),
+                        )
+                        await cursor.execute(
+                            "INSERT INTO playerbot_llm_conversation_turn "
+                            "(bot_guid, role, content, created_at) VALUES (%s, 'assistant', %s, %s)",
+                            (bot_guid, f"turn for {bot_name}", NOW),
+                        )
+                        await cursor.execute(
+                            "INSERT INTO playerbot_llm_career_decision "
+                            "(bot_guid, career_version, candidate_token, spending_style, updated_at) "
+                            "VALUES (%s, 2, 'blacksmithing', 'careful', %s)",
+                            (bot_guid, NOW),
+                        )
+
+                    await cursor.execute("INSERT INTO playerbot_llm_lock (lock_key) VALUES ('fixture-lock')")
+                    await cursor.execute(
+                        "INSERT INTO playerbot_llm_ambient_attempt (created_at) VALUES (%s)", (NOW,)
+                    )
+                    await cursor.execute("INSERT INTO playerbot_llm_bot_purge (bot_guid) VALUES (%s)", (42,))
+                await connection.commit()
+
+            assert await state.purge_pending_bot_data() == 1
+            assert await state.purge_pending_bot_data() == 0
+
+            async with pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    remaining: dict[str, list[int]] = {}
+                    for table in (
+                        "playerbot_llm_profile",
+                        "playerbot_llm_conversation_turn",
+                        "playerbot_llm_career_decision",
+                    ):
+                        await cursor.execute(f"SELECT bot_guid FROM `{table}` ORDER BY bot_guid")  # noqa: S608
+                        remaining[table] = [int(row[0]) for row in await cursor.fetchall()]
+
+                    await cursor.execute(
+                        "SELECT COUNT(*), COUNT(acknowledged_at) FROM playerbot_llm_bot_purge"
+                    )
+                    purge_count, acknowledged_count = (int(value) for value in await cursor.fetchone())
+                    await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_lock")
+                    lock_count = int((await cursor.fetchone())[0])
+                    await cursor.execute("SELECT COUNT(*) FROM playerbot_llm_ambient_attempt")
+                    ambient_count = int((await cursor.fetchone())[0])
+
+            assert remaining == {
+                "playerbot_llm_profile": [73],
+                "playerbot_llm_conversation_turn": [73],
+                "playerbot_llm_career_decision": [73],
+            }
+            assert purge_count == 1
+            assert acknowledged_count == 1
+            assert lock_count >= 1
+            assert ambient_count == 1
+        finally:
+            await state_module.close_pool(pool)
+
+
+async def test_purge_pending_bot_data_rolls_back_and_retains_the_intent() -> None:
+    async with _isolated_database("bot_purge_rollback") as database:
+        await _apply_revisions(database, tuple(SQL_REVISIONS))
+        state, pool = await state_module.open_state(
+            _settings_for(database), ceiling_nano=CEILING, reserve_ratio=QUARTER
+        )
+        try:
+            async with pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "INSERT INTO playerbot_llm_profile "
+                        "(bot_guid, profile_version, crafting_affinity, gathering_affinity, "
+                        "exploration_affinity, sociability, voice, bot_name, updated_at) "
+                        "VALUES (42, 3, 1, 2, 3, 4, 'warm', 'Target', %s)",
+                        (NOW,),
+                    )
+                    await cursor.execute(
+                        "INSERT INTO playerbot_llm_conversation_turn "
+                        "(bot_guid, role, content, created_at) "
+                        "VALUES (42, 'assistant', 'must survive rollback', %s)",
+                        (NOW,),
+                    )
+                    await cursor.execute(
+                        "INSERT INTO playerbot_llm_career_decision "
+                        "(bot_guid, career_version, candidate_token, spending_style, updated_at) "
+                        "VALUES (42, 2, 'blacksmithing', 'careful', %s)",
+                        (NOW,),
+                    )
+                    await cursor.execute("INSERT INTO playerbot_llm_bot_purge (bot_guid) VALUES (42)")
+                    await cursor.execute(
+                        "CREATE TRIGGER refuse_career_purge BEFORE DELETE ON playerbot_llm_career_decision "
+                        "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'forced purge failure'"
+                    )
+                await connection.commit()
+
+            with pytest.raises(OperationalError, match="forced purge failure"):
+                await state.purge_pending_bot_data()
+
+            async with pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    counts: dict[str, int] = {}
+                    for table in (
+                        "playerbot_llm_profile",
+                        "playerbot_llm_conversation_turn",
+                        "playerbot_llm_career_decision",
+                        "playerbot_llm_bot_purge",
+                    ):
+                        await cursor.execute(f"SELECT COUNT(*) FROM `{table}`")  # noqa: S608
+                        counts[table] = int((await cursor.fetchone())[0])
+                    await cursor.execute(
+                        "SELECT acknowledged_at IS NULL FROM playerbot_llm_bot_purge WHERE bot_guid = 42"
+                    )
+                    intent_is_pending = bool((await cursor.fetchone())[0])
+
+            assert set(counts.values()) == {1}
+            assert intent_is_pending
+        finally:
+            await state_module.close_pool(pool)
 
 
 async def test_admission_and_settlement_write_the_deployed_columns(clean_ledger) -> None:

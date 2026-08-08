@@ -200,15 +200,18 @@ The sidecar keeps its state in the shared `acore_playerbots` database. It create
 | `playerbot_llm_career_decision` | The current validated career decision per bot |
 | `playerbot_llm_lock` | Named serialization points, from a bounded key set |
 
-Three more tables it writes to belong to mod-playerbots and are created by that module's SQL revisions, not by the sidecar:
+Four more tables it writes to belong to mod-playerbots and are created by that module's SQL revisions, not by the sidecar:
 
 | Table | Holds |
 | --- | --- |
 | `playerbot_llm_daily_budget` | One row per UTC day: the reserved and spent decimal totals |
 | `playerbot_llm_budget_reservation` | One row per attempt, with its request kind, model, maximum, and settled cost |
 | `playerbot_social_runtime_control` | The operator controls, including the budget circuit breaker |
+| `playerbot_llm_bot_purge` | Durable cleanup intents and acknowledgements for deleted random bot GUIDs |
 
-The sidecar refuses to start when those three are missing, naming them, rather than creating its own version. Apply `modules/mod-playerbots/data/sql/playerbots/updates` to the Playerbots database first.
+The sidecar refuses to start when those four are missing, naming them, rather than creating its own version. Apply `modules/mod-playerbots/data/sql/playerbots/updates` to the Playerbots database first.
+
+`AiPlayerbot.DeleteRandomBotAccounts` commits one purge intent for every GUID in its confirmed cohort before it deletes any character or account. Physical sidecar cleanup can happen later, including after sidecar downtime. The sidecar deletes only matching rows from `playerbot_llm_profile`, `playerbot_llm_conversation_turn`, and `playerbot_llm_career_decision`, then timestamps the acknowledgement in the same transaction. The keyed acknowledgement remains so concurrent consumption cannot make the worldserver mistake a completed intent for a failed publication. Reusing a GUID resets that row to pending. Budget state, runtime controls, named locks, ambient rate attempts, and rows for other bots remain unchanged.
 
 The conversation turns are the only table holding player text. No secrets are ever stored, and nothing here records account names, IP addresses, or positions.
 
