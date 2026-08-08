@@ -12,7 +12,7 @@ Verify before building:
 test "$(cat modules/mod-playerbot-llm/PLAYERBOTS_REVISION)" = "$(git -C modules/mod-playerbots rev-parse HEAD)"
 ```
 
-The module consumes the versioned personality contract (`PLAYERBOT_PERSONALITY_API_VERSION == 2`) from mod-playerbots. Configuration fails with a clear error when mod-playerbots is missing, and compilation fails when the personality API version changes.
+The module consumes the versioned personality contract (`PLAYERBOT_PERSONALITY_API_VERSION == 4`) from mod-playerbots. Configuration fails with a clear error when mod-playerbots is missing, and compilation fails when the personality API version changes.
 
 Requirements:
 
@@ -130,7 +130,7 @@ Replies are one short line (at most 240 bytes), in the bot's fixed voice. If any
 
 ## Personality and career behavior
 
-Bots reuse the deterministic personality profiles defined by mod-playerbots (see its `docs/personality.md`). Version 2 provides independent crafting, gathering, exploration, and sociability scores from 0 to 100, plus one of five voices.
+Bots reuse the persistent personality profiles defined by mod-playerbots (see its `docs/personality.md`). Version 4 provides independent crafting, gathering, economy, exploration, sociability, and roleplay affinities, plus a stable fictional identity and one of five voices. Economy affinity stays inside mod-playerbots and does not grant this module economy authority.
 
 When playerbot code needs a new career plan, this module may submit one request containing only opaque legal candidate tokens, short candidate categories, maximum spending styles, market eligibility, and engagement. The model chooses one token and a permitted style. It cannot invent a profession, recipe, spell, destination, price, or runtime action. Playerbot code validates the correlation, versions, token, and style before persistence. Disabled, unavailable, invalid, or late responses use the same deterministic fallback as a server without this module.
 

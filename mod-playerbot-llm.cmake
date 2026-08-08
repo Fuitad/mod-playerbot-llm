@@ -3,7 +3,7 @@
 #
 # The module is compiled only against the private mod-playerbots personality contract.
 # Configuration fails fast with a clear message when that module is absent, and the
-# loader enforces PLAYERBOT_PERSONALITY_API_VERSION == 1 at compile time.
+# loader enforces PLAYERBOT_PERSONALITY_API_VERSION == 4 at compile time.
 
 set(PLAYERBOT_LLM_PERSONALITY_HEADER
   "${CMAKE_SOURCE_DIR}/modules/mod-playerbots/src/Bot/Personality/PlayerbotPersonality.h")
