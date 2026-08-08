@@ -240,17 +240,25 @@ async def open_state(
         pool_recycle=POOL_RECYCLE_SECONDS,
     )
 
-    book = ledger.BudgetLedger(ceiling_nano, reserve_ratio)
-    store = store_module.SidecarStore()
+    initialized = False
+    try:
+        book = ledger.BudgetLedger(ceiling_nano, reserve_ratio)
+        store = store_module.SidecarStore()
 
-    async with pool.acquire() as connection:
-        await schema.ensure_schema(connection)
-        # ensure_schema runs DDL, which MySQL commits implicitly, but the connection is
-        # still handed back to a pool that discards anything with an open transaction.
-        if connection.get_transaction_status():
-            await connection.rollback()
+        async with pool.acquire() as connection:
+            await schema.ensure_schema(connection)
+            # ensure_schema runs DDL, which MySQL commits implicitly, but the connection is
+            # still handed back to a pool that discards anything with an open transaction.
+            if connection.get_transaction_status():
+                await connection.rollback()
 
-    return MySqlSidecarState(pool, book, store), pool
+        state = MySqlSidecarState(pool, book, store)
+        initialized = True
+        return state, pool
+    finally:
+        if not initialized:
+            pool.close()
+            await pool.wait_closed()
 
 
 async def close_pool(pool: aiomysql.Pool) -> None:

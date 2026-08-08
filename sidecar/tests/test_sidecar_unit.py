@@ -22,7 +22,7 @@ import pytest
 from fakes import FakeState
 from pydantic import ValidationError
 
-from playerbot_llm import app, budget, generation, ledger, protocol, provider
+from playerbot_llm import app, budget, generation, ledger, protocol, provider, state
 from playerbot_llm.providers import anthropic as anthropic_provider
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
@@ -2123,6 +2123,74 @@ def test_a_bad_request_token_is_reported_as_a_schema_violation() -> None:
 
 
 # The deployed Playerbots database settings ----------------------------------------
+
+
+@pytest.mark.parametrize("failure_stage", ("schema_preflight", "state_construction"))
+async def test_open_state_closes_its_pool_when_initialization_fails(monkeypatch, failure_stage: str) -> None:
+    class Connection:
+        def get_transaction_status(self) -> bool:
+            return False
+
+    class PoolAcquire:
+        async def __aenter__(self) -> Connection:
+            return Connection()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FailingPool:
+        def __init__(self) -> None:
+            self.closed = False
+            self.waited = False
+
+        def acquire(self) -> PoolAcquire:
+            return PoolAcquire()
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.waited = True
+
+    pool = FailingPool()
+
+    async def create_pool(**_kwargs: object) -> FailingPool:
+        return pool
+
+    async def check_schema(_connection: object) -> None:
+        if failure_stage == "schema_preflight":
+            raise state.schema.LedgerError("module schema is missing")
+
+    monkeypatch.setattr(state.aiomysql, "create_pool", create_pool)
+    monkeypatch.setattr(state.schema, "ensure_schema", check_schema)
+
+    expected_error: type[BaseException]
+    expected_message: str
+    if failure_stage == "schema_preflight":
+        expected_error = state.schema.LedgerError
+        expected_message = "module schema is missing"
+    else:
+        expected_error = RuntimeError
+        expected_message = "state construction failed"
+
+        def refuse_state(*_args: object) -> None:
+            raise RuntimeError(expected_message)
+
+        monkeypatch.setattr(state, "MySqlSidecarState", refuse_state)
+
+    settings = app.PlayerbotsDatabaseSettings(
+        host="127.0.0.1",
+        port=3306,
+        user="acore",
+        password="secret",
+        database="acore_playerbots",
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        await state.open_state(settings, ceiling_nano=1, reserve_ratio=Decimal("0.25"))
+
+    assert pool.closed is True
+    assert pool.waited is True
 
 
 def test_playerbots_database_info_is_parsed_from_the_deployed_value() -> None:
