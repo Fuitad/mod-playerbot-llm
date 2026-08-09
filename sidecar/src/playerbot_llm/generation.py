@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection
 from enum import StrEnum
 from typing import Literal, TypedDict, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from playerbot_llm import protocol, provider
 
@@ -94,11 +93,18 @@ class ModerationCategory(StrEnum):
     TARGETED_REPETITION = "targeted_repetition"
     QUOTED_THREAD = "quoted_thread"
     CARRIED_SECRET = "carried_secret"  # noqa: S105 - a category name, not a credential
-    BOTH_ANSWERS = "both_answers"
     UNKNOWN_EMOTE = "unknown_emote"
     EMOTE_CHANNEL_ILLEGAL = "emote_channel_illegal"
     UNKNOWN_SUBJECT = "unknown_subject"
     SCOPE_MISMATCH = "scope_mismatch"
+    UNKNOWN_EVIDENCE = "unknown_evidence"
+    EVIDENCE_SUBJECT_MISMATCH = "evidence_subject_mismatch"
+    SUPPLIED_FACT_QUESTION = "supplied_fact_question"
+    GENERIC_FILLER = "generic_filler"
+    ADOPTED_ACCOMPLISHMENT = "adopted_accomplishment"
+    UNCITED_CURRENT_CLAIM = "uncited_current_claim"
+    CONTRADICTED_EVIDENCE = "contradicted_evidence"
+    UNAVAILABLE_CONTENT = "unavailable_content"
 
 
 class ChatReply(BaseModel):
@@ -119,7 +125,7 @@ class CareerReply(BaseModel):
 
 
 class SocialReply(BaseModel):
-    """Structured output schema for one social answer: a line, or a gesture.
+    """A cited social proposal: one line, one gesture, or deliberate silence.
 
     There is deliberately no safety or confidence field for the model to self-report. A
     label the model supplies is not evidence, and Key Decision 6 requires that deterministic
@@ -130,6 +136,7 @@ class SocialReply(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    response_kind: Literal["message", "emote", "silence"]
     message: str = ""
     emote: Literal[
         "",
@@ -149,6 +156,36 @@ class SocialReply(BaseModel):
         "wave",
         "ponder",
     ] = ""
+    contribution: Literal["answer", "specific_reaction", "fact_free_banter", "gesture", "none"]
+    claim_subject: Literal["candidate_bot", "participant", "none"]
+    cited_evidence_ids: list[str]
+
+    @model_validator(mode="after")
+    def _one_coherent_answer(self) -> SocialReply:
+        if len(self.cited_evidence_ids) > protocol.MAX_SOCIAL_EVIDENCE_ENTRIES:
+            raise ValueError("too many cited evidence ids")
+        if len(set(self.cited_evidence_ids)) != len(self.cited_evidence_ids):
+            raise ValueError("cited evidence ids must be unique")
+
+        if self.response_kind == "message":
+            if not self.message.strip() or self.emote:
+                raise ValueError("message response carries exactly one line")
+            if self.contribution in {"gesture", "none"}:
+                raise ValueError("message response requires a conversational contribution")
+            return self
+
+        if self.response_kind == "emote":
+            if self.message.strip() or not self.emote or self.contribution != "gesture":
+                raise ValueError("emote response carries exactly one gesture")
+            if self.claim_subject != "none" or self.cited_evidence_ids:
+                raise ValueError("a gesture makes no factual claim")
+            return self
+
+        if self.message.strip() or self.emote or self.contribution != "none":
+            raise ValueError("silence carries no generated content")
+        if self.claim_subject != "none" or self.cited_evidence_ids:
+            raise ValueError("silence cites nothing")
+        return self
 
 
 def build_social_system_prompt(request: protocol.SocialRequest) -> str:
@@ -170,9 +207,9 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
     if request.speak_on_channel in SOCIAL_EMOTE_CHANNELS:
         gestures = ", ".join(sorted(SOCIAL_EMOTES))
         answer_rule = (
-            "- Answer in ONE of two ways, never both. Either `message` with exactly one short "
+            "- Answer in ONE of three ways. Use `message` with exactly one short "
             "natural chat line of plain text, at most 200 characters, or `emote` with exactly one "
-            f"of these gestures: {gestures}. Leave the other field empty.\n"
+            f"of these gestures: {gestures}, or deliberate `silence` with both fields empty.\n"
             "- Prefer a line. A gesture is for when a word would add nothing.\n"
         )
     else:
@@ -181,7 +218,8 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         # generation and teaches the model nothing.
         answer_rule = (
             "- Reply with exactly one short natural chat line of plain text, at most 200 "
-            "characters, in `message`. Leave `emote` empty.\n"
+            "characters, in `message`, or choose deliberate `silence` with both fields empty. "
+            "Leave `emote` empty on this channel.\n"
         )
 
     context = protocol.parse_social_context(request.context)
@@ -283,6 +321,15 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         f"{premise}"
         "Rules:\n"
         f"{answer_rule}"
+        "- Set response_kind to message, emote, or silence. Silence is a complete answer when "
+        "nothing specific and useful follows from the current subject.\n"
+        "- Set contribution to answer, specific_reaction, fact_free_banter, gesture, or none. "
+        "Use none only with silence and gesture only with an emote.\n"
+        "- Cite only request evidence identifiers in cited_evidence_ids. Set claim_subject to "
+        "candidate_bot for claims about yourself, participant for claims about the triggering "
+        "participant, or none for fact-free banter. Never cite a fact owned by another subject.\n"
+        "- A current fact or accomplishment requires a compatible cited evidence id. Evidence "
+        "belongs only to the subject and privacy scope written on it.\n"
         f"{identity_rules}"
         f"{voice_rules}"
         f"- Every gameplay claim about you must be possible for a level {request.bot_level} "
@@ -355,6 +402,8 @@ def build_social_user_message(request: protocol.SocialRequest) -> str:
     """
 
     lines = ["Answer naturally as the player described below, using only what follows as background.", ""]
+    evidence = [entry.model_dump(mode="json") for entry in request.evidence]
+    lines += _fenced("EVIDENCE", json.dumps(evidence, ensure_ascii=False, separators=(",", ":")))
 
     context = protocol.parse_social_context(request.context)
     if context is None:
@@ -631,6 +680,182 @@ def validate_social_message(
         )
 
     return message
+
+
+_SUPPLIED_FACT_QUESTION_PATTERNS: dict[str, tuple[str, ...]] = {
+    "level": (r"\bwhat level\b", r"\blevel are (?:you|they)\b"),
+    "race": (r"\bwhat race\b",),
+    "character_class": (r"\bwhat class\b", r"\bwhat kind of class\b"),
+    "zone": (r"\bwhat zone\b", r"\bwhere are (?:you|they)\b"),
+    "area": (r"\bwhat area\b", r"\bwhere are (?:you|they)\b"),
+    "target": (r"\bwhat are (?:you|they) (?:fighting|targeting)\b",),
+    "group_relation": (r"\bare (?:you|we|they) in (?:the same|a) (?:party|group)\b",),
+    "guild_relation": (r"\bare (?:you|we|they) in the same guild\b",),
+}
+
+_GENERIC_FILLER = re.compile(
+    r"^(?:(?:hey|wow),?\s+)?(?:congrats|congratulations|nice|good job|well done)[!. ]*$",
+    re.IGNORECASE,
+)
+_ADOPTED_ACCOMPLISHMENT = re.compile(
+    r"\b(?:i|we)(?:'ve| have)?\s+(?:cleared|completed|finished|killed|looted|earned|unlocked|beat)\b",
+    re.IGNORECASE,
+)
+_CURRENT_CLAIM = re.compile(
+    r"\b(?:(?:i am|i'm|we are)\s+"
+    r"(?:farming|fighting|targeting|carrying|wearing|grouped|in\b|level\b|a level\b)|"
+    r"(?:i have|i've|we've)\s+(?:completed|cleared|finished|killed|looted|equipped|unlocked|got\b)|"
+    r"my (?:gear|quest|item|target|group|guild)\b)",
+    re.IGNORECASE,
+)
+_LEVEL_CLAIM = re.compile(
+    r"\b(?P<speaker>i(?: am|'m)|you(?: are|'re))\s+(?:a\s+)?level\s+(?P<value>\d{1,3})\b",
+    re.IGNORECASE,
+)
+_LOCATION_CLAIM = re.compile(
+    r"\b(?P<speaker>i(?: am|'m)|you(?: are|'re))\s+in\s+"
+    r"(?P<value>[a-z][a-z' -]{1,63})(?:[.!?]|$)",
+    re.IGNORECASE,
+)
+
+
+def _literal_claim_refusal(
+    message: str,
+    claim_subject: str,
+    cited: list[protocol.SocialEvidence],
+) -> ModerationCategory | None:
+    expected_speaker = "i" if claim_subject == "candidate_bot" else "you"
+
+    level = _LEVEL_CLAIM.search(message)
+    if level is not None and level.group("speaker").casefold().startswith(expected_speaker):
+        evidence = [entry.value for entry in cited if entry.fact == "level"]
+        if not evidence:
+            return ModerationCategory.UNCITED_CURRENT_CLAIM
+        if level.group("value") not in evidence:
+            return ModerationCategory.CONTRADICTED_EVIDENCE
+
+    location = _LOCATION_CLAIM.search(message)
+    if location is not None and location.group("speaker").casefold().startswith(expected_speaker):
+        evidence = [entry.value.casefold() for entry in cited if entry.fact in {"zone", "area"}]
+        if not evidence:
+            return ModerationCategory.UNCITED_CURRENT_CLAIM
+        if location.group("value").strip().casefold() not in evidence:
+            return ModerationCategory.CONTRADICTED_EVIDENCE
+
+    return None
+
+
+def validate_social_reply(
+    reply: SocialReply,
+    request: protocol.SocialRequest,
+    usage: provider.GenerationUsage | None = None,
+) -> tuple[str, int]:
+    """Validate citations, perspective, scope, and the proposal's observable content."""
+
+    if reply.response_kind == "silence":
+        return "", 0
+
+    evidence_by_id = {entry.id: entry for entry in request.evidence}
+    try:
+        cited = [evidence_by_id[evidence_id] for evidence_id in reply.cited_evidence_ids]
+    except KeyError as error:
+        raise provider.GenerationInvalidOutputError(
+            f"social reply cited unknown evidence {error.args[0]!r}",
+            usage,
+            ModerationCategory.UNKNOWN_EVIDENCE,
+        ) from error
+
+    if reply.contribution == "answer" and not cited:
+        raise provider.GenerationInvalidOutputError(
+            "social answer cited no grounding evidence",
+            usage,
+            ModerationCategory.UNCITED_CURRENT_CLAIM,
+        )
+    if reply.contribution == "fact_free_banter" and (reply.claim_subject != "none" or cited):
+        raise provider.GenerationInvalidOutputError(
+            "fact free social banter carried a factual claim",
+            usage,
+            ModerationCategory.EVIDENCE_SUBJECT_MISMATCH,
+        )
+
+    compatible_subjects = {
+        "candidate_bot": {"candidate_bot", "source"},
+        "participant": {"participant"},
+        "none": set(),
+    }[reply.claim_subject]
+    if any(entry.subject not in compatible_subjects for entry in cited):
+        raise provider.GenerationInvalidOutputError(
+            "social reply cited evidence owned by another subject",
+            usage,
+            ModerationCategory.EVIDENCE_SUBJECT_MISMATCH,
+        )
+    if reply.claim_subject == "none" and cited:
+        raise provider.GenerationInvalidOutputError(
+            "fact free social reply cited factual evidence",
+            usage,
+            ModerationCategory.EVIDENCE_SUBJECT_MISMATCH,
+        )
+
+    if reply.response_kind == "emote":
+        return "", validate_social_emote(reply.emote, request, usage)
+
+    message = validate_social_message(reply.message, request, usage)
+    lowered = message.casefold()
+
+    supplied_facts = {entry.fact for entry in request.evidence}
+    if message.rstrip().endswith("?"):
+        for fact, patterns in _SUPPLIED_FACT_QUESTION_PATTERNS.items():
+            if fact in supplied_facts and any(re.search(pattern, lowered) for pattern in patterns):
+                raise provider.GenerationInvalidOutputError(
+                    f"social reply asked for supplied {fact} evidence",
+                    usage,
+                    ModerationCategory.SUPPLIED_FACT_QUESTION,
+                )
+
+    if _GENERIC_FILLER.fullmatch(message):
+        raise provider.GenerationInvalidOutputError(
+            "social reply was generic filler",
+            usage,
+            ModerationCategory.GENERIC_FILLER,
+        )
+
+    literal_refusal = _literal_claim_refusal(message, reply.claim_subject, cited)
+    if literal_refusal is not None:
+        raise provider.GenerationInvalidOutputError(
+            "social reply contradicted or failed to cite a literal current claim",
+            usage,
+            literal_refusal,
+        )
+
+    if _ADOPTED_ACCOMPLISHMENT.search(message) and not any(
+        entry.subject in {"candidate_bot", "source"} for entry in cited
+    ):
+        raise provider.GenerationInvalidOutputError(
+            "social reply adopted another participant's accomplishment",
+            usage,
+            ModerationCategory.ADOPTED_ACCOMPLISHMENT,
+        )
+
+    unavailable = {
+        0: ("outland", "northrend", "blood elf", "draenei", "death knight", "lich king"),
+        1: ("northrend", "death knight", "lich king"),
+        2: (),
+    }[request.active_content_expansion]
+    if any(term in lowered for term in unavailable):
+        raise provider.GenerationInvalidOutputError(
+            "social reply named unavailable progression content",
+            usage,
+            ModerationCategory.UNAVAILABLE_CONTENT,
+        )
+
+    if (_CURRENT_CLAIM.search(message) or reply.claim_subject != "none") and not cited:
+        raise provider.GenerationInvalidOutputError(
+            "social reply made an uncited current claim",
+            usage,
+            ModerationCategory.UNCITED_CURRENT_CLAIM,
+        )
+
+    return message, 0
 
 
 """Terms that mark a generated player profile as a fabricated status claim.
@@ -983,6 +1208,8 @@ def build_memory_system_prompt(request: protocol.MemoryRequest) -> str:
         "- Write each memory as a short paraphrase in your own words. Never reproduce a line as "
         "it was said.\n"
         "- about_guid must be one of the guids listed above, and nothing else.\n"
+        "- source_event_id must be the exact event id beside the one line that supports the memory. "
+        "That line's speaker_guid must equal about_guid.\n"
         f'- scope must be exactly "{request.scope}".\n'
         "- Record only what a character said about themselves or their doings in the game. Never "
         "record a real world detail: no names, contact details, locations, or credentials.\n"
@@ -994,7 +1221,12 @@ def build_memory_system_prompt(request: protocol.MemoryRequest) -> str:
 def build_memory_user_message(request: protocol.MemoryRequest) -> str:
     """The conversation, fenced and neutralised like every other untrusted body."""
 
-    return "\n".join(_fenced("THREAD", "\n".join(request.thread))).rstrip()
+    rendered = "\n".join(
+        f"{line.source_event_id} | speaker_guid={line.speaker_guid} | {line.speaker_name}: "
+        f"{_neutralised(line.text)}"
+        for line in request.thread
+    )
+    return "\n".join(_fenced("THREAD", rendered)).rstrip()
 
 
 def _memory_messages(request: protocol.MemoryRequest) -> list[MessageParam]:
@@ -1070,6 +1302,7 @@ class MemoryCandidate(BaseModel):
     paraphrase: str
     about_guid: int
     scope: Literal["public", "party", "whisper"]
+    source_event_id: str
 
 
 class MemoryReply(BaseModel):
@@ -1080,9 +1313,7 @@ class MemoryReply(BaseModel):
 
 def validate_memory_reply(
     reply: MemoryReply,
-    thread: list[str],
-    subjects: Collection[int],
-    scope: str,
+    request: protocol.MemoryRequest,
     usage: provider.GenerationUsage | None = None,
 ) -> list[dict[str, object]]:
     """Accepts paraphrases drawn from this thread, about these people, at this privacy.
@@ -1095,8 +1326,9 @@ def validate_memory_reply(
     that got either wrong was not describing the conversation it was given.
     """
 
-    normalized = [_normalized(line) for line in thread]
-    allowed = set(subjects)
+    normalized = [_normalized(f"{line.speaker_name}: {line.text}") for line in request.thread]
+    allowed = set(request.subject_guids)
+    sources = {line.source_event_id: line for line in request.thread}
     accepted: list[dict[str, object]] = []
 
     for candidate in reply.candidates:
@@ -1115,11 +1347,19 @@ def validate_memory_reply(
         # repeated in zone General, so one mislabel turns something said among four people into
         # something a bot announces to a zone. The narrower direction is merely wrong, and is
         # refused too rather than accepting a field that is never useful.
-        if candidate.scope != scope:
+        if candidate.scope != request.scope:
             raise provider.GenerationInvalidOutputError(
                 "memory candidate relabels the privacy it was learned under",
                 usage,
                 ModerationCategory.SCOPE_MISMATCH,
+            )
+
+        source = sources.get(candidate.source_event_id)
+        if source is None or source.speaker_guid != candidate.about_guid:
+            raise provider.GenerationInvalidOutputError(
+                "memory candidate cites no eligible source for its subject",
+                usage,
+                ModerationCategory.UNKNOWN_EVIDENCE,
             )
 
         text = candidate.paraphrase.strip()

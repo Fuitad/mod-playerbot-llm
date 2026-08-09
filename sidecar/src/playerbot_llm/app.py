@@ -801,7 +801,7 @@ class SidecarService:
 
             try:
                 provider_started_at = time.monotonic_ns()
-                reply, emote_id, usage = await asyncio.to_thread(self._adapter.generate_social_reply, request)
+                generated = await asyncio.to_thread(self._adapter.generate_social_reply, request)
                 provider_latency_ms = (time.monotonic_ns() - provider_started_at) // 1_000_000
             except provider.GenerationInvalidOutputError as error:
                 # Generated, billed, and refused by the gate. The money is settled from the
@@ -824,7 +824,7 @@ class SidecarService:
 
             settled_at = self._now()
             try:
-                actual_cost_nano = _actual_cost_nano(usage, input_prices)
+                actual_cost_nano = _actual_cost_nano(generated.usage, input_prices)
             except ValueError as error:
                 _log(f"social {token}: cannot price the completion: {error}")
                 return None
@@ -850,10 +850,10 @@ class SidecarService:
                 metadata = protocol.SocialCallMetadata(
                     model=self._adapter.metadata.model,
                     provider_latency_ms=provider_latency_ms,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cache_creation_input_tokens=usage.cache_creation_input_tokens,
-                    cache_read_input_tokens=usage.cache_read_input_tokens,
+                    input_tokens=generated.usage.input_tokens,
+                    output_tokens=generated.usage.output_tokens,
+                    cache_creation_input_tokens=generated.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens=generated.usage.cache_read_input_tokens,
                     cost_usd=budget.nano_to_fixed_usd_string(settlement.stored_cost_nano),
                 )
             except ValueError:
@@ -864,10 +864,13 @@ class SidecarService:
             social_request_token=token,
             bot_guid=request.bot_guid,
             speak_on_channel=request.speak_on_channel,
-            message=reply,
+            message=generated.message,
             token=self._token,
-            emote_id=emote_id,
+            emote_id=generated.emote_id,
             metadata=metadata,
+            contribution=generated.contribution,
+            claim_subject=generated.claim_subject,
+            cited_evidence_ids=generated.cited_evidence_ids,
         )
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:

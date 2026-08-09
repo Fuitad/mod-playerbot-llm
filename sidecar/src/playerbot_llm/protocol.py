@@ -25,8 +25,8 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 5
-SOCIAL_SCHEMA_VERSION = 6
+SCHEMA_VERSION = 6
+SOCIAL_SCHEMA_VERSION = 7
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -35,6 +35,9 @@ MAX_ACTOR_NAME_BYTES = 48
 MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024
 MAX_THREAD_ID_BYTES = 64
 MAX_SOCIAL_MODEL_BYTES = 64
+MAX_SOCIAL_EVIDENCE_ENTRIES = 24
+MAX_SOCIAL_EVIDENCE_VALUE_BYTES = 128
+MAX_SOCIAL_EVIDENCE_ENVELOPE_BYTES = 2 * 1024
 MAX_CAREER_TOKEN_BYTES = 64
 MAX_CAREER_SUMMARY_BYTES = 160
 MIN_BRIDGE_TOKEN_BYTES = 32
@@ -151,6 +154,39 @@ SOCIAL_MEMORY_SCOPES = ("public", "party", "whisper")
 # anyone nearby, so they get public only; party may use what the party knows; a whisper is
 # already the most private thing there is.
 SOCIAL_CHANNEL_MEMORY_SCOPE = (0, 0, 1, 2)
+
+SocialEvidenceSubject = Literal["candidate_bot", "participant", "source"]
+SocialEvidenceFact = Literal[
+    "name",
+    "race",
+    "character_class",
+    "level",
+    "faction",
+    "zone",
+    "area",
+    "group_relation",
+    "guild_relation",
+    "combat_state",
+    "target",
+    "visibility",
+    "proximity",
+    "progression",
+    "quest",
+    "item",
+    "creature",
+    "objective",
+    "achievement",
+]
+SocialEvidenceProvenance = Literal["current_world", "human_observation", "authoritative_source"]
+SocialEvidenceScope = Literal["public", "party", "whisper"]
+SocialProfileLoadState = Literal[
+    "pending",
+    "loaded",
+    "absent_using_base",
+    "rejected_using_base",
+    "unavailable_using_base",
+]
+SocialMemoryInputState = Literal["pending", "loaded", "absent", "unavailable"]
 
 MAX_SOCIAL_CONTEXT_ENTRIES = 12
 FICTIONAL_IDENTITY_COUNTRIES = (
@@ -318,7 +354,7 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     token: str
     request_id: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     channel: Literal["whisper", "party", "world", "career", "social"]
@@ -447,6 +483,27 @@ def _object_with_unique_keys(pairs: list[tuple[str, object]]) -> dict[str, objec
     return result
 
 
+class SocialEvidence(BaseModel):
+    """One request local fact supplied by the worldserver, never by generation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    id: Annotated[str, StringConstraints(pattern=r"^g[1-9][0-9]*$")]
+    subject: SocialEvidenceSubject
+    fact: SocialEvidenceFact
+    value: Annotated[str, StringConstraints(min_length=1)]
+    provenance: SocialEvidenceProvenance
+    scope: SocialEvidenceScope
+    observed_at: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+
+    @field_validator("value")
+    @classmethod
+    def _validate_value_bytes(cls, value: str) -> str:
+        if _byte_length(value) > MAX_SOCIAL_EVIDENCE_VALUE_BYTES:
+            raise ValueError(f"evidence value must be at most {MAX_SOCIAL_EVIDENCE_VALUE_BYTES} UTF-8 bytes")
+        return value
+
+
 class SocialRequest(BaseModel):
     """One social generation asked for by the worldserver coordinator.
 
@@ -458,7 +515,7 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -473,6 +530,14 @@ class SocialRequest(BaseModel):
     speak_on_channel: Annotated[int, Field(ge=0, le=255)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
     context: str
+    evidence: Annotated[list[SocialEvidence], Field(min_length=1, max_length=MAX_SOCIAL_EVIDENCE_ENTRIES)]
+    transcript_event_ids: Annotated[
+        list[Annotated[str, StringConstraints(pattern=r"^evt_[0-9a-f]{32}$")]],
+        Field(max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
+    ]
+    profile_load_state: SocialProfileLoadState
+    memory_input_state: SocialMemoryInputState
+    active_content_expansion: Annotated[int, Field(ge=0, le=MAX_SOCIAL_ACTIVE_EXPANSION)]
 
     @field_validator("token")
     @classmethod
@@ -534,6 +599,28 @@ class SocialRequest(BaseModel):
             raise ValueError(f"context must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
 
         return value
+
+    @model_validator(mode="after")
+    def _grounding_is_coherent(self) -> Self:
+        ids = [entry.id for entry in self.evidence]
+        if len(set(ids)) != len(ids):
+            raise ValueError("evidence ids must be unique")
+
+        event_ids = self.transcript_event_ids
+        if len(set(event_ids)) != len(event_ids):
+            raise ValueError("transcript event ids must be unique")
+
+        envelope_bytes = sum(_byte_length(entry.id) + _byte_length(entry.value) for entry in self.evidence)
+        if envelope_bytes > MAX_SOCIAL_EVIDENCE_ENVELOPE_BYTES:
+            raise ValueError(
+                f"evidence envelope must be at most {MAX_SOCIAL_EVIDENCE_ENVELOPE_BYTES} UTF-8 bytes"
+            )
+
+        allowed_scope = SOCIAL_CHANNEL_MEMORY_SCOPE[self.speak_on_channel]
+        if any(SOCIAL_MEMORY_SCOPES.index(entry.scope) > allowed_scope for entry in self.evidence):
+            raise ValueError("evidence scope is more private than the output channel")
+
+        return self
 
 
 class SocialCallMetadata(BaseModel):
@@ -755,7 +842,7 @@ class RoleplayAssessmentRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     token: str
     kind: Literal["roleplay_assessment"]
     roleplay_assessment_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -931,7 +1018,7 @@ class BiographyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     token: str
     kind: Literal["biography"]
     biography_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -1025,6 +1112,9 @@ def encode_social_response(
     regenerate: bool = False,
     emote_id: int = 0,
     metadata: SocialCallMetadata | None = None,
+    contribution: str | None = None,
+    claim_subject: str | None = None,
+    cited_evidence_ids: tuple[str, ...] = (),
 ) -> bytes:
     """Builds the exact payload shape the C++ social response parser accepts.
 
@@ -1048,6 +1138,8 @@ def encode_social_response(
     if regenerate:
         if metadata is not None:
             raise ProtocolError("a social regeneration carries no call metadata")
+        if contribution is not None or claim_subject is not None or cited_evidence_ids:
+            raise ProtocolError("a social regeneration carries no proposal metadata")
         message = ""
         emote_id = 0
     elif emote_id:
@@ -1062,11 +1154,35 @@ def encode_social_response(
 
         if speak_on_channel not in SOCIAL_EMOTE_CHANNELS:
             raise ProtocolError("an emote cannot be seen on this channel")
-    else:
+    elif message:
         _validate_response_message(message)
 
     if not regenerate and metadata is None:
         raise ProtocolError("a deliverable social response requires call metadata")
+
+    if not regenerate:
+        if contribution not in {"answer", "specific_reaction", "fact_free_banter", "gesture", "none"}:
+            raise ProtocolError("a deliverable social response requires a valid contribution")
+        if claim_subject not in {"candidate_bot", "participant", "none"}:
+            raise ProtocolError("a deliverable social response requires a valid claim subject")
+        if len(cited_evidence_ids) > MAX_SOCIAL_EVIDENCE_ENTRIES or len(set(cited_evidence_ids)) != len(
+            cited_evidence_ids
+        ):
+            raise ProtocolError("social response citations are not bounded and unique")
+        if any(
+            len(identifier) < 2 or identifier[0] != "g" or not identifier[1:].isdigit()
+            for identifier in cited_evidence_ids
+        ):
+            raise ProtocolError("social response citation id is malformed")
+
+        if emote_id:
+            coherent = contribution == "gesture" and claim_subject == "none" and not cited_evidence_ids
+        elif message:
+            coherent = contribution in {"answer", "specific_reaction", "fact_free_banter"}
+        else:
+            coherent = contribution == "none" and claim_subject == "none" and not cited_evidence_ids
+        if not coherent:
+            raise ProtocolError("social response proposal metadata is incoherent")
 
     payload = {
         "schema_version": SOCIAL_SCHEMA_VERSION,
@@ -1081,6 +1197,11 @@ def encode_social_response(
     }
     if metadata is not None:
         payload.update(metadata.model_dump())
+        payload["contribution"] = contribution
+        payload["claim_subject"] = claim_subject
+        payload["citation_count"] = len(cited_evidence_ids)
+        for index, evidence_id in enumerate(cited_evidence_ids):
+            payload[f"citation_{index}"] = evidence_id
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -1170,6 +1291,49 @@ class MemorySubject(BaseModel):
         return value
 
 
+def event_public_id_is_valid(value: str) -> bool:
+    """Accepts only the opaque event identity shape minted by worldserver."""
+
+    body = value.removeprefix("evt_")
+    return len(value) == 36 and len(body) == 32 and all(symbol in "0123456789abcdef" for symbol in body)
+
+
+class MemoryLine(BaseModel):
+    """One retained line with the exact source that permits factual extraction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    speaker_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
+    speaker_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
+    text: Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]
+    source_event_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
+    source_kind: Literal["human_observation", "authoritative_source"]
+
+    @field_validator("speaker_name")
+    @classmethod
+    def _validate_speaker_name(cls, value: str) -> str:
+        if _byte_length(value) > MAX_ACTOR_NAME_BYTES:
+            raise ValueError(f"actor name must be at most {MAX_ACTOR_NAME_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        if _byte_length(value) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES:
+            raise ValueError(f"a thread line must be at most {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes")
+
+        return value
+
+    @field_validator("source_event_id")
+    @classmethod
+    def _validate_source_event_id(cls, value: str) -> str:
+        if not event_public_id_is_valid(value):
+            raise ValueError("source_event_id is not an event public id")
+
+        return value
+
+
 class MemoryRequest(BaseModel):
     """One idle conversation, offered for whatever is worth remembering about it.
 
@@ -1186,7 +1350,7 @@ class MemoryRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     token: str
     kind: Literal["memory"]
     memory_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -1199,10 +1363,7 @@ class MemoryRequest(BaseModel):
     # The same two bounds the worldserver's buffer enforces. A request past either did not come
     # from a buffer applying them, so accepting it would let one producer bug become an
     # unbounded prompt.
-    thread: Annotated[
-        list[Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]],
-        Field(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRIES),
-    ]
+    thread: Annotated[list[MemoryLine], Field(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRIES)]
 
     @field_validator("token")
     @classmethod
@@ -1230,13 +1391,10 @@ class MemoryRequest(BaseModel):
 
     @field_validator("thread")
     @classmethod
-    def _validate_thread(cls, value: list[str]) -> list[str]:
+    def _validate_thread(cls, value: list[MemoryLine]) -> list[MemoryLine]:
         # Characters versus bytes again, per entry and in total. The per entry declaration above
         # is the cheap first cut; a multibyte thread passes it and still overflows the frame.
-        if any(_byte_length(line) > MAX_SOCIAL_CONTEXT_ENTRY_BYTES for line in value):
-            raise ValueError(f"a thread line must be at most {MAX_SOCIAL_CONTEXT_ENTRY_BYTES} UTF-8 bytes")
-
-        if sum(_byte_length(line) for line in value) > MAX_SOCIAL_CONTEXT_BYTES:
+        if sum(_byte_length(line.text) for line in value) > MAX_SOCIAL_CONTEXT_BYTES:
             raise ValueError(f"the thread must be at most {MAX_SOCIAL_CONTEXT_BYTES} UTF-8 bytes")
 
         return value
@@ -1246,6 +1404,10 @@ class MemoryRequest(BaseModel):
         guids = [subject.guid for subject in self.subjects]
         if len(guids) != len(set(guids)):
             raise ValueError("memory subjects must be distinct")
+
+        source_ids = [line.source_event_id for line in self.thread]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("memory source events must be distinct")
 
         return self
 
@@ -1332,6 +1494,10 @@ def encode_memory_response(
         if candidate.get("scope") not in SOCIAL_MEMORY_SCOPES:
             raise ProtocolError("memory candidate carries an unknown scope")
 
+        source_event_id = candidate.get("source_event_id")
+        if not isinstance(source_event_id, str) or not event_public_id_is_valid(source_event_id):
+            raise ProtocolError("memory candidate cites no valid source event")
+
     # Flat, not a nested "candidates" array, for the reason encode_biography_response gives: the
     # worldserver's reader is a strict parser for ONE flat object and fails the parse on any
     # nesting at all. That narrowness is most of what makes it safe to point at a payload from the
@@ -1349,6 +1515,7 @@ def encode_memory_response(
         payload[f"memory_{index}_paraphrase"] = candidate["paraphrase"]
         payload[f"memory_{index}_about_guid"] = candidate["about_guid"]
         payload[f"memory_{index}_scope"] = candidate["scope"]
+        payload[f"memory_{index}_source_event_id"] = candidate["source_event_id"]
 
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 

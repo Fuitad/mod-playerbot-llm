@@ -291,6 +291,7 @@ namespace
             }
             request.speakOnChannel = static_cast<uint8>(channel);
             request.threadPublicId = threadPublicId;
+            request.grounding = context.grounding;
 
             /*
              * Everything the coordinator selected for this line: who the bot is, how it feels about
@@ -418,6 +419,16 @@ namespace
             request.thread.reserve(thread.size());
             for (PlayerbotSocialMemoryLine const& line : thread)
             {
+                if (line.sourceThreadPublicId != threadPublicId)
+                    return false;
+
+                bool const partyLine = line.sourceChannel == PlayerbotSocialChannel::Party;
+                bool const publicLine = line.sourceChannel == PlayerbotSocialChannel::Say ||
+                                        line.sourceChannel == PlayerbotSocialChannel::General;
+                if ((scope == PlayerbotSocialPrivacyScope::Party && !partyLine) ||
+                    (scope == PlayerbotSocialPrivacyScope::Public && !publicLine))
+                    return false;
+
                 std::string speaker = NameOfCharacter(line.speakerGuidCounter);
 
                 /*
@@ -429,7 +440,8 @@ namespace
                 if (speaker.empty())
                     speaker = "character " + std::to_string(line.speakerGuidCounter);
 
-                request.thread.push_back(speaker + ": " + line.text);
+                request.thread.push_back({line.speakerGuidCounter, std::move(speaker), line.text,
+                                          line.sourceEventPublicId, line.sourceKind});
             }
 
             if (!PlayerbotLLM::MemoryRequestIsUsable(request, _bridgeToken))
@@ -1051,7 +1063,8 @@ namespace
                 extracted.reserve(response.memories.size());
 
                 for (PlayerbotLLM::MemoryResponseCandidate const& candidate : response.memories)
-                    extracted.push_back({candidate.paraphrase, candidate.aboutGuidCounter, candidate.scope});
+                    extracted.push_back({candidate.paraphrase, candidate.aboutGuidCounter, candidate.scope,
+                                         candidate.sourceEventPublicId});
 
                 sPlayerbotSocialMgr.ApplyExtractedMemories(response.memoryRequestToken,
                                                             response.botGuidCounter, response.threadPublicId,

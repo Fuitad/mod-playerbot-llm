@@ -32,12 +32,12 @@
 namespace PlayerbotLLM
 {
     /*
-     * Bumped to 5 so every social and biography request carries the bot level and active gameplay
-     * expansion needed to prevent impossible claims. An older sidecar is rejected outright rather
-     * than partially understood.
+     * Bumped to 6 so memory extraction carries the exact eligible source event for every line and
+     * requires each returned candidate to cite one. An older sidecar is rejected outright rather
+     * than allowed to create source-free durable memory.
      */
-    inline constexpr uint32 SCHEMA_VERSION = 5;
-    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 6;
+    inline constexpr uint32 SCHEMA_VERSION = 6;
+    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 7;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -162,6 +162,7 @@ namespace PlayerbotLLM
         uint8 speakOnChannel = 0;
         std::string threadPublicId;
         std::string context;
+        PlayerbotSocialGroundingEnvelope grounding;
     };
 
     inline constexpr size_t MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024;
@@ -179,6 +180,9 @@ namespace PlayerbotLLM
      * MAX_SOCIAL_CONTEXT_ENTRIES. A longer list is refused there rather than trimmed.
      */
     inline constexpr size_t MAX_SOCIAL_CONTEXT_ENTRIES = 12;
+    inline constexpr size_t MAX_SOCIAL_EVIDENCE_ENTRIES = 24;
+    inline constexpr size_t MAX_SOCIAL_EVIDENCE_VALUE_BYTES = 128;
+    inline constexpr size_t MAX_SOCIAL_EVIDENCE_ENVELOPE_BYTES = 2 * 1024;
     inline constexpr uint8 MAX_SOCIAL_BOT_LEVEL = 80;
 
     /*
@@ -201,6 +205,12 @@ namespace PlayerbotLLM
                   "the per entry bound must match the producer's");
     static_assert(MAX_SOCIAL_CONTEXT_ENTRIES == PLAYERBOT_SOCIAL_CONTEXT_ENTRIES,
                   "the per list bound must match the producer's");
+    static_assert(MAX_SOCIAL_EVIDENCE_ENTRIES == PLAYERBOT_SOCIAL_EVIDENCE_MAX_ENTRIES,
+                  "the evidence entry bound must match the producer's");
+    static_assert(MAX_SOCIAL_EVIDENCE_VALUE_BYTES == PLAYERBOT_SOCIAL_EVIDENCE_VALUE_MAX_BYTES,
+                  "the evidence value bound must match the producer's");
+    static_assert(MAX_SOCIAL_EVIDENCE_ENVELOPE_BYTES == PLAYERBOT_SOCIAL_EVIDENCE_ENVELOPE_MAX_BYTES,
+                  "the evidence envelope bound must match the producer's");
 
     /*
      * At most one regeneration for a fresh invalid response.
@@ -271,6 +281,9 @@ namespace PlayerbotLLM
         uint32 emoteId = 0;
         bool regenerate = false;
         std::optional<PlayerbotSocialCallMetadata> callMetadata;
+        PlayerbotSocialContributionFunction contribution = PlayerbotSocialContributionFunction::None;
+        PlayerbotSocialClaimSubject claimSubject = PlayerbotSocialClaimSubject::None;
+        std::vector<std::string> citedEvidenceIds;
     };
 
     /*
@@ -502,6 +515,15 @@ namespace PlayerbotLLM
         std::string name;
     };
 
+    struct MemoryLine
+    {
+        uint64 speakerGuidCounter = 0;
+        std::string speakerName;
+        std::string text;
+        std::string sourceEventPublicId;
+        PlayerbotSocialMemorySourceKind sourceKind = PlayerbotSocialMemorySourceKind::HumanObservation;
+    };
+
     struct MemoryRequest
     {
         uint64 memoryRequestToken = 0;
@@ -515,7 +537,7 @@ namespace PlayerbotLLM
         PlayerbotSocialPrivacyScope scope = PlayerbotSocialPrivacyScope::Public;
 
         std::vector<MemorySubject> subjects;
-        std::vector<std::string> thread;
+        std::vector<MemoryLine> thread;
     };
 
     [[nodiscard]] bool MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token);
@@ -529,6 +551,7 @@ namespace PlayerbotLLM
         std::string paraphrase;
         uint64 aboutGuidCounter = 0;
         PlayerbotSocialPrivacyScope scope = PlayerbotSocialPrivacyScope::Public;
+        std::string sourceEventPublicId;
     };
 
     struct MemoryResponse
@@ -547,7 +570,7 @@ namespace PlayerbotLLM
      *
      * Flat, like the biography reply and for the same reason: this parser handles ONE flat object
      * and fails on any nesting, and that narrowness is most of what makes it safe to point at a
-     * payload from the network. The memories arrive as `memory_count` plus three keys per slot.
+     * payload from the network. The memories arrive as `memory_count` plus four keys per slot.
      *
      * Identity before content, and the declared count is part of identity here: a payload whose
      * keys disagree with its own count is one where the reader and the writer disagree about the

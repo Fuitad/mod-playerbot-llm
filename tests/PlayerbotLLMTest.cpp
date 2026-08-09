@@ -215,7 +215,7 @@ TEST(PlayerbotLLMProtocolTest, FrameLengthDecodeRejectsOversizedLength)
 TEST(PlayerbotLLMProtocolTest, RequestSerializesToExactContractJson)
 {
     std::string const expected =
-        "{\"schema_version\":5,"
+        "{\"schema_version\":6,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":7,"
         "\"channel\":\"whisper\","
@@ -265,7 +265,7 @@ TEST(PlayerbotLLMProtocolTest, AmbientRequestSerializesToExactContractJson)
     request.occurrence = 9;
 
     std::string const expected =
-        "{\"schema_version\":5,"
+        "{\"schema_version\":6,"
         "\"token\":\"0123456789abcdef0123456789abcdef\","
         "\"request_id\":8,"
         "\"channel\":\"world\","
@@ -926,10 +926,33 @@ namespace
         return actor;
     }
 
+    PlayerbotSocialGroundingEnvelope SocialGrounding(
+        uint64 nowUnixSeconds = 1000, bool hasParticipant = true, uint64 botGuidCounter = 500)
+    {
+        PlayerbotSocialGroundingInput input;
+        input.bot.guidCounter = botGuidCounter;
+        input.bot.name = "Grimbold";
+        if (hasParticipant)
+        {
+            input.participant.guidCounter = 900;
+            input.participant.name = "Deszy";
+            input.participant.visible = true;
+            input.participant.inRange = true;
+        }
+        input.transcriptEventPublicIds = {"evt_00000000000000000000000000000001"};
+        input.profileLoadState = PlayerbotSocialProfileLoadState::Loaded;
+        input.memoryInputState = PlayerbotSocialMemoryInputState::Loaded;
+        input.activeContentExpansion = 0;
+        input.nowUnixSeconds = nowUnixSeconds;
+        return PlayerbotSocialBuildGroundingEnvelope(input);
+    }
+
     std::string SocialPayload(std::string kind = "social", uint64 requestToken = 77, uint64 botGuid = 500,
                               std::string message = "Aye, that pack hits hard.", uint64 regenerate = 0,
                               uint64 schema = PlayerbotLLM::SOCIAL_SCHEMA_VERSION, uint64 emoteId = 0,
-                              uint64 channel = 2)
+                              uint64 channel = 2, std::string contribution = {},
+                              std::string claimSubject = {},
+                              std::vector<std::string> const& citedEvidenceIds = {})
     {
         std::string out = "{\"schema_version\":" + std::to_string(schema);
         out += ",\"token\":\"" + SOCIAL_TOKEN + "\"";
@@ -942,6 +965,10 @@ namespace
         out += ",\"regenerate\":" + std::to_string(regenerate);
         if (regenerate == 0)
         {
+            if (contribution.empty())
+                contribution = emoteId != 0 ? "gesture" : message.empty() ? "none" : "fact_free_banter";
+            if (claimSubject.empty())
+                claimSubject = "none";
             out += ",\"model\":\"fixture-social-model\"";
             out += ",\"provider_latency_ms\":42";
             out += ",\"input_tokens\":100";
@@ -949,6 +976,11 @@ namespace
             out += ",\"cache_creation_input_tokens\":20";
             out += ",\"cache_read_input_tokens\":30";
             out += ",\"cost_usd\":\"0.000400\"";
+            out += ",\"contribution\":\"" + contribution + "\"";
+            out += ",\"claim_subject\":\"" + claimSubject + "\"";
+            out += ",\"citation_count\":" + std::to_string(citedEvidenceIds.size());
+            for (std::size_t index = 0; index < citedEvidenceIds.size(); ++index)
+                out += ",\"citation_" + std::to_string(index) + "\":\"" + citedEvidenceIds[index] + "\"";
         }
         out += "}";
         return out;
@@ -971,6 +1003,7 @@ TEST(PlayerbotLLMSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     request.speakOnChannel = 2;
     request.threadPublicId = "thr_00000000000000000000000000000001";
     request.context = "party pull";
+    request.grounding = SocialGrounding();
 
     std::optional<std::string> const serialized = PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN);
     ASSERT_TRUE(serialized.has_value());
@@ -986,6 +1019,13 @@ TEST(PlayerbotLLMSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     EXPECT_NE(payload.find("\"subject_human\":1"), std::string::npos);
     EXPECT_NE(payload.find("\"admission_lane\":\"immediate_human\""), std::string::npos);
     EXPECT_NE(payload.find("\"kind\":\"social\""), std::string::npos);
+    EXPECT_NE(payload.find("\"evidence\":[{\"id\":\"g1\",\"subject\":\"candidate_bot\""),
+              std::string::npos);
+    EXPECT_NE(payload.find("\"transcript_event_ids\":[\"evt_00000000000000000000000000000001\"]"),
+              std::string::npos);
+    EXPECT_NE(payload.find("\"profile_load_state\":\"loaded\""), std::string::npos);
+    EXPECT_NE(payload.find("\"memory_input_state\":\"loaded\""), std::string::npos);
+    EXPECT_NE(payload.find("\"active_content_expansion\":0"), std::string::npos);
 
     PlayerbotLLM::SocialRequest background = request;
     background.admissionLane = PlayerbotLLM::SocialAdmissionLane::Background;
@@ -1007,7 +1047,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialize
 
 TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
 {
-    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 6u);
+    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 7u);
 
     std::optional<PlayerbotLLM::SocialResponse> const parsed =
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 500);
@@ -1026,6 +1066,40 @@ TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
     EXPECT_EQ(parsed->callMetadata->cacheCreationInputTokens, 20u);
     EXPECT_EQ(parsed->callMetadata->cacheReadInputTokens, 30u);
     EXPECT_EQ(parsed->callMetadata->costUsd, "0.000400");
+    EXPECT_EQ(parsed->contribution, PlayerbotSocialContributionFunction::FactFreeBanter);
+    EXPECT_EQ(parsed->claimSubject, PlayerbotSocialClaimSubject::None);
+    EXPECT_TRUE(parsed->citedEvidenceIds.empty());
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, ProposalMetadataAndCitationsReachTheCoordinatorContract)
+{
+    std::optional<PlayerbotLLM::SocialResponse> const parsed = PlayerbotLLM::ParseSocialResponsePayload(
+        SocialPayload("social", 77, 500, "I'm level 6.", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0, 2,
+                      "answer", "candidate_bot", { "g4" }),
+        SOCIAL_TOKEN, 77, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->contribution, PlayerbotSocialContributionFunction::Answer);
+    EXPECT_EQ(parsed->claimSubject, PlayerbotSocialClaimSubject::CandidateBot);
+    ASSERT_EQ(parsed->citedEvidenceIds.size(), 1u);
+    EXPECT_EQ(parsed->citedEvidenceIds[0], "g4");
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, InvalidGroundingCannotBeSerialized)
+{
+    PlayerbotLLM::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
+    request.subject = SocialActor(900, "Deszy", true);
+    request.admissionLane = PlayerbotLLM::SocialAdmissionLane::ImmediateHuman;
+    request.speakOnChannel = 2;
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+    request.context = "party pull";
+    request.grounding = SocialGrounding();
+    request.grounding.entries[1].id = request.grounding.entries[0].id;
+
+    EXPECT_FALSE(PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, ACareerDecisionCannotArriveAsASocialLine)
@@ -1074,8 +1148,8 @@ TEST(PlayerbotLLMSocialProtocolTest, UnknownFieldsAndOversizeMessagesAreRefused)
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload("social", 77, 500, oversize), SOCIAL_TOKEN, 77, 500)
             .has_value());
 
-    // An empty line is not a deliverable answer.
-    EXPECT_FALSE(
+    // Social v7 uses the empty message and zero emote wire shape for deliberate silence.
+    EXPECT_TRUE(
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload("social", 77, 500, ""), SOCIAL_TOKEN, 77, 500)
             .has_value());
 }
@@ -1161,7 +1235,7 @@ TEST(PlayerbotLLMSocialProtocolTest, TheProtocolVersionMovedSoAnOlderSidecarIsRe
      * the behaviour it is supposed to produce. On its own it only proved the constant had a value
      * somebody had typed, which is not the same claim as "an older sidecar is refused".
      */
-    EXPECT_EQ(PlayerbotLLM::SCHEMA_VERSION, 5u);
+    EXPECT_EQ(PlayerbotLLM::SCHEMA_VERSION, 6u);
 
     std::string const previous = "{\"schema_version\":4,\"token\":\"" + TEST_TOKEN +
                                  "\",\"request_id\":1,\"message\":\"hi\"}";
@@ -1175,7 +1249,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ALegacyChatAnswerIsNotASocialAnswerAndViceV
      * fed the other's payload even if a caller mixed them up.
      */
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
-                     "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":6,\"token\":\"" + SOCIAL_TOKEN + "\",\"request_id\":1,\"message\":\"hi\"}",
                      SOCIAL_TOKEN, 77, 500)
                      .has_value());
     EXPECT_FALSE(PlayerbotLLM::ParseResponsePayload(SocialPayload(), SOCIAL_TOKEN).has_value());
@@ -1280,11 +1354,13 @@ TEST(PlayerbotLLMSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFram
     good.admissionLane = PlayerbotLLM::SocialAdmissionLane::ImmediateHuman;
     good.threadPublicId = "thr_00000000000000000000000000000001";
     good.context = "party pull";
+    good.grounding = SocialGrounding();
     ASSERT_TRUE(PlayerbotLLM::SerializeSocialRequest(good, SOCIAL_TOKEN).has_value());
 
     // An absent subject is allowed: not every social opportunity is about somebody.
     PlayerbotLLM::SocialRequest noSubject = good;
     noSubject.subject = PlayerbotLLM::Actor{};
+    noSubject.grounding = SocialGrounding(1000, false);
     EXPECT_TRUE(PlayerbotLLM::SerializeSocialRequest(noSubject, SOCIAL_TOKEN).has_value());
 
     for (auto const& [name, mutate] :
@@ -1332,7 +1408,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ABiographyRequestSerializesToExactContractJ
     request.activeContentExpansion = 0;
 
     std::string const expected =
-        "{\"schema_version\":5,"
+        "{\"schema_version\":6,"
         "\"token\":\"" + SOCIAL_TOKEN + "\","
         "\"kind\":\"biography\","
         "\"biography_request_token\":4242,"
@@ -1419,7 +1495,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ABiographyResponseIsReadFromTheBytesTheSide
      * network, so the frame was flattened rather than the parser widened.
      */
     std::string const payload =
-        "{\"schema_version\":5,"
+        "{\"schema_version\":6,"
         "\"token\":\"" + SOCIAL_TOKEN + "\","
         "\"kind\":\"biography\","
         "\"biography_request_token\":4242,"
@@ -1457,7 +1533,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ABiographyResponseForSomebodyElsesRequestIs
      * request, or for a different bot, must be refused rather than handed to whoever is waiting.
      */
     auto const build = [](uint64 requestToken, uint64 botGuid, std::string const& kind) {
-        std::string out = "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN + "\",\"kind\":\"" + kind +
+        std::string out = "{\"schema_version\":6,\"token\":\"" + SOCIAL_TOKEN + "\",\"kind\":\"" + kind +
                           "\",\"biography_request_token\":" + std::to_string(requestToken) +
                           ",\"bot_guid\":" + std::to_string(botGuid) + ",";
         out +=
@@ -1497,7 +1573,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ABiographyResponseCarryingAnythingExtraIsRe
      * unknown key is how an instruction field would arrive, and a missing one is a biography with
      * a hole in it, so both refuse the frame instead of being dropped or defaulted.
      */
-    std::string const head = "{\"schema_version\":5,\"token\":\"" + SOCIAL_TOKEN +
+    std::string const head = "{\"schema_version\":6,\"token\":\"" + SOCIAL_TOKEN +
                              "\",\"kind\":\"biography\",\"biography_request_token\":4242,\"bot_guid\":500,";
     std::string const body =
         "\"origin\":\"a\",\"motivation\":\"b\",\"formative_experience\":\"c\",\"interests\":\"d\","
@@ -1626,12 +1702,14 @@ TEST(PlayerbotLLMSocialProtocolTest, ASubjectIsEitherFullyPresentOrFullyAbsent)
     request.botLevel = 6;
     request.admissionLane = PlayerbotLLM::SocialAdmissionLane::ImmediateHuman;
     request.threadPublicId = "thr_00000000000000000000000000000001";
+    request.grounding = SocialGrounding(1000, false);
 
     // Fully absent is legal.
     EXPECT_TRUE(PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
 
     // Fully present is legal.
     request.subject = SocialActor(900, "Deszy", true);
+    request.grounding = SocialGrounding();
     EXPECT_TRUE(PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN).has_value());
 
     // Half described is not.
@@ -1720,7 +1798,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ResponseParsersBoundTheTokenExplicitly)
 
     EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), tooLong, 77, 500).has_value());
     EXPECT_FALSE(PlayerbotLLM::ParseResponsePayload(
-                     "{\"schema_version\":5,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
+                     "{\"schema_version\":6,\"token\":\"" + tooLong + "\",\"request_id\":1,\"message\":\"hi\"}",
                      tooLong)
                      .has_value());
 
@@ -1743,6 +1821,7 @@ namespace
         request.speakOnChannel = static_cast<uint8>(PlayerbotSocialChannel::Party);
         request.threadPublicId = "thr_00000000000000000000000000000001";
         request.context = "party pull";
+        request.grounding = SocialGrounding(1000, true, botGuid);
         return request;
     }
 
@@ -1828,19 +1907,8 @@ TEST(PlayerbotLLMSocialTransportTest, AUsableLineIsDrainedAsAMessageForTheCoordi
     EXPECT_EQ(transport.OutstandingCount(), 0u);
 }
 
-TEST(PlayerbotLLMSocialTransportTest, ScheduleThreeCannotExpressSilenceSoAnEmptyLineIsAbandoned)
+TEST(PlayerbotLLMSocialTransportTest, DeliberateSilenceReachesTheCoordinatorAsSilence)
 {
-    /*
-     * The coordinator names Silence a legitimate answer, but Social schema 6 has no way
-     * to SAY it: a payload that is not a regeneration must carry one clean line, so an empty message
-     * is an invalid response rather than a quiet bot.
-     *
-     * Abandoned rather than delivered as Silence. Reading an empty message as a deliberate choice
-     * would give the same meaning to "this bot decided not to speak" and "the sidecar returned
-     * nothing", and those are not the same event. Task 10 owns the response models and is where a
-     * silence variant belongs; until then this provider produces a line or nothing at all, and the
-     * coordinator's Silence and Emote kinds stay unreachable from it.
-     */
     FakeSidecarServer server(
         [](std::string const&) -> std::optional<std::string> { return SocialPayload("social", 77, 500, ""); });
 
@@ -1854,7 +1922,9 @@ TEST(PlayerbotLLMSocialTransportTest, ScheduleThreeCannotExpressSilenceSoAnEmpty
     bridge.Stop();
 
     ASSERT_EQ(drained.size(), 1u);
-    EXPECT_EQ(drained[0].outcome, PlayerbotLLM::SocialExchangeOutcome::Abandon);
+    EXPECT_EQ(drained[0].outcome, PlayerbotLLM::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(drained[0].result.kind, PlayerbotSocialOutputKind::Silence);
+    EXPECT_TRUE(drained[0].result.text.empty());
     EXPECT_EQ(transport.OutstandingCount(), 0u);
 }
 
@@ -2250,14 +2320,13 @@ TEST(PlayerbotLLMSocialProtocolTest, AGestureAndALineTogetherAreTwoAnswersToOneQ
                      .has_value());
 }
 
-TEST(PlayerbotLLMSocialProtocolTest, AnAnswerWithNeitherALineNorAGestureIsRefused)
+TEST(PlayerbotLLMSocialProtocolTest, AnAnswerWithNeitherALineNorAGestureIsDeliberateSilence)
 {
-    // Social schema 6 cannot express silence, so an empty non-regeneration is a malformed answer rather
-    // than a decision not to speak.
-    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
-                     SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0), SOCIAL_TOKEN,
-                     77, 500)
-                     .has_value());
+    std::optional<PlayerbotLLM::SocialResponse> const response = PlayerbotLLM::ParseSocialResponsePayload(
+        SocialPayload("social", 77, 500, "", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0), SOCIAL_TOKEN, 77, 500);
+    ASSERT_TRUE(response.has_value());
+    EXPECT_TRUE(response->message.empty());
+    EXPECT_EQ(response->emoteId, 0u);
 }
 
 TEST(PlayerbotLLMSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResult)
@@ -2378,15 +2447,19 @@ namespace
         request.threadPublicId = "thr_00000000000000000000000000000001";
         request.scope = PlayerbotSocialPrivacyScope::Party;
         request.subjects.push_back({900, "Deszy"});
-        request.thread.push_back("Deszy: my brother has been ill since midsummer");
-        request.thread.push_back("Grimbold: sorry to hear it");
+        request.thread.push_back({900, "Deszy", "my brother has been ill since midsummer",
+                                  "evt_00000000000000000000000000000001",
+                                  PlayerbotSocialMemorySourceKind::HumanObservation});
+        request.thread.push_back({500, "Grimbold", "sorry to hear it",
+                                  "evt_00000000000000000000000000000002",
+                                  PlayerbotSocialMemorySourceKind::AuthoritativeSource});
         return request;
     }
 
     std::string MemoryReplyPayload(std::size_t count, uint64 requestToken = 91, uint64 botGuid = 500,
                                    std::string const& kind = "memory")
     {
-        std::string out = "{\"schema_version\":5,\"token\":\"" + std::string(SOCIAL_TOKEN) +
+        std::string out = "{\"schema_version\":6,\"token\":\"" + std::string(SOCIAL_TOKEN) +
                           "\",\"kind\":\"" + kind + "\",\"memory_request_token\":" +
                           std::to_string(requestToken) + ",\"bot_guid\":" + std::to_string(botGuid) +
                           ",\"thread_id\":\"thr_00000000000000000000000000000001\",\"memory_count\":" +
@@ -2398,6 +2471,7 @@ namespace
             out += ",\"memory_" + slot + "_paraphrase\":\"remembered thing " + slot + "\"";
             out += ",\"memory_" + slot + "_about_guid\":900";
             out += ",\"memory_" + slot + "_scope\":\"party\"";
+            out += ",\"memory_" + slot + "_source_event_id\":\"evt_00000000000000000000000000000001\"";
         }
 
         return out + "}";
@@ -2413,7 +2487,27 @@ TEST(PlayerbotLLMSocialProtocolTest, AMemoryRequestCarriesTheConversationAndWhoI
     EXPECT_NE(serialized->find("\"kind\":\"memory\""), std::string::npos);
     EXPECT_NE(serialized->find("\"scope\":\"party\""), std::string::npos);
     EXPECT_NE(serialized->find("\"subjects\":[{\"guid\":900,\"name\":\"Deszy\"}]"), std::string::npos);
+    EXPECT_NE(serialized->find("\"speaker_guid\":900"), std::string::npos);
+    EXPECT_NE(serialized->find("\"speaker_name\":\"Deszy\""), std::string::npos);
+    EXPECT_NE(serialized->find("\"source_event_id\":\"evt_00000000000000000000000000000001\""),
+              std::string::npos);
+    EXPECT_NE(serialized->find("\"source_kind\":\"human_observation\""), std::string::npos);
     EXPECT_NE(serialized->find("my brother has been ill"), std::string::npos);
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AGeneratedOrMalformedMemorySourceNeverCrossesTheBridge)
+{
+    PlayerbotLLM::MemoryRequest generated = UsableMemoryRequest();
+    generated.thread[0].sourceKind = PlayerbotSocialMemorySourceKind::GeneratedDelivery;
+    EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(generated, SOCIAL_TOKEN));
+
+    PlayerbotLLM::MemoryRequest wrongId = UsableMemoryRequest();
+    wrongId.thread[0].sourceEventPublicId = "thr_00000000000000000000000000000001";
+    EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(wrongId, SOCIAL_TOKEN));
+
+    PlayerbotLLM::MemoryRequest noSpeaker = UsableMemoryRequest();
+    noSpeaker.thread[0].speakerGuidCounter = 0;
+    EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(noSpeaker, SOCIAL_TOKEN));
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, AWhisperScopedExtractionIsRefusedBeforeItIsEverSent)
@@ -2447,11 +2541,11 @@ TEST(PlayerbotLLMSocialProtocolTest, AnExtractionWithNothingToReadOrNobodyToBeAb
     // come from a buffer enforcing them, so sending it would let one producer bug become an
     // unbounded prompt on a paid request.
     PlayerbotLLM::MemoryRequest tooMany = UsableMemoryRequest();
-    tooMany.thread.assign(PlayerbotLLM::MAX_MEMORY_THREAD_LINES + 1, "a line");
+    tooMany.thread.assign(PlayerbotLLM::MAX_MEMORY_THREAD_LINES + 1, tooMany.thread.front());
     EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(tooMany, SOCIAL_TOKEN));
 
     PlayerbotLLM::MemoryRequest tooLong = UsableMemoryRequest();
-    tooLong.thread.assign(1, std::string(PlayerbotLLM::MAX_MEMORY_LINE_BYTES + 1, 'x'));
+    tooLong.thread[0].text.assign(PlayerbotLLM::MAX_MEMORY_LINE_BYTES + 1, 'x');
     EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(tooLong, SOCIAL_TOKEN));
 }
 
@@ -2467,6 +2561,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AMemoryReplyIsReadFlatAndCountsWhatItCarrie
     EXPECT_EQ(parsed->memories[0].paraphrase, "remembered thing 0");
     EXPECT_EQ(parsed->memories[0].aboutGuidCounter, 900u);
     EXPECT_EQ(parsed->memories[0].scope, PlayerbotSocialPrivacyScope::Party);
+    EXPECT_EQ(parsed->memories[0].sourceEventPublicId, "evt_00000000000000000000000000000001");
     EXPECT_EQ(parsed->memories[1].paraphrase, "remembered thing 1");
 }
 
@@ -2533,6 +2628,21 @@ TEST(PlayerbotLLMSocialProtocolTest, AMemoryReplyThatDisagreesWithItsOwnCountIsR
     EXPECT_FALSE(PlayerbotLLM::ParseMemoryResponsePayload(MemoryReplyPayload(PlayerbotLLM::MAX_EXTRACTED_MEMORIES + 1),
                                                         SOCIAL_TOKEN, 91, 500)
                      .has_value());
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AMemoryReplyMustCiteAWellFormedSourceEvent)
+{
+    std::string missing = MemoryReplyPayload(1);
+    std::string const field =
+        ",\"memory_0_source_event_id\":\"evt_00000000000000000000000000000001\"";
+    missing.erase(missing.find(field), field.size());
+    EXPECT_FALSE(PlayerbotLLM::ParseMemoryResponsePayload(missing, SOCIAL_TOKEN, 91, 500).has_value());
+
+    std::string wrongKind = MemoryReplyPayload(1);
+    wrongKind.replace(wrongKind.find("evt_00000000000000000000000000000001"),
+                      std::strlen("evt_00000000000000000000000000000001"),
+                      "thr_00000000000000000000000000000001");
+    EXPECT_FALSE(PlayerbotLLM::ParseMemoryResponsePayload(wrongKind, SOCIAL_TOKEN, 91, 500).has_value());
 }
 
 // Task 15A: the whole assembled context on the wire ---------------------------------------------

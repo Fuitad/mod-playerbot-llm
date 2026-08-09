@@ -862,26 +862,30 @@ std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransp
         PlayerbotSocialProviderResult result;
         result.requestToken = raw.socialRequestToken;
         /*
-         * A Message or an Emote, and never a Silence.
+         * A Message, an Emote, or deliberate Silence.
          *
          * The parser has already refused an answer carrying both and one carrying neither, so the
-         * branch below is a read of which one arrived rather than a decision. Silence stays
-         * unreachable: Social schema 6 has no way to say "chose not to speak", and an empty answer is
-         * refused as malformed rather than quietly becoming one. That gap belongs to the response
-         * models, not here.
+         * branch below is a read of which one arrived rather than a decision. Social schema 7 gives
+         * deliberate silence the empty message and zero emote wire shape, which the structured
+         * sidecar output can produce only through response_kind silence.
          */
         if (response.emoteId != 0)
         {
             result.kind = PlayerbotSocialOutputKind::Emote;
             result.emoteId = response.emoteId;
         }
-        else
+        else if (!response.message.empty())
         {
             result.kind = PlayerbotSocialOutputKind::Message;
             result.text = response.message;
         }
+        else
+            result.kind = PlayerbotSocialOutputKind::Silence;
         result.channel = channel;
         result.callMetadata = response.callMetadata;
+        result.contribution = response.contribution;
+        result.claimSubject = response.claimSubject;
+        result.citedEvidenceIds = response.citedEvidenceIds;
 
         // Consumed either way: a result is delivered once or not at all, never retried into a
         // conversation that has already moved on.
@@ -942,6 +946,87 @@ char const* PlayerbotLLM::SocialAdmissionLaneName(SocialAdmissionLane lane)
     return "unknown";
 }
 
+namespace
+{
+    char const* EvidenceSubjectName(PlayerbotSocialEvidenceSubjectRole subject)
+    {
+        switch (subject)
+        {
+            case PlayerbotSocialEvidenceSubjectRole::CandidateBot:
+                return "candidate_bot";
+            case PlayerbotSocialEvidenceSubjectRole::Participant:
+                return "participant";
+            case PlayerbotSocialEvidenceSubjectRole::Source:
+                return "source";
+        }
+        return "unknown";
+    }
+
+    char const* EvidenceFactName(PlayerbotSocialEvidenceFactKind fact)
+    {
+        switch (fact)
+        {
+            case PlayerbotSocialEvidenceFactKind::Name: return "name";
+            case PlayerbotSocialEvidenceFactKind::Race: return "race";
+            case PlayerbotSocialEvidenceFactKind::CharacterClass: return "character_class";
+            case PlayerbotSocialEvidenceFactKind::Level: return "level";
+            case PlayerbotSocialEvidenceFactKind::Faction: return "faction";
+            case PlayerbotSocialEvidenceFactKind::Zone: return "zone";
+            case PlayerbotSocialEvidenceFactKind::Area: return "area";
+            case PlayerbotSocialEvidenceFactKind::GroupRelation: return "group_relation";
+            case PlayerbotSocialEvidenceFactKind::GuildRelation: return "guild_relation";
+            case PlayerbotSocialEvidenceFactKind::CombatState: return "combat_state";
+            case PlayerbotSocialEvidenceFactKind::Target: return "target";
+            case PlayerbotSocialEvidenceFactKind::Visibility: return "visibility";
+            case PlayerbotSocialEvidenceFactKind::Proximity: return "proximity";
+            case PlayerbotSocialEvidenceFactKind::Progression: return "progression";
+            case PlayerbotSocialEvidenceFactKind::Quest: return "quest";
+            case PlayerbotSocialEvidenceFactKind::Item: return "item";
+            case PlayerbotSocialEvidenceFactKind::Creature: return "creature";
+            case PlayerbotSocialEvidenceFactKind::Objective: return "objective";
+            case PlayerbotSocialEvidenceFactKind::Achievement: return "achievement";
+        }
+        return "unknown";
+    }
+
+    char const* EvidenceProvenanceName(PlayerbotSocialEvidenceProvenance provenance)
+    {
+        switch (provenance)
+        {
+            case PlayerbotSocialEvidenceProvenance::CurrentWorld:
+                return "current_world";
+            case PlayerbotSocialEvidenceProvenance::HumanObservation:
+                return "human_observation";
+            case PlayerbotSocialEvidenceProvenance::AuthoritativeSource:
+                return "authoritative_source";
+        }
+        return "unknown";
+    }
+
+    char const* EvidenceScopeName(PlayerbotSocialPrivacyScope scope)
+    {
+        switch (scope)
+        {
+            case PlayerbotSocialPrivacyScope::Public: return "public";
+            case PlayerbotSocialPrivacyScope::Party: return "party";
+            case PlayerbotSocialPrivacyScope::Whisper: return "whisper";
+        }
+        return "unknown";
+    }
+
+    char const* MemoryInputStateName(PlayerbotSocialMemoryInputState state)
+    {
+        switch (state)
+        {
+            case PlayerbotSocialMemoryInputState::Pending: return "pending";
+            case PlayerbotSocialMemoryInputState::Loaded: return "loaded";
+            case PlayerbotSocialMemoryInputState::Absent: return "absent";
+            case PlayerbotSocialMemoryInputState::Unavailable: return "unavailable";
+        }
+        return "unknown";
+    }
+}
+
 bool PlayerbotLLM::SocialRequestIsUsable(SocialRequest const& request, std::string const& token)
 {
     /*
@@ -969,6 +1054,24 @@ bool PlayerbotLLM::SocialRequestIsUsable(SocialRequest const& request, std::stri
 
     if (request.context.size() > MAX_SOCIAL_CONTEXT_BYTES)
         return false;
+
+    if (!PlayerbotSocialChannelIsValid(static_cast<PlayerbotSocialChannel>(request.speakOnChannel)) ||
+        !PlayerbotSocialGroundingEnvelopeIsValid(request.grounding) ||
+        request.grounding.activeContentExpansion > MAX_SOCIAL_ACTIVE_EXPANSION)
+        return false;
+
+    PlayerbotSocialChannel const channel = static_cast<PlayerbotSocialChannel>(request.speakOnChannel);
+    for (PlayerbotSocialEvidenceEntry const& evidence : request.grounding.entries)
+    {
+        if (!PlayerbotSocialMemoryIsRetrievableInChannel(evidence.scope, channel))
+            return false;
+        if (evidence.subjectRole == PlayerbotSocialEvidenceSubjectRole::CandidateBot &&
+            evidence.subjectGuidCounter != request.bot.guidCounter)
+            return false;
+        if (evidence.subjectRole == PlayerbotSocialEvidenceSubjectRole::Participant &&
+            (ActorIsAbsent(request.subject) || evidence.subjectGuidCounter != request.subject.guidCounter))
+            return false;
+    }
 
     return true;
 }
@@ -1365,6 +1468,41 @@ std::optional<std::string> PlayerbotLLM::SerializeSocialRequest(SocialRequest co
     AppendJsonField(out, "speak_on_channel", static_cast<uint64>(request.speakOnChannel));
     AppendJsonField(out, "thread_id", request.threadPublicId);
     AppendJsonField(out, "context", request.context);
+    out += ",\"evidence\":[";
+    bool firstEvidence = true;
+    for (PlayerbotSocialEvidenceEntry const& evidence : request.grounding.entries)
+    {
+        if (!firstEvidence)
+            out += ',';
+        out += '{';
+        AppendJsonField(out, "id", evidence.id, true);
+        AppendJsonField(out, "subject", std::string(EvidenceSubjectName(evidence.subjectRole)));
+        AppendJsonField(out, "fact", std::string(EvidenceFactName(evidence.factKind)));
+        AppendJsonField(out, "value", evidence.value);
+        AppendJsonField(out, "provenance", std::string(EvidenceProvenanceName(evidence.provenance)));
+        AppendJsonField(out, "scope", std::string(EvidenceScopeName(evidence.scope)));
+        AppendJsonField(out, "observed_at", evidence.atUnixSeconds);
+        out += '}';
+        firstEvidence = false;
+    }
+    out += ']';
+
+    out += ",\"transcript_event_ids\":[";
+    bool firstEvent = true;
+    for (std::string const& eventPublicId : request.grounding.transcriptEventPublicIds)
+    {
+        if (!firstEvent)
+            out += ',';
+        AppendEscapedJsonString(out, eventPublicId);
+        firstEvent = false;
+    }
+    out += ']';
+    AppendJsonField(out, "profile_load_state",
+                    std::string(PlayerbotSocialProfileLoadStateName(request.grounding.profileLoadState)));
+    AppendJsonField(out, "memory_input_state",
+                    std::string(MemoryInputStateName(request.grounding.memoryInputState)));
+    AppendJsonField(out, "active_content_expansion",
+                    static_cast<uint64>(request.grounding.activeContentExpansion));
     out += '}';
     return out;
 }
@@ -1455,9 +1593,10 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     if (!fields)
         return std::nullopt;
 
-    // A regeneration has the nine control fields. A deliverable answer has those nine plus the
-    // complete seven field call document. Any partial or extended shape is malformed.
-    if (fields->size() != 9 && fields->size() != 16)
+    // A regeneration has the nine control fields. A deliverable answer adds the complete seven
+    // field call document, three proposal fields, and one field per cited request-local evidence id.
+    if (fields->size() != 9 &&
+        (fields->size() < 19 || fields->size() > 19 + MAX_SOCIAL_EVIDENCE_ENTRIES))
         return std::nullopt;
 
     auto const schemaIt = fields->find("schema_version");
@@ -1538,9 +1677,6 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
         return response;
     }
 
-    if (fields->size() != 16)
-        return std::nullopt;
-
     auto const modelIt = fields->find("model");
     auto const latencyIt = fields->find("provider_latency_ms");
     auto const inputIt = fields->find("input_tokens");
@@ -1548,9 +1684,13 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     auto const cacheCreationIt = fields->find("cache_creation_input_tokens");
     auto const cacheReadIt = fields->find("cache_read_input_tokens");
     auto const costIt = fields->find("cost_usd");
+    auto const contributionIt = fields->find("contribution");
+    auto const claimSubjectIt = fields->find("claim_subject");
+    auto const citationCountIt = fields->find("citation_count");
     if (modelIt == fields->end() || latencyIt == fields->end() || inputIt == fields->end() ||
         outputIt == fields->end() || cacheCreationIt == fields->end() || cacheReadIt == fields->end() ||
-        costIt == fields->end())
+        costIt == fields->end() || contributionIt == fields->end() || claimSubjectIt == fields->end() ||
+        citationCountIt == fields->end())
         return std::nullopt;
 
     if (!modelIt->second.isString || modelIt->second.text.empty() ||
@@ -1563,6 +1703,34 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
 
     if (!costIt->second.isString || !FixedMicrodollarUsdIsValid(costIt->second.text))
         return std::nullopt;
+
+    if (!contributionIt->second.isString || !claimSubjectIt->second.isString || citationCountIt->second.isString ||
+        citationCountIt->second.number > MAX_SOCIAL_EVIDENCE_ENTRIES ||
+        fields->size() != 19 + citationCountIt->second.number)
+        return std::nullopt;
+
+    std::optional<PlayerbotSocialContributionFunction> const contribution =
+        PlayerbotSocialContributionFunctionFromName(contributionIt->second.text);
+    std::optional<PlayerbotSocialClaimSubject> const claimSubject =
+        PlayerbotSocialClaimSubjectFromName(claimSubjectIt->second.text);
+    if (!contribution || !claimSubject)
+        return std::nullopt;
+
+    response.contribution = *contribution;
+    response.claimSubject = *claimSubject;
+    for (uint64 index = 0; index < citationCountIt->second.number; ++index)
+    {
+        auto const citation = fields->find("citation_" + std::to_string(index));
+        if (citation == fields->end() || !citation->second.isString || citation->second.text.size() < 2 ||
+            citation->second.text.front() != 'g' ||
+            !std::all_of(citation->second.text.begin() + 1, citation->second.text.end(),
+                         [](char character) { return character >= '0' && character <= '9'; }) ||
+            std::find(response.citedEvidenceIds.begin(), response.citedEvidenceIds.end(), citation->second.text) !=
+                response.citedEvidenceIds.end())
+            return std::nullopt;
+
+        response.citedEvidenceIds.push_back(citation->second.text);
+    }
 
     response.callMetadata = PlayerbotSocialCallMetadata{
         modelIt->second.text,
@@ -1579,8 +1747,9 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
      * intention it did not express; the coordinator would drop the text anyway, so a frame carrying
      * both is refused where the caller can still be told which request was at fault.
      *
-     * Neither is not silence either. Social schema 6 has no way to say "chose not to speak", so an empty
-     * answer is a malformed one.
+     * Neither is deliberate silence in Social schema 7. The sidecar's strict structured output is
+     * what distinguishes it from an accidentally omitted model field before this flat response is
+     * encoded.
      */
     if (response.emoteId != 0)
     {
@@ -1591,11 +1760,29 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
         if (!SocialEmoteIsSupported(response.emoteId))
             return std::nullopt;
 
+        if (response.contribution != PlayerbotSocialContributionFunction::Gesture ||
+            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty())
+            return std::nullopt;
+
         return response;
     }
 
-    if (response.message.empty() || response.message.size() > MAX_RESPONSE_MESSAGE_BYTES ||
+    if (response.message.size() > MAX_RESPONSE_MESSAGE_BYTES ||
         !IsSingleCleanLine(response.message))
+        return std::nullopt;
+
+    if (response.message.empty())
+    {
+        if (response.contribution != PlayerbotSocialContributionFunction::None ||
+            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty())
+            return std::nullopt;
+        return response;
+    }
+
+    if (response.contribution == PlayerbotSocialContributionFunction::Gesture ||
+        response.contribution == PlayerbotSocialContributionFunction::None ||
+        (response.claimSubject == PlayerbotSocialClaimSubject::None && !response.citedEvidenceIds.empty()) ||
+        (response.claimSubject != PlayerbotSocialClaimSubject::None && response.citedEvidenceIds.empty()))
         return std::nullopt;
 
     return response;
@@ -2334,10 +2521,26 @@ bool PlayerbotLLM::MemoryRequestIsUsable(MemoryRequest const& request, std::stri
     if (request.thread.empty() || request.thread.size() > MAX_MEMORY_THREAD_LINES)
         return false;
 
-    for (std::string const& line : request.thread)
+    for (std::size_t index = 0; index < request.thread.size(); ++index)
     {
-        if (line.empty() || line.size() > MAX_MEMORY_LINE_BYTES)
+        MemoryLine const& line = request.thread[index];
+        if (line.speakerGuidCounter == 0 || line.speakerName.empty() ||
+            line.speakerName.size() > MAX_ACTOR_NAME_BYTES || line.text.empty() ||
+            line.text.size() > MAX_MEMORY_LINE_BYTES)
             return false;
+
+        if (!PlayerbotSocialPublicIdIsValid(PlayerbotSocialIdKind::Event, line.sourceEventPublicId))
+            return false;
+
+        if (line.sourceKind != PlayerbotSocialMemorySourceKind::HumanObservation &&
+            line.sourceKind != PlayerbotSocialMemorySourceKind::AuthoritativeSource)
+            return false;
+
+        for (std::size_t previous = 0; previous < index; ++previous)
+        {
+            if (request.thread[previous].sourceEventPublicId == line.sourceEventPublicId)
+                return false;
+        }
     }
 
     return true;
@@ -2388,7 +2591,18 @@ std::optional<std::string> PlayerbotLLM::SerializeMemoryRequest(MemoryRequest co
         if (index != 0)
             out += ',';
 
-        AppendEscapedJsonString(out, request.thread[index]);
+        MemoryLine const& line = request.thread[index];
+        out += "{\"speaker_guid\":";
+        out += std::to_string(line.speakerGuidCounter);
+        out += ",\"speaker_name\":";
+        AppendEscapedJsonString(out, line.speakerName);
+        out += ",\"text\":";
+        AppendEscapedJsonString(out, line.text);
+        out += ",\"source_event_id\":";
+        AppendEscapedJsonString(out, line.sourceEventPublicId);
+        out += ",\"source_kind\":";
+        AppendEscapedJsonString(out, std::string(PlayerbotSocialMemorySourceKindName(line.sourceKind)));
+        out += '}';
     }
     out += "]}";
 
@@ -2454,13 +2668,13 @@ std::optional<PlayerbotLLM::MemoryResponse> PlayerbotLLM::ParseMemoryResponsePay
     std::size_t const count = static_cast<std::size_t>(countIt->second.number);
 
     /*
-     * Seven protocol keys plus three per memory, counted exactly. The parser already refuses
+     * Seven protocol keys plus four per memory, counted exactly. The parser already refuses
      * duplicates, so an exact count is what refuses an unknown key, and here it also refuses a
      * payload whose slots disagree with its own declared count. Both are the same defect: the
      * reader and the writer do not agree about the frame, and reading it up to the count would
      * accept one carrying something nobody looked at.
      */
-    if (fields->size() != 7 + count * 3)
+    if (fields->size() != 7 + count * 4)
         return std::nullopt;
 
     MemoryResponse response;
@@ -2476,8 +2690,10 @@ std::optional<PlayerbotLLM::MemoryResponse> PlayerbotLLM::ParseMemoryResponsePay
         auto const paraphraseIt = fields->find(slot + "paraphrase");
         auto const aboutIt = fields->find(slot + "about_guid");
         auto const scopeIt = fields->find(slot + "scope");
+        auto const sourceIt = fields->find(slot + "source_event_id");
 
-        if (paraphraseIt == fields->end() || aboutIt == fields->end() || scopeIt == fields->end())
+        if (paraphraseIt == fields->end() || aboutIt == fields->end() || scopeIt == fields->end() ||
+            sourceIt == fields->end())
             return std::nullopt;
 
         if (!paraphraseIt->second.isString || paraphraseIt->second.text.empty() ||
@@ -2490,9 +2706,14 @@ std::optional<PlayerbotLLM::MemoryResponse> PlayerbotLLM::ParseMemoryResponsePay
         if (!scopeIt->second.isString)
             return std::nullopt;
 
+        if (!sourceIt->second.isString ||
+            !PlayerbotSocialPublicIdIsValid(PlayerbotSocialIdKind::Event, sourceIt->second.text))
+            return std::nullopt;
+
         MemoryResponseCandidate candidate;
         candidate.paraphrase = paraphraseIt->second.text;
         candidate.aboutGuidCounter = aboutIt->second.number;
+        candidate.sourceEventPublicId = sourceIt->second.text;
 
         if (scopeIt->second.text == "public")
             candidate.scope = PlayerbotSocialPrivacyScope::Public;

@@ -43,6 +43,18 @@ class GenerationUsage:
         )
 
 
+@dataclass(frozen=True)
+class SocialGenerationResult:
+    """One validated social proposal plus the provider usage that produced it."""
+
+    message: str
+    emote_id: int
+    contribution: str
+    claim_subject: str
+    cited_evidence_ids: tuple[str, ...]
+    usage: GenerationUsage
+
+
 class GenerationBillingStatus(StrEnum):
     KNOWN = "known"
     IMPOSSIBLE = "impossible"
@@ -109,7 +121,7 @@ class GenerationProvider(Protocol):
 
     def count_social_input_tokens(self, request: protocol.SocialRequest) -> int: ...
 
-    def generate_social_reply(self, request: protocol.SocialRequest) -> tuple[str, int, GenerationUsage]: ...
+    def generate_social_reply(self, request: protocol.SocialRequest) -> SocialGenerationResult: ...
 
     def count_roleplay_assessment_input_tokens(self, request: protocol.RoleplayAssessmentRequest) -> int: ...
 

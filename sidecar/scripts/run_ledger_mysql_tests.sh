@@ -23,7 +23,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIDECAR="$(dirname "${HERE}")"
 ROOT="$(cd "${SIDECAR}/../../.." && pwd)"
 PLAYERBOTS_SQL="${ROOT}/modules/mod-playerbots/data/sql/playerbots"
-CPP_TEST_BINARY="${ROOT}/build-playerbot-claude-tests/src/test/unit_tests"
+CPP_TEST_BINARY="${CPP_TEST_BINARY:-${ROOT}/build-playerbot-claude-tests/src/test/unit_tests}"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
   echo "container ${CONTAINER} already exists; remove it first" >&2
@@ -75,6 +75,16 @@ if [ ! -x "${CPP_TEST_BINARY}" ]; then
   echo "C++ unit test binary is missing; build unit_tests before running this harness" >&2
   exit 1
 fi
+
+case "${CPP_TEST_BINARY}" in
+  /*) ;;
+  *)
+    echo "CPP_TEST_BINARY must be an absolute path: ${CPP_TEST_BINARY}" >&2
+    exit 1
+    ;;
+esac
+
+echo "using C++ unit test binary ${CPP_TEST_BINARY}"
 
 docker exec "${CONTAINER}" mysql -uroot "-p${PASSWORD}" \
   -e "CREATE DATABASE \`${CPP_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"

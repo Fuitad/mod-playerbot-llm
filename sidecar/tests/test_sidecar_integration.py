@@ -65,6 +65,21 @@ def social_request_payload(schema_version: int = protocol.SOCIAL_SCHEMA_VERSION)
             "speak_on_channel": 2,
             "thread_id": "thr_00000000000000000000000000000001",
             "context": "party pull",
+            "evidence": [
+                {
+                    "id": "g1",
+                    "subject": "candidate_bot",
+                    "fact": "name",
+                    "value": "Grimbold",
+                    "provenance": "current_world",
+                    "scope": "public",
+                    "observed_at": 1000,
+                }
+            ],
+            "transcript_event_ids": ["evt_00000000000000000000000000000001"],
+            "profile_load_state": "loaded",
+            "memory_input_state": "loaded",
+            "active_content_expansion": 0,
         }
     ).encode()
 
@@ -95,11 +110,16 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
     def count_social_input_tokens(self, request: protocol.SocialRequest) -> int:
         return self.input_tokens
 
-    def generate_social_reply(
-        self, request: protocol.SocialRequest
-    ) -> tuple[str, int, provider.GenerationUsage]:
+    def generate_social_reply(self, request: protocol.SocialRequest) -> provider.SocialGenerationResult:
         self.social_requests.append(request)
-        return self.reply, 0, provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10)
+        return provider.SocialGenerationResult(
+            message=self.reply,
+            emote_id=0,
+            contribution="fact_free_banter",
+            claim_subject="none",
+            cited_evidence_ids=(),
+            usage=provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10),
+        )
 
 
 @dataclass
@@ -166,7 +186,7 @@ async def test_authenticated_request_round_trips_over_real_socket(tmp_path) -> N
         assert harness.store.outstanding == {}
 
 
-async def test_social_v6_round_trips_while_social_v5_fails_closed(tmp_path) -> None:
+async def test_social_v7_round_trips_while_social_v6_fails_closed(tmp_path) -> None:
     async with running_sidecar(tmp_path) as harness:
         response = await round_trip(harness.port, social_request_payload())
 
@@ -181,7 +201,7 @@ async def test_social_v6_round_trips_while_social_v5_fails_closed(tmp_path) -> N
 
         await silent_round_trip(
             harness.port,
-            social_request_payload(schema_version=protocol.SCHEMA_VERSION),
+            social_request_payload(schema_version=protocol.SOCIAL_SCHEMA_VERSION - 1),
         )
 
 

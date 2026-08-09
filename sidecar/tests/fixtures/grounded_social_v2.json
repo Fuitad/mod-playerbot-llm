@@ -1,0 +1,258 @@
+{
+  "semantic_cases": [
+    {
+      "id": "wrong_level",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "level",
+          "value": "6",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I'm level 80.",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "candidate_bot",
+        "cited_evidence_ids": ["g1"]
+      },
+      "expected": "contradicted_evidence"
+    },
+    {
+      "id": "wrong_location",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "zone",
+          "value": "Elwynn Forest",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I'm in Westfall.",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "candidate_bot",
+        "cited_evidence_ids": ["g1"]
+      },
+      "expected": "contradicted_evidence"
+    },
+    {
+      "id": "supported_level_claim",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "level",
+          "value": "6",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I'm level 6.",
+        "emote": "",
+        "contribution": "answer",
+        "claim_subject": "candidate_bot",
+        "cited_evidence_ids": ["g1"]
+      },
+      "expected": "accepted"
+    },
+    {
+      "id": "supported_location_claim",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "zone",
+          "value": "Elwynn Forest",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I'm in Elwynn Forest.",
+        "emote": "",
+        "contribution": "answer",
+        "claim_subject": "candidate_bot",
+        "cited_evidence_ids": ["g1"]
+      },
+      "expected": "accepted"
+    },
+    {
+      "id": "unavailable_progression",
+      "active_content_expansion": 0,
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "source",
+          "fact": "objective",
+          "value": "continue questing",
+          "provenance": "authoritative_source",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "Northrend is where I'm headed.",
+        "emote": "",
+        "contribution": "fact_free_banter",
+        "claim_subject": "none",
+        "cited_evidence_ids": []
+      },
+      "expected": "unavailable_content"
+    },
+    {
+      "id": "adopted_accomplishment",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "participant",
+          "fact": "achievement",
+          "value": "cleared the dungeon",
+          "provenance": "human_observation",
+          "scope": "party",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I cleared that too.",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "none",
+        "cited_evidence_ids": []
+      },
+      "expected": "adopted_accomplishment"
+    },
+    {
+      "id": "question_about_supplied_fact",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "participant",
+          "fact": "level",
+          "value": "6",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "What level are you?",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "none",
+        "cited_evidence_ids": []
+      },
+      "expected": "supplied_fact_question"
+    },
+    {
+      "id": "generic_encouragement",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "source",
+          "fact": "quest",
+          "value": "completed",
+          "provenance": "authoritative_source",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "Good job!",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "none",
+        "cited_evidence_ids": []
+      },
+      "expected": "generic_filler"
+    },
+    {
+      "id": "wrong_subject_citation",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "name",
+          "value": "Grimbold",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "You're called Grimbold.",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "participant",
+        "cited_evidence_ids": ["g1"]
+      },
+      "expected": "evidence_subject_mismatch"
+    },
+    {
+      "id": "uncited_current_claim",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "objective",
+          "value": "gather herbs",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "I'm farming that now.",
+        "emote": "",
+        "contribution": "specific_reaction",
+        "claim_subject": "candidate_bot",
+        "cited_evidence_ids": []
+      },
+      "expected": "uncited_current_claim"
+    },
+    {
+      "id": "fact_free_relevant_banter",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "source",
+          "fact": "creature",
+          "value": "Defias Bandit",
+          "provenance": "authoritative_source",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "proposal": {
+        "response_kind": "message",
+        "message": "That pull got messy fast.",
+        "emote": "",
+        "contribution": "fact_free_banter",
+        "claim_subject": "none",
+        "cited_evidence_ids": []
+      },
+      "expected": "accepted"
+    }
+  ]
+}

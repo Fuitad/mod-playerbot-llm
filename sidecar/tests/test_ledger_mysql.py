@@ -73,6 +73,10 @@ LEGACY_SOCIAL_REVISIONS = (
 )
 LLM_TABLE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_07_00_playerbot_llm_tables.sql"
 BOT_PURGE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_08_00_playerbot_llm_bot_purge.sql"
+PROFILE_V3_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_09_00_playerbot_social_profile_v3.sql"
+PROFILE_V3_PREREQUISITES = tuple(
+    revision for revision in SQL_REVISIONS if revision.name < PROFILE_V3_MIGRATION.name
+)
 PROVIDER_TABLE_SUFFIXES = (
     "daily_budget",
     "budget_reservation",
@@ -484,6 +488,64 @@ async def test_fresh_migration_runs_before_sidecar_schema_initialization() -> No
             set(schema.REQUIRED_MODULE_TABLES) - {"playerbot_social_runtime_control"}
             | set(schema.SIDECAR_OWNED_TABLES)
         )
+
+
+async def test_profile_v3_migration_preserves_only_coherent_v2_traits() -> None:
+    async with _isolated_database("profile_v3_migration") as database:
+        await _apply_revisions(database, PROFILE_V3_PREREQUISITES)
+        await _execute_statements(
+            database,
+            (
+                "INSERT INTO playerbot_social_actor "
+                "(id, public_id, character_guid, display_name, actor_kind, last_seen_at) VALUES "
+                "(1, 'act_00000000000000000000000000000001', 41, 'Coherent', 'bot', "
+                "'2026-08-09 12:00:00'), "
+                "(2, 'act_00000000000000000000000000000002', 42, 'Mixed', 'bot', "
+                "'2026-08-09 12:00:00'), "
+                "(3, 'act_00000000000000000000000000000003', 43, 'Future', 'bot', "
+                "'2026-08-09 12:00:00')",
+                "INSERT INTO playerbot_social_profile "
+                "(bot_actor_id, schema_version, traits_version, social_traits, biography_state, "
+                "biography_request_token, biography_attempted_at, biography, biography_generated_at) VALUES "
+                "(1, 2, 2, JSON_OBJECT('warmth', 71, 'interests', JSON_ARRAY('mining')), "
+                "'ready', 99, '2026-08-09 12:00:00', JSON_OBJECT('version', 2), '2026-08-09 12:01:00'), "
+                "(2, 2, 3, JSON_OBJECT('warmth', 52), 'ready', 98, '2026-08-09 12:00:00', "
+                "JSON_OBJECT('version', 2), '2026-08-09 12:01:00'), "
+                "(3, 4, 4, JSON_OBJECT('warmth', 83), 'ready', 97, '2026-08-09 12:00:00', "
+                "JSON_OBJECT('version', 4), '2026-08-09 12:01:00')",
+            ),
+        )
+
+        await _apply_revisions(database, (PROFILE_V3_MIGRATION, PROFILE_V3_MIGRATION))
+
+        settings = _settings()
+        connection = await aiomysql.connect(
+            host=settings.host,
+            port=settings.port,
+            user=settings.user,
+            password=settings.password,
+            db=database,
+            autocommit=True,
+        )
+        try:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT bot_actor_id, schema_version, traits_version, "
+                    "JSON_UNQUOTE(JSON_EXTRACT(social_traits, '$.warmth')), biography_state, "
+                    "biography_request_token, biography_attempted_at, biography, biography_generated_at "
+                    "FROM playerbot_social_profile ORDER BY bot_actor_id"
+                )
+                rows = await cursor.fetchall()
+        finally:
+            connection.close()
+
+        assert rows[0] == (1, 3, 3, "71", "absent", 0, None, None, None)
+        assert rows[1][0:7] == (2, 2, 3, "52", "ready", 98, datetime(2026, 8, 9, 12, 0))
+        assert rows[1][7] == '{"version": 2}'
+        assert rows[1][8] == datetime(2026, 8, 9, 12, 1)
+        assert rows[2][0:7] == (3, 4, 4, "83", "ready", 97, datetime(2026, 8, 9, 12, 0))
+        assert rows[2][7] == '{"version": 4}'
+        assert rows[2][8] == datetime(2026, 8, 9, 12, 1)
 
 
 async def test_full_legacy_migration_preserves_every_provider_table_and_row() -> None:

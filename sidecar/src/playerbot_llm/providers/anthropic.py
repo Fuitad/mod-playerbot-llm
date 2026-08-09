@@ -22,7 +22,6 @@ from playerbot_llm.generation import (
     ChatReply,
     MemoryReply,
     MessageParam,
-    ModerationCategory,
     SocialReply,
     _biography_messages,
     _build_messages,
@@ -37,8 +36,7 @@ from playerbot_llm.generation import (
     build_social_system_prompt,
     build_system_prompt,
     validate_memory_reply,
-    validate_social_emote,
-    validate_social_message,
+    validate_social_reply,
 )
 
 API_KEY_ENV_VAR = "MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY"
@@ -206,9 +204,7 @@ class AnthropicProvider:
 
         return result.input_tokens
 
-    def generate_social_reply(
-        self, request: protocol.SocialRequest
-    ) -> tuple[str, int, provider.GenerationUsage]:
+    def generate_social_reply(self, request: protocol.SocialRequest) -> provider.SocialGenerationResult:
         system = build_social_system_prompt(request)
         messages = _social_messages(request)
         try:
@@ -244,20 +240,15 @@ class AnthropicProvider:
                 "model output did not match the social reply schema", totals
             )
 
-        # Exactly one answer. Both filled is the model hedging, and picking one for it would
-        # be inventing an intention it did not have; neither filled is silence, which schema 3
-        # cannot express, so it is a regeneration rather than something to deliver.
-        if parsed.emote and parsed.message.strip():
-            raise provider.GenerationInvalidOutputError(
-                "model answered with both a line and a gesture",
-                totals,
-                ModerationCategory.BOTH_ANSWERS,
-            )
-
-        if parsed.emote:
-            return "", validate_social_emote(parsed.emote, request, totals), totals
-
-        return validate_social_message(parsed.message, request, totals), 0, totals
+        message, emote_id = validate_social_reply(parsed, request, totals)
+        return provider.SocialGenerationResult(
+            message=message,
+            emote_id=emote_id,
+            contribution=parsed.contribution,
+            claim_subject=parsed.claim_subject,
+            cited_evidence_ids=tuple(parsed.cited_evidence_ids),
+            usage=totals,
+        )
 
     def count_roleplay_assessment_input_tokens(self, request: protocol.RoleplayAssessmentRequest) -> int:
         try:
@@ -442,9 +433,7 @@ class AnthropicProvider:
                 "model output did not match the memory schema", totals
             )
 
-        accepted = validate_memory_reply(
-            parsed, list(request.thread), request.subject_guids, request.scope, totals
-        )
+        accepted = validate_memory_reply(parsed, request, totals)
         return accepted, totals
 
     def generate_reply(
