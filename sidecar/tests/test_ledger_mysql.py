@@ -157,6 +157,35 @@ async def _connect() -> aiomysql.Connection:
     )
 
 
+def _revision_statements(revision: Path) -> tuple[str, ...]:
+    delimiter = ";"
+    current: list[str] = []
+    statements: list[str] = []
+
+    for line in revision.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("DELIMITER "):
+            if any(part.strip() for part in current):
+                raise ValueError(f"{revision.name} changes delimiter inside a statement")
+            delimiter = stripped.split(maxsplit=1)[1]
+            continue
+
+        current.append(line)
+        if not line.rstrip().endswith(delimiter):
+            continue
+
+        statement = "\n".join(current)
+        statement = statement[: statement.rfind(delimiter)].strip()
+        if statement:
+            statements.append(statement)
+        current.clear()
+
+    if any(part.strip() for part in current):
+        raise ValueError(f"{revision.name} ends with an unterminated statement")
+
+    return tuple(statements)
+
+
 def _settings_for(database: str) -> PlayerbotsDatabaseSettings:
     settings = _settings()
     return PlayerbotsDatabaseSettings(
@@ -182,9 +211,8 @@ async def _apply_revisions(database: str, revisions: tuple[Path, ...]) -> None:
     try:
         for revision in revisions:
             async with connection.cursor() as cursor:
-                await cursor.execute(revision.read_text())
-                while await cursor.nextset():
-                    pass
+                for statement in _revision_statements(revision):
+                    await cursor.execute(statement)
     finally:
         connection.close()
 
@@ -278,11 +306,11 @@ async def _isolated_database(suffix: str) -> AsyncIterator[str]:
 async def _apply_deployed_schema() -> None:
     """Runs the module's SQL revisions, in order, against the test database.
 
-    Sent as whole files rather than split on semicolons, because the revisions build their
-    DDL as a quoted string for ``PREPARE`` and that string contains semicolons of its own.
-    A naive splitter cuts those statements in half; the server's parser does not. Every
-    revision is idempotent, so running them against a database that already has them is
-    the no-op they are written to be.
+    Statements are split only at the active MySQL client delimiter. This preserves quoted
+    DDL used by ``PREPARE`` and lets procedure migrations use ``DELIMITER`` directives,
+    which the server protocol itself does not understand. Every revision is idempotent,
+    so running them against a database that already has them is the no-op they are written
+    to be.
     """
 
     settings = _settings()
@@ -320,9 +348,8 @@ async def _apply_deployed_schema() -> None:
                 # note the driver raises as a Python warning, one per table per test.
                 await cursor.execute("SET sql_notes = 0")
                 try:
-                    await cursor.execute(revision.read_text())
-                    while await cursor.nextset():
-                        pass
+                    for statement in _revision_statements(revision):
+                        await cursor.execute(statement)
                 finally:
                     await cursor.execute("SET sql_notes = 1")
     finally:
