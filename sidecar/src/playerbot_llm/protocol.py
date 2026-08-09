@@ -301,7 +301,7 @@ class CareerCandidate(BaseModel):
 class CareerRequestContent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    personality_version: Literal[2]
+    personality_version: Literal[4]
     career_version: Literal[1]
     candidates: Annotated[list[CareerCandidate], Field(min_length=1, max_length=256)]
 

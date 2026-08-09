@@ -290,7 +290,7 @@ TEST(PlayerbotLLMProtocolTest, AmbientRequestSerializesToExactContractJson)
 TEST(PlayerbotLLMProtocolTest, CareerRequestUsesOpaqueCandidates)
 {
     PlayerbotCareerPlanRequest request;
-    request.personalityVersion = 2u;
+    request.personalityVersion = PLAYERBOT_PERSONALITY_API_VERSION;
     request.careerVersion = 1u;
     request.candidates =
     {
@@ -301,7 +301,7 @@ TEST(PlayerbotLLMProtocolTest, CareerRequestUsesOpaqueCandidates)
 
     EXPECT_EQ(
         SerializeCareerRequestContent(request).value(),
-        "{\"personality_version\":2,\"career_version\":1,\"candidates\":["
+        "{\"personality_version\":4,\"career_version\":1,\"candidates\":["
         "{\"token\":\"career-none\",\"summary\":\"no professions\","
         "\"maximum_spending_style\":\"none\",\"market_eligible\":0,\"engagement\":0},"
         "{\"token\":\"career-deadbeef\",\"summary\":\"mixed primary professions\","

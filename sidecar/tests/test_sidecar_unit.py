@@ -94,7 +94,7 @@ def career_request_dict() -> dict[str, object]:
         occurrence=0,
         message=json.dumps(
             {
-                "personality_version": 2,
+                "personality_version": 4,
                 "career_version": 1,
                 "candidates": [
                     {
@@ -324,7 +324,7 @@ def test_rejects_ambient_identity_fields_on_direct_chat() -> None:
 def test_accepts_only_opaque_bounded_career_candidates() -> None:
     request = parse(career_request_dict())
     assert request.is_career
-    assert request.career_content.personality_version == 2
+    assert request.career_content.personality_version == 4
     assert request.career_content.career_version == 1
     assert [candidate.token for candidate in request.career_content.candidates] == [
         "career-abc123",
@@ -343,6 +343,13 @@ def test_accepts_only_opaque_bounded_career_candidates() -> None:
         payload[field] = invalid
         with pytest.raises(protocol.ProtocolError):
             parse(payload)
+
+    payload = career_request_dict()
+    content = json.loads(str(payload["message"]))
+    content["personality_version"] = 2
+    payload["message"] = json.dumps(content, separators=(",", ":"))
+    with pytest.raises(protocol.ProtocolError):
+        parse(payload)
 
 
 def test_rejects_career_raw_ids_duplicates_and_invalid_styles() -> None:
