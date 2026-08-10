@@ -38,8 +38,8 @@ jobs:
     name: Worldserver module (C++)
     runs-on: ubuntu-24.04
     env:
-      # The playerbot-compatible AzerothCore. Must match what Fuitad/mod-playerbots-upstream targets.
-      CORE_REPOSITORY: Fuitad/azerothcore-wotlk
+      # The public Playerbot compatible AzerothCore targeted by the Playerbots fork.
+      CORE_REPOSITORY: mod-playerbots/azerothcore-wotlk
       CORE_REF: Playerbot
     steps:
       - name: Check out mod-playerbot-llm
