@@ -16,6 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check out the public Social contract
+        uses: actions/checkout@v4
+        with:
+          repository: Fuitad/mod-playerbots-social
+          path: social-contract
+
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
@@ -34,6 +40,8 @@ jobs:
 
       - name: Tests (unit and socket integration, fully offline)
         run: uv run pytest -q
+        env:
+          PLAYERBOTS_SOCIAL_ROOT: ${{ github.workspace }}/social-contract
 
   worldserver-module:
     name: Worldserver module (C++)

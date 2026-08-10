@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 import re
 import time
 from datetime import UTC, datetime
@@ -3535,10 +3536,13 @@ def test_the_forbidden_claim_list_has_not_drifted_from_the_worldserver() -> None
     by reading the C++ source rather than by trusting that both were updated together. This
     is the exact failure shape Task 8 found in six consecutive review rounds.
     """
-    source = (
-        Path(__file__).resolve().parents[3]
-        / "mod-playerbots-social/src/Bot/Social/PlayerbotSocialPersonality.cpp"
+    configured_root = os.environ.get("PLAYERBOTS_SOCIAL_ROOT")
+    social_root = (
+        Path(configured_root)
+        if configured_root
+        else Path(__file__).resolve().parents[3] / "mod-playerbots-social"
     )
+    source = social_root / "src/Bot/Social/PlayerbotSocialPersonality.cpp"
     text = source.read_text(encoding="utf-8")
     block = text.split("FORBIDDEN_CLAIM_TERMS[] = {", 1)[1].split("};", 1)[0]
     worldserver_terms = set(re.findall(r'"([^"]+)"', block))
