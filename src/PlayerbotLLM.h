@@ -5,6 +5,7 @@
 #ifndef MOD_PLAYERBOT_LLM_H
 #define MOD_PLAYERBOT_LLM_H
 
+#include "Define.h"
 #include "PlayerbotPersonality.h"
 #include "PlayerbotCareerPlan.h"
 
