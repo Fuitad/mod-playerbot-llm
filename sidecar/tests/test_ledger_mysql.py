@@ -53,27 +53,23 @@ TOKEN = "0123456789abcdef0123456789abcdef"
 
 # The deployed schema, from the files that actually deploy it.
 #
-# The budget tables belong to mod-playerbots, not to the sidecar. Reproducing their shape
-# in a fixture would let the two drift apart and let this suite keep passing while the
-# sidecar wrote columns the real database does not have, which is exactly the failure that
-# put the reconciliation in the plan. Applying the revisions themselves means a column
-# renamed there fails here, in the run that renames it.
+# The module migrations are the deployed schema authority. Reproducing their shape in a
+# fixture would let the copies drift apart while this suite kept passing.
+MODULES_ROOT = Path(__file__).resolve().parents[3]
+SOCIAL_UPDATES = MODULES_ROOT / "mod-playerbots-social" / "data" / "sql" / "db_playerbot" / "updates"
+LLM_UPDATES = MODULES_ROOT / "mod-playerbot-llm" / "data" / "sql" / "db_playerbot" / "updates"
 SQL_REVISIONS = sorted(
-    (Path(__file__).resolve().parents[3] / "mod-playerbots" / "data" / "sql" / "playerbots" / "updates").glob(
-        "2026_08_*.sql"
-    )
+    (*SOCIAL_UPDATES.glob("2026_08_*.sql"), *LLM_UPDATES.glob("2026_08_*.sql")),
+    key=lambda revision: revision.name,
 )
 
-PLAYERBOTS_UPDATES = (
-    Path(__file__).resolve().parents[3] / "mod-playerbots" / "data" / "sql" / "playerbots" / "updates"
-)
 LEGACY_SOCIAL_REVISIONS = (
-    PLAYERBOTS_UPDATES / "2026_08_01_00_playerbot_social_schema.sql",
-    PLAYERBOTS_UPDATES / "2026_08_04_00_playerbot_budget_lane_unspecified.sql",
+    SOCIAL_UPDATES / "2026_08_01_00_playerbot_social_schema.sql",
+    LLM_UPDATES / "2026_08_04_00_playerbot_budget_lane_unspecified.sql",
 )
-LLM_TABLE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_07_00_playerbot_llm_tables.sql"
-BOT_PURGE_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_08_00_playerbot_llm_bot_purge.sql"
-PROFILE_V3_MIGRATION = PLAYERBOTS_UPDATES / "2026_08_09_00_playerbot_social_profile_v3.sql"
+LLM_TABLE_MIGRATION = LLM_UPDATES / "2026_08_07_00_playerbot_llm_tables.sql"
+BOT_PURGE_MIGRATION = LLM_UPDATES / "2026_08_08_00_playerbot_llm_bot_purge.sql"
+PROFILE_V3_MIGRATION = SOCIAL_UPDATES / "2026_08_09_00_playerbot_social_profile_v3.sql"
 PROFILE_V3_PREREQUISITES = tuple(
     revision for revision in SQL_REVISIONS if revision.name < PROFILE_V3_MIGRATION.name
 )

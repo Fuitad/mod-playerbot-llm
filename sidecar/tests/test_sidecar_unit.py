@@ -3536,7 +3536,8 @@ def test_the_forbidden_claim_list_has_not_drifted_from_the_worldserver() -> None
     is the exact failure shape Task 8 found in six consecutive review rounds.
     """
     source = (
-        Path(__file__).resolve().parents[3] / "mod-playerbots/src/Bot/Personality/PlayerbotPersonality.cpp"
+        Path(__file__).resolve().parents[3]
+        / "mod-playerbots-social/src/Bot/Social/PlayerbotSocialPersonality.cpp"
     )
     text = source.read_text(encoding="utf-8")
     block = text.split("FORBIDDEN_CLAIM_TERMS[] = {", 1)[1].split("};", 1)[0]

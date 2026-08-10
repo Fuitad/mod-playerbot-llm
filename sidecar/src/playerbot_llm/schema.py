@@ -86,7 +86,7 @@ SCHEMA_STATEMENTS = (
 #
 # `playerbot_llm_daily_budget`, `playerbot_llm_budget_reservation`, and the
 # `playerbot_social_runtime_control` row that carries the circuit breaker belong to
-# mod-playerbots and are created by its SQL revisions. The sidecar used to carry a second
+# the LLM and Social modules and are created by their SQL revisions. The sidecar used to carry a second
 # definition of the first two here, with different column names, integer nano money
 # instead of decimal dollars, and a breaker on the daily row. Both definitions used
 # CREATE TABLE IF NOT EXISTS, so whichever ran first won and the other silently did
@@ -437,8 +437,8 @@ async def ensure_schema(connection) -> None:
 
     if not legacy_present and not neutral_present and missing:
         raise LedgerError(
-            "the mod-playerbots social schema is missing from this database "
-            f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
+            "the Playerbot LLM or Social schema is missing from this database "
+            f"({', '.join(missing)}); apply each module's data/sql/db_playerbot/updates before starting"
         )
 
     if legacy_present or not (fresh_neutral or complete_neutral):
@@ -456,14 +456,14 @@ async def ensure_schema(connection) -> None:
         )
 
     if missing:
-        # Refused rather than created. These tables belong to the mod-playerbots SQL
-        # revisions, and a sidecar that creates its own version of them is how the two
+        # Refused rather than created. These tables belong to the module SQL revisions,
+        # and a sidecar that creates its own version of them is how the two
         # definitions diverged in the first place. A missing table here means the
         # revisions have not been applied to this database, which is an operator
         # problem with an operator fix.
         raise LedgerError(
-            "the mod-playerbots social schema is missing from this database "
-            f"({', '.join(missing)}); apply data/sql/playerbots/updates before starting"
+            "the Playerbot LLM or Social schema is missing from this database "
+            f"({', '.join(missing)}); apply each module's data/sql/db_playerbot/updates before starting"
         )
 
     validated_tables = set(neutral_present)

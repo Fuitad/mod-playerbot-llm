@@ -22,7 +22,9 @@ IMAGE=mysql:8.0
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIDECAR="$(dirname "${HERE}")"
 ROOT="$(cd "${SIDECAR}/../../.." && pwd)"
-PLAYERBOTS_SQL="${ROOT}/modules/mod-playerbots/data/sql/playerbots"
+PLAYERBOTS_BASE_SQL="${ROOT}/modules/mod-playerbots/data/sql/playerbots/base"
+SOCIAL_UPDATES="${ROOT}/modules/mod-playerbots-social/data/sql/db_playerbot/updates"
+LLM_UPDATES="${ROOT}/modules/mod-playerbot-llm/data/sql/db_playerbot/updates"
 CPP_TEST_BINARY="${CPP_TEST_BINARY:-${ROOT}/build-playerbot-claude-tests/src/test/unit_tests}"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
@@ -89,7 +91,7 @@ echo "using C++ unit test binary ${CPP_TEST_BINARY}"
 docker exec "${CONTAINER}" mysql -uroot "-p${PASSWORD}" \
   -e "CREATE DATABASE \`${CPP_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 
-for sql_file in "${PLAYERBOTS_SQL}"/base/*.sql; do
+for sql_file in "${PLAYERBOTS_BASE_SQL}"/*.sql; do
   awk '
     /^CREATE TABLE/ { emitting = 1 }
     emitting { print }
@@ -97,9 +99,9 @@ for sql_file in "${PLAYERBOTS_SQL}"/base/*.sql; do
   ' "${sql_file}" | docker exec -i "${CONTAINER}" mysql -uroot "-p${PASSWORD}" "${CPP_DATABASE}"
 done
 
-for sql_file in "${PLAYERBOTS_SQL}"/updates/2026_08_*.sql; do
+while IFS= read -r sql_file; do
   docker exec -i "${CONTAINER}" mysql -uroot "-p${PASSWORD}" "${CPP_DATABASE}" < "${sql_file}"
-done
+done < <(printf '%s\n' "${SOCIAL_UPDATES}"/2026_08_*.sql "${LLM_UPDATES}"/2026_08_*.sql | sort)
 
 GCOV_PREFIX="${GCOV_DIR}" \
   PLAYERBOT_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${CPP_DATABASE}" \

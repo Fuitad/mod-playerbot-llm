@@ -6,8 +6,9 @@ a reservation, and settling or releasing one. That split is deliberate. A rule e
 a transaction is a rule the tests can reach only through a transaction, and the arithmetic
 is the part that has to be right.
 
-The tables this writes belong to mod-playerbots, not to the sidecar. The ownership
-boundary and the startup guard that enforces it live in :mod:`playerbot_llm.schema`.
+The tables this writes belong to the mod-playerbot-llm migrations, not to the
+sidecar runtime. The ownership boundary and the startup guard that enforces it
+live in :mod:`playerbot_llm.schema`.
 
 Concurrency rests on one named lock. Every reservation takes ``budget_day`` through
 :func:`playerbot_llm.schema.acquire_named_lock` before reading anything, so two
