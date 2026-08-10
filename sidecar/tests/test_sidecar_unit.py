@@ -1239,6 +1239,32 @@ async def test_bot_purge_worker_gates_connections_retries_and_stops(tmp_path) ->
     assert retry_state.purge_calls == 2
 
 
+async def test_serve_routes_successful_lifecycle_messages_to_stdout(monkeypatch, capsys) -> None:
+    config = app.SidecarConfig(enable=True, bridge_port=0)
+    store = FakeState(config.budget_nano)
+    handler_ready = asyncio.Event()
+    signal_handlers = []
+    loop = asyncio.get_running_loop()
+
+    def capture_signal_handler(_signal_number, handler) -> None:
+        signal_handlers.append(handler)
+        handler_ready.set()
+
+    monkeypatch.setattr(loop, "add_signal_handler", capture_signal_handler)
+    server = asyncio.create_task(app.serve(config, TEST_TOKEN, adapter=FakeAdapter(), store=store))
+
+    await asyncio.wait_for(handler_ready.wait(), timeout=1)
+    signal_handlers[0]()
+    await asyncio.wait_for(server, timeout=1)
+
+    captured = capsys.readouterr()
+    assert re.fullmatch(
+        r"playerbot-llm: listening on 127\.0\.0\.1:\d+\nplayerbot-llm: shutting down\n",
+        captured.out,
+    )
+    assert captured.err == ""
+
+
 async def test_the_service_makes_no_generation_call_without_a_budget(tmp_path) -> None:
     service, store, adapter = make_stored_service(tmp_path, daily_budget="0")
     assert await service.process_payload(CPP_REQUEST_FIXTURE.encode()) is None

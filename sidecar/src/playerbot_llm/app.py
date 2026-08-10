@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from typing import TextIO
 
 from playerbot_llm import budget, generation, ledger, protocol, provider, state
 from playerbot_llm import store as store_module
@@ -1133,7 +1134,7 @@ async def serve(
             loop.add_signal_handler(signal_number, stop.set)
 
         address = server.sockets[0].getsockname() if server.sockets else ("127.0.0.1", 0)
-        _log(f"listening on 127.0.0.1:{address[1]}")
+        _log(f"listening on 127.0.0.1:{address[1]}", stream=sys.stdout)
 
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(run_bot_purge_worker(service, stop))
@@ -1143,11 +1144,11 @@ async def serve(
         if pool is not None:
             await state.close_pool(pool)
 
-    _log("shutting down")
+    _log("shutting down", stream=sys.stdout)
 
 
-def _log(message: str) -> None:
-    print(f"playerbot-llm: {message}", file=sys.stderr, flush=True)
+def _log(message: str, *, stream: TextIO | None = None) -> None:
+    print(f"playerbot-llm: {message}", file=sys.stderr if stream is None else stream, flush=True)
 
 
 def _default_provider(config: SidecarConfig) -> provider.GenerationProvider:
