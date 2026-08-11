@@ -9,6 +9,7 @@
 #include "ChannelMgr.h"
 #include "Chat.h"
 #include "Config.h"
+#include "DatabaseEnv.h"
 #include "Group.h"
 #include "Item.h"
 #include "ItemTemplate.h"
@@ -18,11 +19,11 @@
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
-#include "VanillaOnlyRules.h"
 
 #include "Bot/Personality/PlayerbotPersonalityMgr.h"
 #include "Bot/Social/PlayerbotSocialMgr.h"
 #include "Bot/Social/PlayerbotSocialRoute.h"
+#include "Bot/Extension/PlayerbotExtension.h"
 #include "ExternalEventHelper.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotAIConfig.h"
@@ -53,6 +54,34 @@ namespace
     {
         PlayerbotCareerPlanRequest request;
         int64 expiresAtSteadyMs = 0;
+    };
+
+    class PlayerbotLLMPurgeExtension final : public PlayerbotExtension
+    {
+    public:
+        bool PrepareBotPurge(std::vector<std::uint32_t> const& botGuids) override
+        {
+            for (std::uint32_t guid : botGuids)
+            {
+                PlayerbotsDatabase.DirectExecute(
+                    "INSERT INTO playerbot_llm_bot_purge (bot_guid, acknowledged_at) VALUES ({}, NULL) "
+                    "ON DUPLICATE KEY UPDATE acknowledged_at = NULL",
+                    guid);
+            }
+
+            for (std::uint32_t guid : botGuids)
+            {
+                QueryResult const result = PlayerbotsDatabase.Query(
+                    "SELECT COUNT(*) FROM playerbot_llm_bot_purge WHERE bot_guid = {} AND acknowledged_at IS NULL",
+                    guid);
+                if (!result || result->Fetch()[0].Get<uint64>() != 1)
+                {
+                    LOG_ERROR("playerbot.llm", "Could not verify the durable LLM purge intent for bot {}.", guid);
+                    return false;
+                }
+            }
+            return true;
+        }
     };
 
     bool IsMachineBot(Player* candidate)
@@ -104,7 +133,7 @@ namespace
 
         ChannelMgr* channelManager = ChannelMgr::forTeam(player->GetTeamId());
         Channel* worldChannel = channelManager ? channelManager->GetChannel("World", player) : nullptr;
-        return worldChannel && worldChannel->IsOn(player->GetGUID());
+        return worldChannel && player->IsInChannel(worldChannel);
     }
 
     bool EqualNamesCaseInsensitive(std::string const& a, std::string const& b)
@@ -360,7 +389,7 @@ namespace
             request.classId = classId;
             request.genderId = genderId;
             request.botLevel = bot->GetLevel();
-            request.activeContentExpansion = VanillaOnlyRules::ActiveContentExpansion();
+            request.activeContentExpansion = PlayerbotSocialActiveContentExpansion();
 
             if (!PlayerbotLLM::BiographyRequestIsUsable(request, _bridgeToken))
                 return false;
@@ -1235,6 +1264,8 @@ namespace
 
 void AddPlayerbotLLMScripts()
 {
+    static PlayerbotLLMPurgeExtension purgeExtension;
+    GetPlayerbotExtensionRegistry().Register(purgeExtension);
     new PlayerbotLLMPlayerScript();
     new PlayerbotLLMWorldScript();
 }

@@ -101,6 +101,14 @@ jobs:
       - name: Verify the pinned revision resolved exactly
         run: test "$(git -C azerothcore/modules/mod-playerbots rev-parse HEAD)" = "${{ steps.pin.outputs.revision }}"
 
+      - name: Apply the public core test harness patch until it is merged
+        run: |
+          if ! grep -q 'target_link_libraries(unit_tests modules scripts)' azerothcore/src/test/CMakeLists.txt ||
+             ! grep -q 'GetPlayerbotsDBRevision' azerothcore/src/test/mocks/WorldMock.h; then
+            git -C azerothcore apply \
+              modules/mod-playerbots/patches/azerothcore-playerbot-test-harness.patch
+          fi
+
       - name: Place this module in the core tree
         run: cp -R module azerothcore/modules/mod-playerbot-llm
 

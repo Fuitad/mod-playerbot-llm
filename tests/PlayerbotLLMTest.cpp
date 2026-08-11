@@ -1375,9 +1375,11 @@ TEST(PlayerbotLLMSocialProtocolTest, ASocialRequestIsRefusedBeforeAnOversizeFram
              {"unusable subject", [](PlayerbotLLM::SocialRequest& r) { r.subject.name = std::string(200, 'a'); }},
              {"empty thread", [](PlayerbotLLM::SocialRequest& r) { r.threadPublicId.clear(); }},
              {"long thread",
-              [](PlayerbotLLM::SocialRequest& r) { r.threadPublicId = std::string(PlayerbotLLM::MAX_THREAD_ID_BYTES + 1, 'a'); }},
+              [](PlayerbotLLM::SocialRequest& r)
+              { r.threadPublicId = std::string(PlayerbotLLM::MAX_THREAD_ID_BYTES + 1, 'a'); }},
              {"long context",
-              [](PlayerbotLLM::SocialRequest& r) { r.context = std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_BYTES + 1, 'a'); }}})
+              [](PlayerbotLLM::SocialRequest& r)
+              { r.context = std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_BYTES + 1, 'a'); }}})
     {
         PlayerbotLLM::SocialRequest bad = good;
         mutate(bad);
@@ -3063,7 +3065,7 @@ TEST(PlayerbotLLMRoleplayProtocolTest, UnusableRequestsAreRefusedBeforeSerializa
 TEST(PlayerbotLLMRoleplayProtocolTest, EveryValidAssessmentShapeRoundTrips)
 {
     using Kind = PlayerbotRoleplayAssessmentKind;
-    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+    using Capability = PlayerbotSocialContentCapability;
 
     struct Case
     {

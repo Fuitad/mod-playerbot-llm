@@ -1664,7 +1664,7 @@ async def test_retiring_superseded_locks_is_opt_in_and_leaves_live_keys_alone(cl
     assert [r[0] for r in rows] == ["ambient", "budget_day", "conversation:5"]
 
 
-# The façade the service actually talks to ------------------------------------------
+# The façade the service actually talks to.
 
 
 @pytest.fixture

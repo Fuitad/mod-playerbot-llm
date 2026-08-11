@@ -2732,9 +2732,9 @@ std::optional<PlayerbotLLM::MemoryResponse> PlayerbotLLM::ParseMemoryResponsePay
 
 // --- Roleplay assessment lane ---
 
-char const* PlayerbotLLM::RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability)
+char const* PlayerbotLLM::RoleplayContentCapabilityName(PlayerbotSocialContentCapability capability)
 {
-    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+    using Capability = PlayerbotSocialContentCapability;
 
     switch (capability)
     {
@@ -2763,10 +2763,10 @@ char const* PlayerbotLLM::RoleplayContentCapabilityName(VanillaOnlyRules::Rolepl
     return "invalid";
 }
 
-std::optional<VanillaOnlyRules::RoleplayContentCapability> PlayerbotLLM::RoleplayContentCapabilityFromName(
+std::optional<PlayerbotSocialContentCapability> PlayerbotLLM::RoleplayContentCapabilityFromName(
     std::string const& name)
 {
-    using Capability = VanillaOnlyRules::RoleplayContentCapability;
+    using Capability = PlayerbotSocialContentCapability;
 
     // Exact match only, same as every other wire spelling in this protocol.
     if (name == "classic_content")
@@ -2936,7 +2936,7 @@ std::optional<PlayerbotLLM::RoleplayAssessmentResponse> PlayerbotLLM::ParseRolep
         if (capabilityIt == fields->end() || !capabilityIt->second.isString)
             return std::nullopt;
 
-        std::optional<VanillaOnlyRules::RoleplayContentCapability> const capability =
+        std::optional<PlayerbotSocialContentCapability> const capability =
             RoleplayContentCapabilityFromName(capabilityIt->second.text);
         if (!capability)
             return std::nullopt;

@@ -873,12 +873,12 @@ namespace PlayerbotLLM
     {
         uint64 assessmentToken = 0;
         PlayerbotRoleplayAssessmentKind kind = PlayerbotRoleplayAssessmentKind::Ordinary;
-        std::vector<VanillaOnlyRules::RoleplayContentCapability> capabilities;
+        std::vector<PlayerbotSocialContentCapability> capabilities;
     };
 
     // Wire spellings of the ten capability values, shared with the sidecar's Literal.
-    [[nodiscard]] char const* RoleplayContentCapabilityName(VanillaOnlyRules::RoleplayContentCapability capability);
-    [[nodiscard]] std::optional<VanillaOnlyRules::RoleplayContentCapability> RoleplayContentCapabilityFromName(
+    [[nodiscard]] char const* RoleplayContentCapabilityName(PlayerbotSocialContentCapability capability);
+    [[nodiscard]] std::optional<PlayerbotSocialContentCapability> RoleplayContentCapabilityFromName(
         std::string const& name);
 
     // Wire spellings of the six assessment kinds, parsed strictly: anything else is malformed.
