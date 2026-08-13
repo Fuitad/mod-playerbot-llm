@@ -40,7 +40,7 @@ class RequestKind(enum.Enum):
 
     The values are the deployed ``request_kind`` enumerators, character for character.
     They are not the sidecar's own vocabulary: the column belongs to the
-    mod-playerbot-llm schema, and a value this enum can produce that the column
+    mod-playerbots-llm schema, and a value this enum can produce that the column
     cannot hold is a write that fails in production and nowhere else.
 
     ``MODERATION_CLASSIFICATION`` is produced by the roleplay assessment preflight: the

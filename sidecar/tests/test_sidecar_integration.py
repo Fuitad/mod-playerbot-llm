@@ -16,8 +16,8 @@ from dataclasses import dataclass
 import pytest
 from fakes import FakeState
 
-from playerbot_llm import app, protocol, provider
-from playerbot_llm.providers import anthropic as anthropic_provider
+from playerbots_llm import app, protocol, provider
+from playerbots_llm.providers import anthropic as anthropic_provider
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -392,7 +392,7 @@ async def test_assessment_round_trips_with_authenticated_correlation() -> None:
         assert harness.adapter.assessments[0].current_line == "care to share a tale?"
 
         # Admitted as human social work, and its cost reported exactly once, as its own call.
-        from playerbot_llm import budget as budget_module
+        from playerbots_llm import budget as budget_module
 
         assert harness.store.reserved_priorities == [budget_module.RequestPriority.IMMEDIATE_HUMAN]
         assert harness.store.reserved_kinds == [budget_module.RequestKind.MODERATION_CLASSIFICATION]

@@ -20,21 +20,21 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TextIO
 
-from playerbot_llm import budget, generation, ledger, protocol, provider, state
-from playerbot_llm import store as store_module
-from playerbot_llm.budget import AdmissionDecision, RequestKind, RequestPriority
-from playerbot_llm.providers.anthropic import (
+from playerbots_llm import budget, generation, ledger, protocol, provider, state
+from playerbots_llm import store as store_module
+from playerbots_llm.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbots_llm.providers.anthropic import (
     AnthropicProvider,
 )
 
 CONFIG_SECTION = "worldserver"
-CONFIG_PREFIX = "PlayerbotLLM."
+CONFIG_PREFIX = "PlayerbotsLLM."
 # Environment variable *names*, not secret values.
-TOKEN_ENV_VAR = "PLAYERBOT_LLM_BRIDGE_TOKEN"  # noqa: S105
+TOKEN_ENV_VAR = "PLAYERBOTS_LLM_BRIDGE_TOKEN"  # noqa: S105
 BOT_PURGE_POLL_SECONDS = 5.0
 
 # There is deliberately no maximum above the configured ceiling. A second limit in the
-# code silently ignores what the operator asked for, and PlayerbotLLM.DailyBudgetUsd
+# code silently ignores what the operator asked for, and PlayerbotsLLM.DailyBudgetUsd
 # is documented as the sole ceiling.
 
 
@@ -1148,7 +1148,7 @@ async def serve(
 
 
 def _log(message: str, *, stream: TextIO | None = None) -> None:
-    print(f"playerbot-llm: {message}", file=sys.stderr if stream is None else stream, flush=True)
+    print(f"playerbots-llm: {message}", file=sys.stderr if stream is None else stream, flush=True)
 
 
 def _default_provider(config: SidecarConfig) -> provider.GenerationProvider:
@@ -1171,9 +1171,9 @@ async def _with_state(config: SidecarConfig, database: PlayerbotsDatabaseSetting
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="playerbot-llm")
+    parser = argparse.ArgumentParser(prog="playerbots-llm")
     parser.add_argument("command", choices=["serve", "doctor", "profile"])
-    parser.add_argument("--config", required=True, help="Path to mod_playerbot_llm.conf")
+    parser.add_argument("--config", required=True, help="Path to mod_playerbots_llm.conf")
     parser.add_argument(
         "--playerbots-config",
         required=True,
@@ -1248,7 +1248,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not config.enable or config.bridge_port <= 0:
-        _log("disabled by configuration (PlayerbotLLM.Enable / BridgePort); refusing to start")
+        _log("disabled by configuration (PlayerbotsLLM.Enable / BridgePort); refusing to start")
         return 1
 
     try:

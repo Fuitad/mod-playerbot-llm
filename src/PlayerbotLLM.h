@@ -1,5 +1,5 @@
 /*
- * This file is part of the mod-playerbot-llm module.
+ * This file is part of the mod-playerbots-llm module.
  */
 
 #ifndef MOD_PLAYERBOT_LLM_H
@@ -376,7 +376,7 @@ namespace PlayerbotLLM
     /*
      * How long a social exchange may stay outstanding, given what the operator configured.
      *
-     * `PlayerbotLLM.ResponseDeadlineMs` has only a floor, so nothing stops it being set above the
+     * `PlayerbotsLLM.ResponseDeadlineMs` has only a floor, so nothing stops it being set above the
      * coordinator's own provider timeout. Past that point the coordinator has already abandoned the
      * request as timed out while this side still holds the slot, so the transport would sit at its
      * bound refusing new work on behalf of requests nobody is waiting for. The coordinator's timeout
@@ -615,7 +615,7 @@ namespace PlayerbotLLM
     // already invalid UTF-8 is cut at its first invalid byte.
     std::string TruncateUtf8Bytes(std::string text, size_t maxBytes);
 
-    // Reads PLAYERBOT_LLM_BRIDGE_TOKEN. Fails closed (nullopt) when the variable is
+    // Reads PLAYERBOTS_LLM_BRIDGE_TOKEN. Fails closed (nullopt) when the variable is
     // missing or shorter than MIN_BRIDGE_TOKEN_BYTES.
     std::optional<std::string> BridgeTokenFromEnvironment();
 

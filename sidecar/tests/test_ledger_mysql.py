@@ -1,6 +1,6 @@
 """Budget ledger tests against a real MySQL.
 
-Marked ``mysql`` and skipped unless ``PLAYERBOT_LLM_TEST_MYSQL_DSN`` names a
+Marked ``mysql`` and skipped unless ``PLAYERBOTS_LLM_TEST_MYSQL_DSN`` names a
 disposable database. These cannot be mocked usefully: what they prove is that
 ``SELECT ... FOR UPDATE`` actually serializes two concurrent transactions, and a mock
 that serializes them is a mock that assumes the answer.
@@ -26,19 +26,19 @@ import pytest
 from pymysql.constants import CLIENT
 from pymysql.err import OperationalError
 
-from playerbot_llm import app, budget, generation, ledger, protocol, provider, schema
-from playerbot_llm import state as state_module
-from playerbot_llm import store as store_module
-from playerbot_llm.app import PlayerbotsDatabaseSettings
-from playerbot_llm.budget import AdmissionDecision, RequestKind, RequestPriority
-from playerbot_llm.providers import anthropic as anthropic_provider
+from playerbots_llm import app, budget, generation, ledger, protocol, provider, schema
+from playerbots_llm import state as state_module
+from playerbots_llm import store as store_module
+from playerbots_llm.app import PlayerbotsDatabaseSettings
+from playerbots_llm.budget import AdmissionDecision, RequestKind, RequestPriority
+from playerbots_llm.providers import anthropic as anthropic_provider
 
 pytestmark = [pytest.mark.mysql, pytest.mark.asyncio]
 
-DSN = os.environ.get("PLAYERBOT_LLM_TEST_MYSQL_DSN")
+DSN = os.environ.get("PLAYERBOTS_LLM_TEST_MYSQL_DSN")
 
 if not DSN:  # pragma: no cover - the skip is the point
-    pytest.skip("PLAYERBOT_LLM_TEST_MYSQL_DSN is not set", allow_module_level=True)
+    pytest.skip("PLAYERBOTS_LLM_TEST_MYSQL_DSN is not set", allow_module_level=True)
 
 
 CEILING = budget.usd_to_nano("10.00")
@@ -57,7 +57,7 @@ TOKEN = "0123456789abcdef0123456789abcdef"
 # fixture would let the copies drift apart while this suite kept passing.
 MODULES_ROOT = Path(__file__).resolve().parents[3]
 SOCIAL_UPDATES = MODULES_ROOT / "mod-playerbots-social" / "data" / "sql" / "db_playerbot" / "updates"
-LLM_UPDATES = MODULES_ROOT / "mod-playerbot-llm" / "data" / "sql" / "db_playerbot" / "updates"
+LLM_UPDATES = MODULES_ROOT / "mod-playerbots-llm" / "data" / "sql" / "db_playerbot" / "updates"
 SQL_REVISIONS = sorted(
     (*SOCIAL_UPDATES.glob("2026_08_*.sql"), *LLM_UPDATES.glob("2026_08_*.sql")),
     key=lambda revision: revision.name,

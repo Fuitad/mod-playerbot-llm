@@ -51,7 +51,7 @@ jobs:
       CORE_REPOSITORY: mod-playerbots/azerothcore-wotlk
       CORE_REF: Playerbot
     steps:
-      - name: Check out mod-playerbot-llm
+      - name: Check out mod-playerbots-llm
         uses: actions/checkout@v4
         with:
           path: module
@@ -83,8 +83,8 @@ jobs:
       - name: Check out Personality
         uses: actions/checkout@v4
         with:
-          repository: Fuitad/mod-playerbot-personality
-          path: azerothcore/modules/mod-playerbot-personality
+          repository: Fuitad/mod-playerbots-personality
+          path: azerothcore/modules/mod-playerbots-personality
 
       - name: Check out Economy
         uses: actions/checkout@v4
@@ -110,7 +110,7 @@ jobs:
           fi
 
       - name: Place this module in the core tree
-        run: cp -R module azerothcore/modules/mod-playerbot-llm
+        run: cp -R module azerothcore/modules/mod-playerbots-llm
 
       - name: Install build dependencies
         run: |

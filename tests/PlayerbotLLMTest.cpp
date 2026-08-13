@@ -1,5 +1,5 @@
 /*
- * This file is part of the mod-playerbot-llm module.
+ * This file is part of the mod-playerbots-llm module.
  */
 
 #include "PlayerbotLLM.h"
@@ -417,17 +417,17 @@ TEST(PlayerbotLLMProtocolTest, Utf8TruncationNeverSplitsASequence)
 
 TEST(PlayerbotLLMProtocolTest, BridgeTokenFailsClosed)
 {
-    unsetenv("PLAYERBOT_LLM_BRIDGE_TOKEN");
+    unsetenv("PLAYERBOTS_LLM_BRIDGE_TOKEN");
     EXPECT_FALSE(BridgeTokenFromEnvironment().has_value());
 
-    setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", "too-short", 1);
+    setenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", "too-short", 1);
     EXPECT_FALSE(BridgeTokenFromEnvironment().has_value());
 
-    setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", TEST_TOKEN.c_str(), 1);
+    setenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", TEST_TOKEN.c_str(), 1);
     std::optional<std::string> const token = BridgeTokenFromEnvironment();
     ASSERT_TRUE(token.has_value());
     EXPECT_EQ(*token, TEST_TOKEN);
-    unsetenv("PLAYERBOT_LLM_BRIDGE_TOKEN");
+    unsetenv("PLAYERBOTS_LLM_BRIDGE_TOKEN");
 }
 
 // --- Queue ---
@@ -2141,7 +2141,7 @@ TEST(PlayerbotLLMSocialTransportTest, TheBoundRecoversOnceDeadRequestsExpire)
 TEST(PlayerbotLLMSocialTransportTest, AConfiguredDeadlineCannotOutliveTheCoordinatorsOwnTimeout)
 {
     /*
-     * `PlayerbotLLM.ResponseDeadlineMs` has only a floor, so an operator can set it to minutes.
+     * `PlayerbotsLLM.ResponseDeadlineMs` has only a floor, so an operator can set it to minutes.
      * The coordinator abandons a request it is still waiting on after its own provider timeout, and
      * a transport that kept holding the slot past that point would sit at its bound refusing new
      * work on behalf of requests nobody is waiting for any more.

@@ -23,8 +23,8 @@ import pytest
 from fakes import FakeState
 from pydantic import ValidationError
 
-from playerbot_llm import app, budget, generation, ledger, protocol, provider, state
-from playerbot_llm.providers import anthropic as anthropic_provider
+from playerbots_llm import app, budget, generation, ledger, protocol, provider, state
+from playerbots_llm.providers import anthropic as anthropic_provider
 
 TEST_TOKEN = "0123456789abcdef0123456789abcdef"
 
@@ -833,13 +833,13 @@ def test_generate_reply_rejects_malformed_or_oversized_output() -> None:
 
 
 def test_adapter_ignores_global_anthropic_api_key(monkeypatch) -> None:
-    # The default client must only ever read MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY; a
+    # The default client must only ever read MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY; a
     # machine-wide ANTHROPIC_API_KEY must never be picked up implicitly.
-    monkeypatch.delenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-global-key")
     assert anthropic_provider.AnthropicProvider()._client.api_key == ""
 
-    monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-module-key")
+    monkeypatch.setenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", "sk-module-key")
     assert anthropic_provider.AnthropicProvider()._client.api_key == "sk-module-key"
 
 
@@ -848,20 +848,20 @@ def test_adapter_ignores_global_anthropic_api_key(monkeypatch) -> None:
 
 CONF_TEXT = """[worldserver]
 
-PlayerbotLLM.Enable = 1
-PlayerbotLLM.BridgePort = 40123
-PlayerbotLLM.AmbientWorldEnable = 1
-PlayerbotLLM.AmbientMaxMessagesPerHour = 6
-PlayerbotLLM.DailyBudgetUsd = 5.0
-PlayerbotLLM.ResponseDeadlineMs = 10000
-PlayerbotLLM.LogModelIO = 1
-PlayerbotLLM.QueueSize = 16
-PlayerbotLLM.GroupCooldownSeconds = 120
+PlayerbotsLLM.Enable = 1
+PlayerbotsLLM.BridgePort = 40123
+PlayerbotsLLM.AmbientWorldEnable = 1
+PlayerbotsLLM.AmbientMaxMessagesPerHour = 6
+PlayerbotsLLM.DailyBudgetUsd = 5.0
+PlayerbotsLLM.ResponseDeadlineMs = 10000
+PlayerbotsLLM.LogModelIO = 1
+PlayerbotsLLM.QueueSize = 16
+PlayerbotsLLM.GroupCooldownSeconds = 120
 """
 
 
 def write_conf(tmp_path, text: str = CONF_TEXT) -> str:
-    conf = tmp_path / "mod_playerbot_llm.conf"
+    conf = tmp_path / "mod_playerbots_llm.conf"
     conf.write_text(text)
     return str(conf)
 
@@ -880,7 +880,7 @@ def test_config_strips_surrounding_quotes_like_worldserver(tmp_path) -> None:
     # AzerothCore .conf convention quotes string values (the shipped .dist does);
     # worldserver's ConfigMgr strips them, so the sidecar must too. A quoted ceiling
     # that keeps its quotes parses as no budget at all, which silences every bot.
-    conf = write_conf(tmp_path, '[worldserver]\nPlayerbotLLM.DailyBudgetUsd = "2.50"\n')
+    conf = write_conf(tmp_path, '[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = "2.50"\n')
     config = app.SidecarConfig.load(conf)
     assert config.daily_budget_usd == "2.50"
     assert config.budget_nano == budget.usd_to_nano("2.50")
@@ -895,7 +895,7 @@ def test_an_unrecordable_ceiling_disables_generation_rather_than_being_clamped(t
     """
     huge = budget.nano_to_usd_string(budget.MAX_STORABLE_NANO + budget.NANO)
     config = app.SidecarConfig.load(
-        write_conf(tmp_path, f"[worldserver]\nPlayerbotLLM.DailyBudgetUsd = {huge}\n")
+        write_conf(tmp_path, f"[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = {huge}\n")
     )
     assert config.budget_nano == 0
     assert config.generation_allowed is False
@@ -914,19 +914,19 @@ def test_config_replaces_lifetime_budget_and_has_no_ceiling_above_the_configured
     A second limit in the code silently ignores what the operator asked for, which is
     why a large configured budget must now be honoured rather than clamped.
     """
-    old_only = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\nPlayerbotLLM.BudgetUsd = 1\n"))
+    old_only = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\nPlayerbotsLLM.BudgetUsd = 1\n"))
     assert old_only.budget_nano == 0
     assert old_only.generation_allowed is False
 
     for value, allowed in ((0, False), (0.5, True), (5, True), (-1, False), (5.01, True), (500, True)):
         config = app.SidecarConfig.load(
-            write_conf(tmp_path, f"[worldserver]\nPlayerbotLLM.DailyBudgetUsd = {value}\n")
+            write_conf(tmp_path, f"[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = {value}\n")
         )
         assert config.generation_allowed is allowed, value
 
     # And the ceiling is carried exactly rather than through a float.
     large = app.SidecarConfig.load(
-        write_conf(tmp_path, "[worldserver]\nPlayerbotLLM.DailyBudgetUsd = 500.10\n")
+        write_conf(tmp_path, "[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = 500.10\n")
     )
     assert large.budget_nano == budget.usd_to_nano("500.10")
 
@@ -937,15 +937,17 @@ def test_config_reserve_ratio_defaults_to_a_quarter_and_fails_closed(tmp_path) -
     Failing closed here means a typo silences background work rather than quietly
     removing the protection it was meant to configure.
     """
-    default = app.SidecarConfig.load(write_conf(tmp_path, "[worldserver]\nPlayerbotLLM.DailyBudgetUsd = 5\n"))
+    default = app.SidecarConfig.load(
+        write_conf(tmp_path, "[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = 5\n")
+    )
     assert default.reserve_ratio == Decimal("0.25")
 
     for value, expected in (("0", Decimal(0)), ("1", Decimal(1)), ("0.5", Decimal("0.5"))):
         config = app.SidecarConfig.load(
             write_conf(
                 tmp_path,
-                "[worldserver]\nPlayerbotLLM.DailyBudgetUsd = 5\n"
-                f"PlayerbotLLM.HumanBudgetReserveRatio = {value}\n",
+                "[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = 5\n"
+                f"PlayerbotsLLM.HumanBudgetReserveRatio = {value}\n",
             )
         )
         assert config.reserve_ratio == expected
@@ -954,8 +956,8 @@ def test_config_reserve_ratio_defaults_to_a_quarter_and_fails_closed(tmp_path) -
         config = app.SidecarConfig.load(
             write_conf(
                 tmp_path,
-                "[worldserver]\nPlayerbotLLM.DailyBudgetUsd = 5\n"
-                f"PlayerbotLLM.HumanBudgetReserveRatio = {bad}\n",
+                "[worldserver]\nPlayerbotsLLM.DailyBudgetUsd = 5\n"
+                f"PlayerbotsLLM.HumanBudgetReserveRatio = {bad}\n",
             )
         )
         assert config.reserve_ratio == Decimal(1), bad
@@ -967,9 +969,9 @@ def test_config_bounds_ambient_rate_without_disabling_direct_chat(tmp_path) -> N
             write_conf(
                 tmp_path,
                 "[worldserver]\n"
-                "PlayerbotLLM.DailyBudgetUsd = 5\n"
-                "PlayerbotLLM.AmbientWorldEnable = 1\n"
-                f"PlayerbotLLM.AmbientMaxMessagesPerHour = {rate}\n",
+                "PlayerbotsLLM.DailyBudgetUsd = 5\n"
+                "PlayerbotsLLM.AmbientWorldEnable = 1\n"
+                f"PlayerbotsLLM.AmbientMaxMessagesPerHour = {rate}\n",
             )
         )
         assert config.ambient_allowed is allowed
@@ -977,8 +979,8 @@ def test_config_bounds_ambient_rate_without_disabling_direct_chat(tmp_path) -> N
 
 
 def test_doctor_reports_status_without_secrets(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", TEST_TOKEN)
-    monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
+    monkeypatch.setenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
     report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     serialized = json.dumps(report)
     assert TEST_TOKEN not in serialized
@@ -991,8 +993,8 @@ def test_doctor_reports_status_without_secrets(tmp_path, monkeypatch) -> None:
 
 
 def test_doctor_ignores_global_anthropic_api_key(tmp_path, monkeypatch) -> None:
-    # The module never uses a machine-wide key: only MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY counts.
-    monkeypatch.delenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", raising=False)
+    # The module never uses a machine-wide key: only MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY counts.
+    monkeypatch.delenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-global-key")
     report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     assert report["provider_name"] == "anthropic"
@@ -1000,7 +1002,7 @@ def test_doctor_ignores_global_anthropic_api_key(tmp_path, monkeypatch) -> None:
 
 
 def test_doctor_flags_missing_token(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("PLAYERBOT_LLM_BRIDGE_TOKEN", raising=False)
+    monkeypatch.delenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", raising=False)
     report = app.doctor_report(app.SidecarConfig.load(write_conf(tmp_path)), FakeAdapter())
     assert report["bridge_token_present"] is False
     assert report["ok"] is False
@@ -1048,7 +1050,7 @@ def test_the_configuration_no_longer_carries_a_sqlite_path(tmp_path) -> None:
     server ends up with budget in MySQL and budget in a file nobody is looking at.
     """
     config = app.SidecarConfig.load(
-        write_conf(tmp_path, CONF_TEXT + 'PlayerbotLLM.SidecarDatabase = "leftover.sqlite"\n')
+        write_conf(tmp_path, CONF_TEXT + 'PlayerbotsLLM.SidecarDatabase = "leftover.sqlite"\n')
     )
     assert not hasattr(config, "database_path")
 
@@ -1260,7 +1262,7 @@ async def test_serve_routes_successful_lifecycle_messages_to_stdout(monkeypatch,
 
     captured = capsys.readouterr()
     assert re.fullmatch(
-        r"playerbot-llm: listening on 127\.0\.0\.1:\d+\nplayerbot-llm: shutting down\n",
+        r"playerbots-llm: listening on 127\.0\.0\.1:\d+\nplayerbots-llm: shutting down\n",
         captured.out,
     )
     assert captured.err == ""
@@ -1481,8 +1483,8 @@ def test_the_actual_cost_counts_cache_tokens_at_the_input_rate(tmp_path) -> None
 
 
 def test_the_doctor_reports_budget_numbers_without_secrets(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", TEST_TOKEN)
-    monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
+    monkeypatch.setenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
     config = app.SidecarConfig.load(write_conf(tmp_path))
 
     report = app.doctor_report(
@@ -1506,8 +1508,8 @@ def test_the_doctor_reports_budget_numbers_without_secrets(tmp_path, monkeypatch
 
 
 def test_the_doctor_is_not_ok_while_the_circuit_is_open(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("PLAYERBOT_LLM_BRIDGE_TOKEN", TEST_TOKEN)
-    monkeypatch.setenv("MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
+    monkeypatch.setenv("PLAYERBOTS_LLM_BRIDGE_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY", "sk-ant-super-secret")
     report = app.doctor_report(
         app.SidecarConfig.load(write_conf(tmp_path)),
         FakeAdapter(),
@@ -1733,12 +1735,12 @@ def test_generation_contract_owns_metadata_usage_and_billing_status() -> None:
 
 
 def test_neutral_package_owns_the_cli_configuration_and_secret_names() -> None:
-    neutral_app = importlib.import_module("playerbot_llm.app")
-    neutral_anthropic = importlib.import_module("playerbot_llm.providers.anthropic")
+    neutral_app = importlib.import_module("playerbots_llm.app")
+    neutral_anthropic = importlib.import_module("playerbots_llm.providers.anthropic")
 
-    assert neutral_app.CONFIG_PREFIX == "PlayerbotLLM."
-    assert neutral_app.TOKEN_ENV_VAR == "PLAYERBOT_LLM_BRIDGE_TOKEN"
-    assert neutral_anthropic.API_KEY_ENV_VAR == "MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY"
+    assert neutral_app.CONFIG_PREFIX == "PlayerbotsLLM."
+    assert neutral_app.TOKEN_ENV_VAR == "PLAYERBOTS_LLM_BRIDGE_TOKEN"
+    assert neutral_anthropic.API_KEY_ENV_VAR == "MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY"
 
 
 async def test_an_unpriceable_completion_stays_silent_rather_than_settling_free(tmp_path) -> None:
@@ -1805,7 +1807,7 @@ async def test_the_response_deadline_stops_a_slow_request_without_charging_it_fr
             return self.reply, provider.GenerationUsage(input_tokens=100, output_tokens=10)
 
     config_text = CONF_TEXT.replace(
-        "PlayerbotLLM.ResponseDeadlineMs = 10000", "PlayerbotLLM.ResponseDeadlineMs = 50"
+        "PlayerbotsLLM.ResponseDeadlineMs = 10000", "PlayerbotsLLM.ResponseDeadlineMs = 50"
     )
     config = app.SidecarConfig.load(write_conf(tmp_path, config_text))
     store = FakeState(config.budget_nano, config.reserve_ratio)

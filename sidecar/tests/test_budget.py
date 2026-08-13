@@ -10,8 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from playerbot_llm import budget
-from playerbot_llm.budget import (
+from playerbots_llm import budget
+from playerbots_llm.budget import (
     AdmissionDecision,
     BudgetConfigurationError,
     BudgetState,

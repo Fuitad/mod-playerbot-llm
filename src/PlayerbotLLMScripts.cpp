@@ -1,5 +1,5 @@
 /*
- * This file is part of the mod-playerbot-llm module.
+ * This file is part of the mod-playerbots-llm module.
  */
 
 #include "PlayerbotLLM.h"
@@ -174,16 +174,16 @@ namespace
 
         void Startup()
         {
-            if (!sConfigMgr->GetOption<bool>("PlayerbotLLM.Enable", false))
+            if (!sConfigMgr->GetOption<bool>("PlayerbotsLLM.Enable", false))
             {
-                LOG_INFO("playerbot.llm", "mod-playerbot-llm: disabled by configuration");
+                LOG_INFO("playerbot.llm", "mod-playerbots-llm: disabled by configuration");
                 return;
             }
 
-            int32 const port = sConfigMgr->GetOption<int32>("PlayerbotLLM.BridgePort", 0);
+            int32 const port = sConfigMgr->GetOption<int32>("PlayerbotsLLM.BridgePort", 0);
             if (port <= 0 || port > 65535)
             {
-                LOG_INFO("playerbot.llm", "mod-playerbot-llm: disabled (PlayerbotLLM.BridgePort is not set)");
+                LOG_INFO("playerbot.llm", "mod-playerbots-llm: disabled (PlayerbotsLLM.BridgePort is not set)");
                 return;
             }
 
@@ -191,23 +191,23 @@ namespace
             if (!token)
             {
                 LOG_ERROR("playerbot.llm",
-                          "mod-playerbot-llm: disabled (PLAYERBOT_LLM_BRIDGE_TOKEN is missing or shorter "
+                          "mod-playerbots-llm: disabled (PLAYERBOTS_LLM_BRIDGE_TOKEN is missing or shorter "
                           "than {} bytes)",
                           MIN_BRIDGE_TOKEN_BYTES);
                 return;
             }
 
             _responseDeadlineMs =
-                std::max<int64>(1000, sConfigMgr->GetOption<int32>("PlayerbotLLM.ResponseDeadlineMs", 10000));
+                std::max<int64>(1000, sConfigMgr->GetOption<int32>("PlayerbotsLLM.ResponseDeadlineMs", 10000));
             _groupCooldownMs =
-                std::max<int64>(0, sConfigMgr->GetOption<int32>("PlayerbotLLM.GroupCooldownSeconds", 120)) * 1000;
+                std::max<int64>(0, sConfigMgr->GetOption<int32>("PlayerbotsLLM.GroupCooldownSeconds", 120)) * 1000;
             ConfigureAmbient();
 
             BridgeConfig config;
             config.port = static_cast<uint16>(port);
             config.token = std::move(*token);
             config.queueCapacity =
-                static_cast<uint32>(std::max(1, sConfigMgr->GetOption<int32>("PlayerbotLLM.QueueSize", 16)));
+                static_cast<uint32>(std::max(1, sConfigMgr->GetOption<int32>("PlayerbotsLLM.QueueSize", 16)));
             config.socketTimeoutMs = _responseDeadlineMs;
 
             std::string const bridgeToken = config.token;
@@ -222,10 +222,10 @@ namespace
             {
                 _bridge->Stop();
                 _bridge.reset();
-                LOG_ERROR("playerbot.llm", "mod-playerbot-llm: career provider registration failed");
+                LOG_ERROR("playerbot.llm", "mod-playerbots-llm: career provider registration failed");
                 return;
             }
-            LOG_INFO("playerbot.llm", "mod-playerbot-llm: bridge worker started on 127.0.0.1:{}", port);
+            LOG_INFO("playerbot.llm", "mod-playerbots-llm: bridge worker started on 127.0.0.1:{}", port);
 
             /*
              * The social provider registers only while the worldserver's social feature is on.
@@ -244,7 +244,7 @@ namespace
             {
                 _socialTransport.emplace(*_bridge, bridgeToken, _responseDeadlineMs);
                 sPlayerbotSocialMgr.SetSocialProvider(this);
-                LOG_INFO("playerbot.llm", "mod-playerbot-llm: registered as the social provider");
+                LOG_INFO("playerbot.llm", "mod-playerbots-llm: registered as the social provider");
             }
         }
 
@@ -731,7 +731,7 @@ namespace
 
                     if (decision && !offered)
                         LOG_INFO("playerbot.llm",
-                                 "mod-playerbot-llm: career decision for request {} named a candidate "
+                                 "mod-playerbots-llm: career decision for request {} named a candidate "
                                  "that was never offered; discarded",
                                  response.requestId);
 
@@ -777,7 +777,7 @@ namespace
                 if (!ShouldDeliver(delivery.channel, snapshot))
                 {
                     LOG_INFO("playerbot.llm",
-                             "mod-playerbot-llm: dropped response for request {} (expired={} botOnline={} "
+                             "mod-playerbots-llm: dropped response for request {} (expired={} botOnline={} "
                              "speakerOnline={} stillBot={} inCombat={} sameGroup={})",
                              response.requestId, snapshot.expired, snapshot.botOnline, snapshot.speakerOnline,
                              snapshot.botIsStillBot, snapshot.botInCombat, snapshot.sameGroup);
@@ -793,7 +793,7 @@ namespace
                 if (!LegacyConversationalHookAllowed(PlayerbotSocialConfiguredGate().enabled))
                 {
                     LOG_INFO("playerbot.llm",
-                             "mod-playerbot-llm: dropped legacy response for request {} "
+                             "mod-playerbots-llm: dropped legacy response for request {} "
                              "(AiPlayerbot.SocialChat.Enable took ownership while it was in flight)",
                              response.requestId);
                     continue;
@@ -804,7 +804,7 @@ namespace
                     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
                     if (!botAI || !botAI->SayToWorld(response.message))
                         LOG_INFO("playerbot.llm",
-                                 "mod-playerbot-llm: World delivery failed for request {}",
+                                 "mod-playerbots-llm: World delivery failed for request {}",
                                  response.requestId);
                 }
                 else if (delivery.channel == ChatChannel::Whisper)
@@ -834,7 +834,7 @@ namespace
     private:
         void ConfigureAmbient()
         {
-            if (!sConfigMgr->GetOption<bool>("PlayerbotLLM.AmbientWorldEnable", false))
+            if (!sConfigMgr->GetOption<bool>("PlayerbotsLLM.AmbientWorldEnable", false))
                 return;
 
             /*
@@ -845,19 +845,19 @@ namespace
             if (!LegacyAmbientWorldAllowed(true, PlayerbotSocialConfiguredGate().enabled))
             {
                 LOG_INFO("playerbot.llm",
-                         "mod-playerbot-llm: ambient World chat disabled "
+                         "mod-playerbots-llm: ambient World chat disabled "
                          "(AiPlayerbot.SocialChat.Enable owns unprompted chat while it is on)");
                 return;
             }
 
             int32 const messagesPerHour =
-                sConfigMgr->GetOption<int32>("PlayerbotLLM.AmbientMaxMessagesPerHour", 6);
+                sConfigMgr->GetOption<int32>("PlayerbotsLLM.AmbientMaxMessagesPerHour", 6);
             if (messagesPerHour < 1 ||
                 messagesPerHour > static_cast<int32>(MAX_AMBIENT_MESSAGES_PER_HOUR))
             {
                 LOG_ERROR("playerbot.llm",
-                          "mod-playerbot-llm: ambient World chat disabled "
-                          "(PlayerbotLLM.AmbientMaxMessagesPerHour must be from 1 through {})",
+                          "mod-playerbots-llm: ambient World chat disabled "
+                          "(PlayerbotsLLM.AmbientMaxMessagesPerHour must be from 1 through {})",
                           MAX_AMBIENT_MESSAGES_PER_HOUR);
                 return;
             }
@@ -865,14 +865,14 @@ namespace
             if (sPlayerbotAIConfig.enableBroadcasts)
             {
                 LOG_ERROR("playerbot.llm",
-                          "mod-playerbot-llm: ambient World chat disabled "
+                          "mod-playerbots-llm: ambient World chat disabled "
                           "(set AiPlayerbot.EnableBroadcasts = 0)");
                 return;
             }
 
             _ambientCadence.emplace(static_cast<uint32>(messagesPerHour), SteadyNowMs());
             LOG_INFO("playerbot.llm",
-                     "mod-playerbot-llm: ambient World chat enabled at up to {} messages per hour",
+                     "mod-playerbots-llm: ambient World chat enabled at up to {} messages per hour",
                      messagesPerHour);
         }
 
@@ -1010,7 +1010,7 @@ namespace
                     completed.result, nowMs, urand(0, 100000));
 
                 if (rejection != PlayerbotSocialDeliveryRejection::None)
-                    LOG_DEBUG("playerbot.llm", "mod-playerbot-llm: social result for request {} refused ({})",
+                    LOG_DEBUG("playerbot.llm", "mod-playerbots-llm: social result for request {} refused ({})",
                               completed.socialRequestToken, PlayerbotSocialDeliveryRejectionName(rejection));
             }
         }
@@ -1043,7 +1043,7 @@ namespace
                     sPlayerbotSocialMgr.ApplyRoleplayAssessment(result);
                 if (application.discard != PlayerbotSocialRoleplayAssessmentDiscard::None)
                     LOG_DEBUG("playerbot.llm",
-                              "mod-playerbot-llm: roleplay assessment {} discarded by coordinator ({})",
+                              "mod-playerbots-llm: roleplay assessment {} discarded by coordinator ({})",
                               response.assessmentToken,
                               PlayerbotSocialRoleplayAssessmentDiscardName(application.discard));
             }
@@ -1143,7 +1143,7 @@ namespace
 
                 if (rejection != PlayerbotBiographyCompletionRejection::None)
                     LOG_DEBUG("playerbot.llm",
-                              "mod-playerbot-llm: biography for request {} refused ({})",
+                              "mod-playerbots-llm: biography for request {} refused ({})",
                               response.biographyRequestToken,
                               PlayerbotBiographyCompletionRejectionName(rejection));
             }

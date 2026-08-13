@@ -1,5 +1,5 @@
 /*
- * This file is part of the mod-playerbot-llm module.
+ * This file is part of the mod-playerbots-llm module.
  */
 
 #include "PlayerbotLLM.h"
@@ -451,7 +451,7 @@ int64 PlayerbotLLM::SteadyNowMs()
 
 std::optional<std::string> PlayerbotLLM::BridgeTokenFromEnvironment()
 {
-    char const* raw = std::getenv("PLAYERBOT_LLM_BRIDGE_TOKEN");
+    char const* raw = std::getenv("PLAYERBOTS_LLM_BRIDGE_TOKEN");
     if (!raw)
         return std::nullopt;
 

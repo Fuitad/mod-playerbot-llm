@@ -9,7 +9,7 @@ from typing import Literal, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from playerbot_llm import protocol, provider
+from playerbots_llm import protocol, provider
 
 
 class MessageParam(TypedDict):

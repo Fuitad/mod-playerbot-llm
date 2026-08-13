@@ -1,28 +1,28 @@
 [worldserver]
 
 ###################################################################################################
-#    mod-playerbot-llm configuration
+#    mod-playerbots-llm configuration
 #
 #    Everything is disabled by default. The module sends chat text, bounded context, and the
 #    deterministic personality profile of addressed bots to the Anthropic API through a local
 #    sidecar. Read the README privacy section before enabling anything.
 #
 #    Secrets are never read from this file. The bridge token comes from the
-#    PLAYERBOT_LLM_BRIDGE_TOKEN environment variable (required, minimum 32 bytes) and the
-#    Anthropic API key from MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY (read by the sidecar only; the global
+#    PLAYERBOTS_LLM_BRIDGE_TOKEN environment variable (required, minimum 32 bytes) and the
+#    Anthropic API key from MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY (read by the sidecar only; the global
 #    ANTHROPIC_API_KEY variable is deliberately ignored).
 ###################################################################################################
 
 #
-#    PlayerbotLLM.Enable
+#    PlayerbotsLLM.Enable
 #        Description: Enables the provider-neutral generation module hooks in worldserver.
 #        Default:     0 - Disabled
 #                     1 - Enabled
 
-PlayerbotLLM.Enable = 0
+PlayerbotsLLM.Enable = 0
 
 #
-#    PlayerbotLLM.AmbientWorldEnable
+#    PlayerbotsLLM.AmbientWorldEnable
 #        LEGACY. Kept only for a server running with AiPlayerbot.SocialChat.Enable = 0.
 #
 #        Description: Enables personality shaped ambient messages in the World channel. Requires
@@ -36,10 +36,10 @@ PlayerbotLLM.Enable = 0
 #        Default:     0 - Disabled
 #                     1 - Enabled
 
-PlayerbotLLM.AmbientWorldEnable = 0
+PlayerbotsLLM.AmbientWorldEnable = 0
 
 #
-#    PlayerbotLLM.AmbientMaxMessagesPerHour
+#    PlayerbotsLLM.AmbientMaxMessagesPerHour
 #        LEGACY. Applies only to the setting above, and only while social chat is off.
 #
 #        Description: Maximum accepted ambient attempts in any rolling hour. Values outside the
@@ -49,19 +49,19 @@ PlayerbotLLM.AmbientWorldEnable = 0
 #                     silently declined and no World line is ever spoken. Treat 6 as the ceiling.
 #        Default:     6
 
-PlayerbotLLM.AmbientMaxMessagesPerHour = 6
+PlayerbotsLLM.AmbientMaxMessagesPerHour = 6
 
 #
-#    PlayerbotLLM.BridgePort
+#    PlayerbotsLLM.BridgePort
 #        Description: Loopback TCP port of the sidecar bridge. Both worldserver and the sidecar
 #                     use this value. 0 disables both processes. The sidecar binds only to
 #                     127.0.0.1.
 #        Default:     0 - Disabled
 
-PlayerbotLLM.BridgePort = 0
+PlayerbotsLLM.BridgePort = 0
 
 #
-#    PlayerbotLLM.DailyBudgetUsd
+#    PlayerbotsLLM.DailyBudgetUsd
 #        Description: The spending ceiling shared by every provider generation. Settled actual cost
 #                     plus live maximum reservations may not exceed this value within one UTC
 #                     calendar day, so it rolls over at one instant regardless of server timezone
@@ -77,10 +77,10 @@ PlayerbotLLM.BridgePort = 0
 #                     always favours the budget, never the spend.
 #        Default:     5
 
-PlayerbotLLM.DailyBudgetUsd = 5
+PlayerbotsLLM.DailyBudgetUsd = 5
 
 #
-#    PlayerbotLLM.HumanBudgetReserveRatio
+#    PlayerbotsLLM.HumanBudgetReserveRatio
 #        Description: The share of the daily ceiling held for players who are actually waiting on
 #                     an answer. Background work, bot only continuation, and memory extraction
 #                     cannot spend into this remainder, so a server that spent the day on
@@ -90,28 +90,28 @@ PlayerbotLLM.DailyBudgetUsd = 5
 #                     work using any budget at all. An unusable value fails closed to 1.
 #        Default:     0.25
 
-PlayerbotLLM.HumanBudgetReserveRatio = 0.25
+PlayerbotsLLM.HumanBudgetReserveRatio = 0.25
 
 #
-#    PlayerbotLLM.InputUsdPerMTok
+#    PlayerbotsLLM.InputUsdPerMTok
 #        Description: Price of one million input tokens in USD, used by the sidecar budget
 #                     ledger. Must match the current Anthropic pricing for the configured
 #                     model. 0 disables all generation.
 #        Default:     1.00 (current Anthropic adapter input)
 
-PlayerbotLLM.InputUsdPerMTok = 1.00
+PlayerbotsLLM.InputUsdPerMTok = 1.00
 
 #
-#    PlayerbotLLM.OutputUsdPerMTok
+#    PlayerbotsLLM.OutputUsdPerMTok
 #        Description: Price of one million output tokens in USD, used by the sidecar budget
 #                     ledger. Must match the current Anthropic pricing for the configured
 #                     model. 0 disables all generation.
 #        Default:     5.00 (current Anthropic adapter output)
 
-PlayerbotLLM.OutputUsdPerMTok = 5.00
+PlayerbotsLLM.OutputUsdPerMTok = 5.00
 
 #
-#    PlayerbotLLM.SidecarDatabase (REMOVED)
+#    PlayerbotsLLM.SidecarDatabase (REMOVED)
 #        The sidecar no longer keeps its own SQLite file. Profiles, conversation memory,
 #        career decisions, the ambient rate, and the budget ledger all live in the shared
 #        acore_playerbots database now, so the budget holds across sidecar restarts and
@@ -123,12 +123,12 @@ PlayerbotLLM.OutputUsdPerMTok = 5.00
 #        and the one that gets missed is the one that keeps working with the old password
 #        until it suddenly does not.
 #
-#        A leftover PlayerbotLLM.SidecarDatabase line is ignored. Nothing migrates the
+#        A leftover PlayerbotsLLM.SidecarDatabase line is ignored. Nothing migrates the
 #        old file; the ledger starts empty.
 #
 
 #
-#    PlayerbotLLM.ResponseDeadlineMs
+#    PlayerbotsLLM.ResponseDeadlineMs
 #        Description: Milliseconds a pending conversation or career choice waits for the
 #                     sidecar before the request expires. Expired conversations are dropped.
 #                     Expired career choices use the deterministic playerbot fallback.
@@ -137,28 +137,28 @@ PlayerbotLLM.OutputUsdPerMTok = 5.00
 #                     before delivery, so a late provider reply is never spoken.
 #        Default:     10000
 
-PlayerbotLLM.ResponseDeadlineMs = 10000
+PlayerbotsLLM.ResponseDeadlineMs = 10000
 
 #
-#    PlayerbotLLM.LogModelIO
+#    PlayerbotsLLM.LogModelIO
 #        Logs the complete system prompt, user messages, output schema, and raw provider reply for
 #        every generation. This includes player conversation content and generated memories. Enable
 #        it only for temporary local diagnostics, then delete the captured log.
 #        Default: 0
 
-PlayerbotLLM.LogModelIO = 0
+PlayerbotsLLM.LogModelIO = 0
 
 #
-#    PlayerbotLLM.QueueSize
+#    PlayerbotsLLM.QueueSize
 #        Description: Maximum pending requests between the world thread and the bridge worker.
 #                     A full queue rejects new requests immediately.
 #        Default:     16
 
-PlayerbotLLM.QueueSize = 16
+PlayerbotsLLM.QueueSize = 16
 
 #
-#    PlayerbotLLM.GroupCooldownSeconds
+#    PlayerbotsLLM.GroupCooldownSeconds
 #        Description: Minimum seconds between milestone reactions for the same group.
 #        Default:     120
 
-PlayerbotLLM.GroupCooldownSeconds = 120
+PlayerbotsLLM.GroupCooldownSeconds = 120

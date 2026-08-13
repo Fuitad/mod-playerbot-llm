@@ -1,17 +1,17 @@
 """The MySQL budget ledger: the durable half of admission.
 
-The decisions live in :mod:`playerbot_llm.budget` and are pure. This module owns only
+The decisions live in :mod:`playerbots_llm.budget` and are pure. This module owns only
 the parts that genuinely need a database: reading committed totals under a lock, inserting
 a reservation, and settling or releasing one. That split is deliberate. A rule embedded in
 a transaction is a rule the tests can reach only through a transaction, and the arithmetic
 is the part that has to be right.
 
-The tables this writes belong to the mod-playerbot-llm migrations, not to the
+The tables this writes belong to the mod-playerbots-llm migrations, not to the
 sidecar runtime. The ownership boundary and the startup guard that enforces it
-live in :mod:`playerbot_llm.schema`.
+live in :mod:`playerbots_llm.schema`.
 
 Concurrency rests on one named lock. Every reservation takes ``budget_day`` through
-:func:`playerbot_llm.schema.acquire_named_lock` before reading anything, so two
+:func:`playerbots_llm.schema.acquire_named_lock` before reading anything, so two
 requests deciding at the same instant cannot both see the same remaining budget and both
 spend it. One global key rather than one per date: only one day is ever being written at a
 time in practice, so a per-date key bought no concurrency and grew the lock table by a row
@@ -29,9 +29,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from playerbot_llm import budget
-from playerbot_llm.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
-from playerbot_llm.schema import LedgerError, acquire_named_lock, utc_day
+from playerbots_llm import budget
+from playerbots_llm.budget import AdmissionDecision, BudgetState, RequestKind, RequestPriority
+from playerbots_llm.schema import LedgerError, acquire_named_lock, utc_day
 
 # How long a reservation may sit unsettled before another transaction may reclaim it.
 #

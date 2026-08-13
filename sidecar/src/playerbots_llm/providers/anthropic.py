@@ -15,8 +15,8 @@ from anthropic.types import MessageParam as AnthropicMessageParam
 from anthropic.types import ParsedMessage
 from pydantic import BaseModel, ValidationError
 
-from playerbot_llm import protocol, provider
-from playerbot_llm.generation import (
+from playerbots_llm import protocol, provider
+from playerbots_llm.generation import (
     BiographyReply,
     CareerReply,
     ChatReply,
@@ -39,7 +39,7 @@ from playerbot_llm.generation import (
     validate_social_reply,
 )
 
-API_KEY_ENV_VAR = "MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY"
+API_KEY_ENV_VAR = "MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY"
 MODEL_ID = "claude-haiku-4-5-20251001"
 MAX_OUTPUT_TOKENS = 96
 BIOGRAPHY_MAX_OUTPUT_TOKENS = 512

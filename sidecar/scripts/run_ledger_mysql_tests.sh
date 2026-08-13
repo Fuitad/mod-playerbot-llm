@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-CONTAINER=playerbot-llm-ledger-itest
+CONTAINER=playerbots-llm-ledger-itest
 PORT=33062
 DATABASE=playerbot_llm_ledger_itest
 CPP_DATABASE=playerbot_llm_cpp_itest
@@ -24,7 +24,7 @@ SIDECAR="$(dirname "${HERE}")"
 ROOT="$(cd "${SIDECAR}/../../.." && pwd)"
 PLAYERBOTS_BASE_SQL="${ROOT}/modules/mod-playerbots/data/sql/playerbots/base"
 SOCIAL_UPDATES="${ROOT}/modules/mod-playerbots-social/data/sql/db_playerbot/updates"
-LLM_UPDATES="${ROOT}/modules/mod-playerbot-llm/data/sql/db_playerbot/updates"
+LLM_UPDATES="${ROOT}/modules/mod-playerbots-llm/data/sql/db_playerbot/updates"
 CPP_TEST_BINARY="${CPP_TEST_BINARY:-${ROOT}/build-playerbot-claude-tests/src/test/unit_tests}"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
@@ -68,7 +68,7 @@ fi
 # mysqladmin answers slightly before the server accepts real work.
 sleep 5
 
-export PLAYERBOT_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${DATABASE}"
+export PLAYERBOTS_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${DATABASE}"
 
 cd "${SIDECAR}"
 uv run python -m pytest tests/test_ledger_mysql.py -q -m mysql "$@"
@@ -104,6 +104,6 @@ while IFS= read -r sql_file; do
 done < <(printf '%s\n' "${SOCIAL_UPDATES}"/2026_08_*.sql "${LLM_UPDATES}"/2026_08_*.sql | sort)
 
 GCOV_PREFIX="${GCOV_DIR}" \
-  PLAYERBOT_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${CPP_DATABASE}" \
+  PLAYERBOTS_LLM_TEST_MYSQL_DSN="127.0.0.1;${PORT};root;${PASSWORD};${CPP_DATABASE}" \
   "${CPP_TEST_BINARY}" \
   --gtest_filter=PlayerbotRandomCleanupIntegrationTest.PublishesTheExactCohortDurablyAndIdempotently

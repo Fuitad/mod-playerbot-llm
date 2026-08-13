@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from playerbot_llm import protocol
+from playerbots_llm import protocol
 
 
 @dataclass(frozen=True)

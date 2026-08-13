@@ -21,7 +21,7 @@ or unavailable generation results in deterministic fallback or silence according
 The C++ module integrates with these public repositories.
 
 1. `Fuitad/mod-playerbots-upstream` supplies the generic Playerbots extension seams.
-2. `Fuitad/mod-playerbot-personality` supplies stable personality and fictional identity values.
+2. `Fuitad/mod-playerbots-personality` supplies stable personality and fictional identity values.
 3. `Fuitad/mod-playerbots-economy` supplies the bounded career provider contract.
 4. `Fuitad/mod-playerbots-social` supplies the grounded conversation provider contract.
 
@@ -34,35 +34,35 @@ Place the repositories in the following AzerothCore module directories.
 
 ```text
 modules/mod-playerbots
-modules/mod-playerbot-personality
+modules/mod-playerbots-personality
 modules/mod-playerbots-economy
 modules/mod-playerbots-social
-modules/mod-playerbot-llm
+modules/mod-playerbots-llm
 ```
 
 Configure and build AzerothCore with static modules. Then create the sidecar environment.
 
 ```bash
-cd modules/mod-playerbot-llm/sidecar
+cd modules/mod-playerbots-llm/sidecar
 uv sync --locked
 ```
 
-Copy `conf/mod_playerbot_llm.conf.dist` into the worldserver configuration directory as
-`mod_playerbot_llm.conf`. Every generation path ships disabled.
+Copy `conf/mod_playerbots_llm.conf.dist` into the worldserver configuration directory as
+`mod_playerbots_llm.conf`. Every generation path ships disabled.
 
 The Playerbots database loader discovers this module's migrations in `data/sql/db_playerbot/updates`.
 
 ## Configuration and secrets
 
-`conf/mod_playerbot_llm.conf.dist` documents the bridge, queue, timeout, provider price, budget, and legacy
+`conf/mod_playerbots_llm.conf.dist` documents the bridge, queue, timeout, provider price, budget, and legacy
 compatibility settings. These settings belong to this module and do not live in `playerbots.conf`.
 
 Secrets are accepted only through environment variables.
 
-`PLAYERBOT_LLM_BRIDGE_TOKEN` authenticates the loopback connection. Both processes refuse a missing or short
+`PLAYERBOTS_LLM_BRIDGE_TOKEN` authenticates the loopback connection. Both processes refuse a missing or short
 token.
 
-`MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY` is read only by the Anthropic adapter. A machine wide
+`MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY` is read only by the Anthropic adapter. A machine wide
 `ANTHROPIC_API_KEY` is deliberately ignored.
 
 ## Operation
@@ -70,11 +70,11 @@ token.
 Start the sidecar before worldserver or alongside it.
 
 ```bash
-cd modules/mod-playerbot-llm/sidecar
-export PLAYERBOT_LLM_BRIDGE_TOKEN=replace_with_at_least_32_bytes
-export MOD_PLAYERBOT_LLM_ANTHROPIC_API_KEY=replace_with_provider_key
-uv run playerbot-llm serve \
-  --config /path/to/mod_playerbot_llm.conf \
+cd modules/mod-playerbots-llm/sidecar
+export PLAYERBOTS_LLM_BRIDGE_TOKEN=replace_with_at_least_32_bytes
+export MOD_PLAYERBOTS_LLM_ANTHROPIC_API_KEY=replace_with_provider_key
+uv run playerbots-llm serve \
+  --config /path/to/mod_playerbots_llm.conf \
   --playerbots-config /path/to/playerbots.conf
 ```
 
@@ -84,16 +84,16 @@ feature settings or provider secrets.
 Check configuration, budget state, and database reachability without printing secrets.
 
 ```bash
-uv run playerbot-llm doctor \
-  --config /path/to/mod_playerbot_llm.conf \
+uv run playerbots-llm doctor \
+  --config /path/to/mod_playerbots_llm.conf \
   --playerbots-config /path/to/playerbots.conf
 ```
 
 Inspect the latest observed bot profile.
 
 ```bash
-uv run playerbot-llm profile \
-  --config /path/to/mod_playerbot_llm.conf \
+uv run playerbots-llm profile \
+  --config /path/to/mod_playerbots_llm.conf \
   --playerbots-config /path/to/playerbots.conf \
   --bot-guid 42
 ```

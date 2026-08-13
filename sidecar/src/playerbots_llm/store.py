@@ -4,7 +4,7 @@ Everything here used to live in a private SQLite file. Sharing the Playerbots da
 instead removes a second thing to back up, a second thing to migrate, and a file whose
 absence or corruption was a failure mode nobody monitored.
 
-Separate from :mod:`playerbot_llm.ledger` because the two share nothing but a
+Separate from :mod:`playerbots_llm.ledger` because the two share nothing but a
 connection and the lock table. Money has a ceiling, a circuit breaker, and a reconciled
 schema it does not own; this has none of that, and reading one should not mean paging
 through the other.
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from playerbot_llm.schema import (
+from playerbots_llm.schema import (
     CONVERSATION_LOCK_BUCKETS,
     LedgerError,
     acquire_named_lock,
