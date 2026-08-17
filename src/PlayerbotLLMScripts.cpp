@@ -90,7 +90,7 @@ namespace
             return false;
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(candidate);
-        return botAI && !botAI->IsRealPlayer();
+        return botAI && !IsSelfBot(candidate);
     }
 
     bool IsRealPlayerActor(Player* actor)
@@ -99,7 +99,7 @@ namespace
             return false;
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(actor);
-        return !botAI || botAI->IsRealPlayer();
+        return !botAI || IsSelfBot(actor);
     }
 
     bool HasOnlineHuman()
