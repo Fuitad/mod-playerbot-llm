@@ -71,6 +71,7 @@ jobs:
         with:
           repository: ${{ env.CORE_REPOSITORY }}
           ref: ${{ env.CORE_REF }}
+          token: ${{ secrets.CORE_REPO_TOKEN }}
           path: azerothcore
 
       - name: Check out the public Playerbots fork at the pinned revision
