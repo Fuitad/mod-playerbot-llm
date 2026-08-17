@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # The public Playerbot compatible AzerothCore targeted by the Playerbots fork.
-      CORE_REPOSITORY: mod-playerbots/azerothcore-wotlk
+      CORE_REPOSITORY: Fuitad/azerothcore-wotlk
       CORE_REF: Playerbot
     steps:
       - name: Check out mod-playerbots-llm
