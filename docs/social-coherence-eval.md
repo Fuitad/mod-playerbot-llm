@@ -109,12 +109,15 @@ SELECT
     pb.display_name                 AS parent_speaker,
     p.message_text                  AS parent_line,
     tb.display_name                 AS addressee,
+    ch.class                        AS bot_class,
+    ch.level                        AS bot_level,
     UNIX_TIMESTAMP(c.occurred_at)   AS occurred_at
 FROM playerbot_social_event c
 LEFT JOIN playerbot_social_event p  ON p.public_id = c.reply_to_event_public_id
 LEFT JOIN playerbot_social_actor cb ON cb.id = c.bot_actor_id
 LEFT JOIN playerbot_social_actor pb ON pb.id = p.bot_actor_id
 LEFT JOIN playerbot_social_actor tb ON tb.id = c.target_actor_id
+LEFT JOIN acore_characters.characters ch ON ch.name = cb.display_name
 WHERE c.event_type = 'social.delivery'
   AND c.outcome = 'delivered'
   AND c.message_text <> ''
@@ -122,31 +125,37 @@ WHERE c.event_type = 'social.delivery'
 ORDER BY c.thread_public_id, c.occurred_at;
 ```
 
-**What the export can and cannot reconstruct.** The identity annotations are composed at capture
-time from the live character and are never persisted, so `[Troll Rogue 23, Durotar]` cannot be
-recovered. The addressee marker can, from `parent_speaker` (or `addressee` where the row carries a
-target). A window transcript therefore looks like this, with the addressee marker but without the
-identity bracket:
+**What the export can and cannot reconstruct.** The full identity annotation is composed at
+capture time from the live character and is never persisted, so the zone the speaker stood in
+cannot be recovered. Class and current level can, from the characters table (the join above;
+qualify the schema name to match the install). The addressee marker can too, from
+`parent_speaker` (or `addressee` where the row carries a target). A window transcript therefore
+looks like this, with a class and level bracket and the addressee marker, but without the zone:
 
 ```json
 [
   {
     "thread_public_id": "thr_...",
-    "bot_name": "Ghosademuhzo",
+    "bot_name": "Ghosademuhzo [Hunter 22]",
     "bot_line": "running beast mastery, my pet does most of the work",
     "lines": [
-      "Ghosademuhzo: just got here, first time in ashenvale. anybody got tips for a level 22 hunter?",
-      "Esdeline (to Ghosademuhzo): stick to the edges, lots of elves here. what spec are you running?"
+      "Ghosademuhzo [Hunter 22]: just got here, first time in ashenvale. anybody got tips for a level 22 hunter?",
+      "Esdeline [Priest 24] (to Ghosademuhzo): stick to the edges, lots of elves here. what spec are you running?"
     ]
   }
 ]
 ```
 
 `lines` is the transcript the bot answered, in order. `bot_line` is the generated line under
-judgement. The judge scores addressee behaviour, which the persisted reply linkage supports;
-class consistency is judged only from what the lines themselves reveal, because the class facts
-the prompt saw are not in the table. Recovering the full annotation, or the human half of a
-thread, would need schema changes this procedure deliberately does not make.
+judgement. Annotate `bot_name` as well, so the judge knows the judged bot's class even when the
+bot has no earlier line in the transcript.
+
+**The class bracket is not optional.** The first live window (2026-08-18) was exported without
+it, and the judge produced four false positives on 17 lines, including a spurious BLEED: it
+inferred from conversational tone that a rogue was not a rogue and scored lock picking as
+somebody else's ability. With the bracket present, the same window judged 20 of 20 lines clean.
+Recovering the zone half of the annotation, or the human half of a thread, would need schema
+changes this procedure deliberately does not make.
 
 ### 3. Judge it
 
