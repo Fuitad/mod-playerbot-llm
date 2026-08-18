@@ -17,8 +17,11 @@
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "QuestDef.h"
+#include "DBCStores.h"
+#include "DBCStructure.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "World.h"
 
 #include "Bot/Personality/PlayerbotPersonalityMgr.h"
 #include "Bot/Social/PlayerbotSocialMgr.h"
@@ -39,6 +42,25 @@ namespace
 
     constexpr size_t MAX_CAPTURED_TEXT_BYTES = 512;
     constexpr size_t RECENT_EVENT_CAPACITY = 256;
+
+    /*
+     * The bot's own zone as a display name, for the prompt premise. The sidecar has no DBC to
+     * resolve an id against, so the name is what travels. An unknown zone is an empty string, which
+     * the premise omits rather than guesses at.
+     */
+    std::string ZoneNameOf(uint32 zoneId)
+    {
+        AreaTableEntry const* const entry = sAreaTableStore.LookupEntry(zoneId);
+        if (entry == nullptr)
+            return {};
+
+        LocaleConstant const locale = sWorld->GetDefaultDbcLocale();
+        if (entry->area_name[locale] != nullptr && entry->area_name[locale][0] != '\0')
+            return entry->area_name[locale];
+        if (entry->area_name[LOCALE_enUS] != nullptr)
+            return entry->area_name[LOCALE_enUS];
+        return {};
+    }
 
     // World-thread delivery routing for one in-flight request. Only immutable values are
     // stored; players are re-resolved from GUIDs at delivery time.
@@ -321,6 +343,20 @@ namespace
             request.speakOnChannel = static_cast<uint8>(channel);
             request.threadPublicId = threadPublicId;
             request.grounding = context.grounding;
+
+            /*
+             * The coordinator's two decisions about the line being answered, carried verbatim. It
+             * already validates the reply against both; this is what lets the generation be told the
+             * rule instead of being rejected by it.
+             */
+            request.expectsAnswer = context.expectsAnswer;
+            request.addressedToBot = context.addressedToBot;
+
+            // Who the bot is. Read from the live character here, for the same reason everything else
+            // in this method is: nothing past this point can resolve it again.
+            request.botRaceId = bot->getRace();
+            request.botClassId = bot->getClass();
+            request.botZone = ZoneNameOf(bot->GetZoneId());
 
             /*
              * Everything the coordinator selected for this line: who the bot is, how it feels about

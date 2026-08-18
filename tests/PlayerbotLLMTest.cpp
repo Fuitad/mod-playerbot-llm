@@ -1035,6 +1035,101 @@ TEST(PlayerbotLLMSocialProtocolTest, BotAndHumanSpeakersUseTheSameActorShape)
     EXPECT_NE(backgroundPayload->find("\"admission_lane\":\"background\""), std::string::npos);
 }
 
+TEST(PlayerbotLLMSocialProtocolTest, ASocialRequestCarriesWhatTheLineAskedAndWhoTheBotIs)
+{
+    /*
+     * Before schema 8 the worldserver decided both of these, validated the reply against them, and
+     * told the generation neither. A bot could only guess whether the question in front of it was
+     * its to answer, and the 2026-08-12 bleed is what guessing looks like.
+     */
+    PlayerbotLLM::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
+    request.subject = SocialActor(900, "Deszy", true);
+    request.admissionLane = PlayerbotLLM::SocialAdmissionLane::ImmediateHuman;
+    request.speakOnChannel = 2;
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+    request.context = "party pull";
+    request.grounding = SocialGrounding();
+    request.expectsAnswer = true;
+    request.addressedToBot = false;
+    request.botRaceId = 3;
+    request.botClassId = 1;
+    request.botZone = "Dun Morogh";
+
+    std::optional<std::string> const serialized = PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN);
+    ASSERT_TRUE(serialized.has_value());
+    EXPECT_NE(serialized->find("\"schema_version\":8"), std::string::npos);
+    EXPECT_NE(serialized->find("\"expects_answer\":1"), std::string::npos);
+    EXPECT_NE(serialized->find("\"addressed_to_bot\":0"), std::string::npos);
+    EXPECT_NE(serialized->find("\"bot_race_id\":3"), std::string::npos);
+    EXPECT_NE(serialized->find("\"bot_class_id\":1"), std::string::npos);
+    EXPECT_NE(serialized->find("\"bot_zone\":\"Dun Morogh\""), std::string::npos);
+
+    PlayerbotLLM::SocialRequest addressed = request;
+    addressed.expectsAnswer = false;
+    addressed.addressedToBot = true;
+    std::optional<std::string> const addressedPayload =
+        PlayerbotLLM::SerializeSocialRequest(addressed, SOCIAL_TOKEN);
+    ASSERT_TRUE(addressedPayload.has_value());
+    EXPECT_NE(addressedPayload->find("\"expects_answer\":0"), std::string::npos);
+    EXPECT_NE(addressedPayload->find("\"addressed_to_bot\":1"), std::string::npos);
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AnUnknownZoneTravelsEmptyAndALongOneShortensRatherThanSilencingTheBot)
+{
+    /*
+     * The zone is prompt colour, not identity. Refusing the request over its length would take the
+     * entire social feature offline for a localized realm whose names run past the bound, so an
+     * over long name is shortened on a character boundary. A control character is still a refusal:
+     * it would break the single line shape the far side parses under.
+     */
+    PlayerbotLLM::SocialRequest request;
+    request.socialRequestToken = 77;
+    request.bot = SocialActor(500, "Grimbold", false);
+    request.botLevel = 6;
+    request.subject = SocialActor(900, "Deszy", true);
+    request.admissionLane = PlayerbotLLM::SocialAdmissionLane::ImmediateHuman;
+    request.speakOnChannel = 2;
+    request.threadPublicId = "thr_00000000000000000000000000000001";
+    request.grounding = SocialGrounding();
+
+    std::optional<std::string> const unknownZone = PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN);
+    ASSERT_TRUE(unknownZone.has_value());
+    EXPECT_NE(unknownZone->find("\"bot_zone\":\"\""), std::string::npos);
+
+    /*
+     * THREE byte characters, chosen so the 64 byte bound lands MID character: 21 whole characters
+     * are 63 bytes and the 22nd would end at 66. A naive substr(0, 64) therefore keeps a partial
+     * sequence and produces invalid UTF-8, which is the bug this bound exists to prevent, while
+     * the character aware prefix stops at 63. A two byte character would have divided evenly and
+     * made both implementations agree, so the test could not have failed.
+     */
+    static_assert(PlayerbotLLM::MAX_SOCIAL_BOT_ZONE_BYTES % 3 != 0,
+                  "the fixture below only exercises a mid character cut while the bound is not a multiple of three");
+
+    PlayerbotLLM::SocialRequest longZone = request;
+    for (int index = 0; index < 30; ++index)
+        longZone.botZone += "\xE6\x9D\xB1";  // U+6771
+    std::optional<std::string> const longPayload = PlayerbotLLM::SerializeSocialRequest(longZone, SOCIAL_TOKEN);
+    ASSERT_TRUE(longPayload.has_value()) << "a long zone name must never silence the generation";
+
+    std::size_t const wholeCharacterBytes = (PlayerbotLLM::MAX_SOCIAL_BOT_ZONE_BYTES / 3) * 3;
+    EXPECT_LT(wholeCharacterBytes, PlayerbotLLM::MAX_SOCIAL_BOT_ZONE_BYTES)
+        << "the fixture must straddle the bound or a naive cut would look correct";
+    std::string const expectedZone = longZone.botZone.substr(0, wholeCharacterBytes);
+    EXPECT_NE(longPayload->find("\"bot_zone\":\"" + expectedZone + "\""), std::string::npos);
+    EXPECT_EQ(longPayload->find("\"bot_zone\":\"" +
+                                longZone.botZone.substr(0, PlayerbotLLM::MAX_SOCIAL_BOT_ZONE_BYTES)),
+              std::string::npos)
+        << "a byte exact cut would have kept a partial character";
+
+    PlayerbotLLM::SocialRequest controlZone = request;
+    controlZone.botZone = "Dun\nMorogh";
+    EXPECT_FALSE(PlayerbotLLM::SerializeSocialRequest(controlZone, SOCIAL_TOKEN).has_value());
+}
+
 TEST(PlayerbotLLMSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialized)
 {
     EXPECT_TRUE(PlayerbotLLM::ActorIsUsable(SocialActor(500, "Grimbold", false)));
@@ -1047,7 +1142,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialize
 
 TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
 {
-    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 7u);
+    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 8u);
 
     std::optional<PlayerbotLLM::SocialResponse> const parsed =
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 500);

@@ -26,7 +26,7 @@ from pydantic import (
 )
 
 SCHEMA_VERSION = 6
-SOCIAL_SCHEMA_VERSION = 7
+SOCIAL_SCHEMA_VERSION = 8
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -34,6 +34,7 @@ MAX_RESPONSE_MESSAGE_BYTES = 240
 MAX_ACTOR_NAME_BYTES = 48
 MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024
 MAX_THREAD_ID_BYTES = 64
+MAX_SOCIAL_BOT_ZONE_BYTES = 64
 MAX_SOCIAL_MODEL_BYTES = 64
 MAX_SOCIAL_EVIDENCE_ENTRIES = 24
 MAX_SOCIAL_EVIDENCE_VALUE_BYTES = 128
@@ -515,7 +516,7 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -539,10 +540,36 @@ class SocialRequest(BaseModel):
     memory_input_state: SocialMemoryInputState
     active_content_expansion: Annotated[int, Field(ge=0, le=MAX_SOCIAL_ACTIVE_EXPANSION)]
 
+    # What the latest line asked, and of whom. Both are worldserver decisions: the coordinator
+    # already refuses an evidence citing answer to a line that asked nothing, and it alone knows
+    # whether a room question named this bot or somebody else standing in the same room.
+    expects_answer: Literal[0, 1]
+    addressed_to_bot: Literal[0, 1]
+
+    # Who the bot is. The ids are the game's own and are resolved to display names here; the zone
+    # arrives as a name because there is no DBC on this side to resolve an id against. Any of the
+    # three may be absent, which the premise omits rather than guesses at.
+    bot_race_id: Annotated[int, Field(ge=0, le=255)]
+    bot_class_id: Annotated[int, Field(ge=0, le=255)]
+    bot_zone: Annotated[str, StringConstraints(max_length=MAX_SOCIAL_BOT_ZONE_BYTES)]
+
     @field_validator("token")
     @classmethod
     def _validate_token(cls, value: str) -> str:
         return _validated_token(value)
+
+    @field_validator("bot_zone")
+    @classmethod
+    def _validate_bot_zone(cls, value: str) -> str:
+        # The same two rules the worldserver holds itself to: a byte budget rather than the
+        # character count StringConstraints checks, and a single line, because this value is
+        # interpolated into the TRUSTED system prompt premise.
+        if _byte_length(value) > MAX_SOCIAL_BOT_ZONE_BYTES:
+            raise ValueError(f"bot_zone must be at most {MAX_SOCIAL_BOT_ZONE_BYTES} UTF-8 bytes")
+        if any(character < " " or character == "\x7f" for character in value):
+            raise ValueError("bot_zone must be a single line of printable text")
+
+        return value
 
     @model_validator(mode="after")
     def _subject_is_present_or_absent(self) -> Self:

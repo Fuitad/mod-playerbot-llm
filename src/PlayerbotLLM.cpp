@@ -1055,6 +1055,18 @@ bool PlayerbotLLM::SocialRequestIsUsable(SocialRequest const& request, std::stri
     if (request.context.size() > MAX_SOCIAL_CONTEXT_BYTES)
         return false;
 
+    /*
+     * The zone is refused for SHAPE only, never for length.
+     *
+     * A control character would break the single line contract the sidecar parses under, so it is
+     * a refusal. Length is not: a zone name is cosmetic prompt colour, and a localized realm whose
+     * names run past the bound would otherwise have its entire social feature go silent over a
+     * display string. The serializer shortens an over long name on a character boundary instead.
+     */
+    for (char const character : request.botZone)
+        if (static_cast<unsigned char>(character) < 0x20 || character == 0x7F)
+            return false;
+
     if (!PlayerbotSocialChannelIsValid(static_cast<PlayerbotSocialChannel>(request.speakOnChannel)) ||
         !PlayerbotSocialGroundingEnvelopeIsValid(request.grounding) ||
         request.grounding.activeContentExpansion > MAX_SOCIAL_ACTIVE_EXPANSION)
@@ -1503,6 +1515,12 @@ std::optional<std::string> PlayerbotLLM::SerializeSocialRequest(SocialRequest co
                     std::string(MemoryInputStateName(request.grounding.memoryInputState)));
     AppendJsonField(out, "active_content_expansion",
                     static_cast<uint64>(request.grounding.activeContentExpansion));
+    AppendJsonField(out, "expects_answer", request.expectsAnswer ? uint64{1} : uint64{0});
+    AppendJsonField(out, "addressed_to_bot", request.addressedToBot ? uint64{1} : uint64{0});
+    AppendJsonField(out, "bot_race_id", static_cast<uint64>(request.botRaceId));
+    AppendJsonField(out, "bot_class_id", static_cast<uint64>(request.botClassId));
+    AppendJsonField(out, "bot_zone",
+                    request.botZone.substr(0, Utf8PrefixLength(request.botZone, MAX_SOCIAL_BOT_ZONE_BYTES)));
     out += '}';
     return out;
 }

@@ -1,0 +1,13 @@
+Answer naturally as the player described below, using only what follows as background.
+
+=== UNTRUSTED EVIDENCE BEGINS ===
+[{"id":"g1","subject":"candidate_bot","fact":"name","value":"Dodokkuli","provenance":"current_world","scope":"public","observed_at":1000},{"id":"g2","subject":"source","fact":"objective","value":"turned in Lost But Not Forgotten","provenance":"authoritative_source","scope":"public","observed_at":1000}]
+=== UNTRUSTED EVIDENCE ENDS ===
+
+=== UNTRUSTED PERSONA BEGINS ===
+chatty, quick to help
+=== UNTRUSTED PERSONA ENDS ===
+
+=== UNTRUSTED STARTER BEGINS ===
+turned in Lost But Not Forgotten
+=== UNTRUSTED STARTER ENDS ===

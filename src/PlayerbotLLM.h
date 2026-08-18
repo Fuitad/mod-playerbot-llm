@@ -38,7 +38,13 @@ namespace PlayerbotLLM
      * than allowed to create source-free durable memory.
      */
     inline constexpr uint32 SCHEMA_VERSION = 6;
-    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 7;
+    /*
+     * Bumped to 8 so a social request carries what the latest line asked and of whom
+     * (`expects_answer`, `addressed_to_bot`) plus the bot's own race, class, and zone. A sidecar
+     * that does not know these fields is refused rather than left to infer an addressee, which is
+     * the failure this version exists to remove.
+     */
+    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 8;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -164,7 +170,30 @@ namespace PlayerbotLLM
         std::string threadPublicId;
         std::string context;
         PlayerbotSocialGroundingEnvelope grounding;
+
+        /*
+         * The two decisions the coordinator already made about the line being answered, and which
+         * its delivery gate already judges the reply against: whether that line asked a question at
+         * all, and whether it was aimed at THIS bot rather than at somebody else in the same room.
+         * Trusted worldserver values; nothing a player typed reaches them.
+         */
+        bool expectsAnswer = false;
+        bool addressedToBot = false;
+
+        /*
+         * Who the bot is, so the prompt's premise can say it rather than leave the model to invent
+         * it. Race and class travel as the game's own ids and are resolved to display names on the
+         * far side; the zone travels as the name because the sidecar has no DBC to resolve an id
+         * against. Any of the three may be absent, which means unknown.
+         */
+        uint8 botRaceId = 0;
+        uint8 botClassId = 0;
+        std::string botZone;
     };
+
+    // The bot's zone name as it travels. Bounded here so an oversized or multi line value is a
+    // refusal at the seam rather than a frame the sidecar rejects after it was built and sent.
+    inline constexpr size_t MAX_SOCIAL_BOT_ZONE_BYTES = 64;
 
     inline constexpr size_t MAX_SOCIAL_CONTEXT_BYTES = 4 * 1024;
     inline constexpr size_t MAX_THREAD_ID_BYTES = 64;

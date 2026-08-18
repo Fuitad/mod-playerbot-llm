@@ -80,6 +80,11 @@ def social_request_payload(schema_version: int = protocol.SOCIAL_SCHEMA_VERSION)
             "profile_load_state": "loaded",
             "memory_input_state": "loaded",
             "active_content_expansion": 0,
+            "expects_answer": 0,
+            "addressed_to_bot": 0,
+            "bot_race_id": 3,
+            "bot_class_id": 1,
+            "bot_zone": "Dun Morogh",
         }
     ).encode()
 

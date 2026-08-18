@@ -1945,16 +1945,70 @@ def _social_request_payload(**overrides: object) -> bytes:
         "profile_load_state": "loaded",
         "memory_input_state": "loaded",
         "active_content_expansion": 0,
+        # The fixture stands in for a bot that was asked something, because most of what these
+        # tests exercise is an answer. A reply labelled `answer` against expects_answer 0 is now
+        # refused as an irrelevant contribution, which is its own test rather than every test.
+        "expects_answer": 1,
+        "addressed_to_bot": 0,
+        "bot_race_id": 3,
+        "bot_class_id": 1,
+        "bot_zone": "Dun Morogh",
     }
     payload.update(overrides)
     return json.dumps(payload).encode("utf-8")
 
 
 def test_social_protocol_has_an_independent_version() -> None:
-    assert protocol.SOCIAL_SCHEMA_VERSION == 7
+    assert protocol.SOCIAL_SCHEMA_VERSION == 8
 
 
-def test_social_v7_requires_typed_bounded_grounding() -> None:
+def test_the_social_schema_version_has_not_drifted_from_the_worldserver() -> None:
+    """The two authorities for this constant live in different languages and must move together.
+
+    A bump landing on one side only refuses every social request, fail closed, with nothing but
+    provider_failed telemetry to show for it. Reading the header is what makes that a test failure
+    here instead of a silent live outage.
+    """
+    header = (Path(__file__).resolve().parents[2] / "src" / "PlayerbotLLM.h").read_text(encoding="utf-8")
+    match = re.search(r"SOCIAL_SCHEMA_VERSION\s*=\s*(\d+)\s*;", header)
+
+    assert match is not None, "the worldserver header no longer declares SOCIAL_SCHEMA_VERSION"
+    assert int(match.group(1)) == protocol.SOCIAL_SCHEMA_VERSION
+
+
+def test_the_social_request_field_names_have_not_drifted_from_the_worldserver() -> None:
+    """The version constants moving together is not enough: a field NAME can diverge at the same
+    version and the failure is identical, because `extra="forbid"` refuses the whole request.
+
+    The worldserver's `SerializeSocialRequest` is the only writer of this frame, so its
+    `AppendJsonField` calls between the schema_version line and the closing brace are the
+    authoritative field list. Reading them here makes a rename a test failure now rather than a
+    silent, fail-closed live outage after a deploy.
+    """
+    source = (Path(__file__).resolve().parents[2] / "src" / "PlayerbotLLM.cpp").read_text(encoding="utf-8")
+    start = source.index("std::optional<std::string> PlayerbotLLM::SerializeSocialRequest")
+    end = source.index("std::optional<PlayerbotLLM::BiographyResponse>", start)
+    body = source[start:end]
+
+    # The evidence entry object is nested and has its own field names, so the top level scalar
+    # fields are everything outside the `for` loop that writes it.
+    evidence_start = body.index('out += ",\\"evidence\\":[";')
+    evidence_end = body.index("out += ']';", evidence_start)
+    top_level = body[:evidence_start] + body[evidence_end:]
+
+    # The two array fields are written as raw JSON rather than through AppendJsonField, so they
+    # are picked up separately; leaving them out would make this check silently partial.
+    written = set(re.findall(r'AppendJsonField\(out, "([a-z_]+)"', top_level))
+    written |= set(re.findall(r'out \+= ",\\"([a-z_]+)\\":\[";', body))
+    declared = set(protocol.SocialRequest.model_fields)
+
+    assert written == declared, (
+        f"worldserver writes but sidecar does not declare: {sorted(written - declared)}; "
+        f"sidecar declares but worldserver does not write: {sorted(declared - written)}"
+    )
+
+
+def test_social_v8_requires_typed_bounded_grounding() -> None:
     request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
 
     assert request.evidence[0].id == "g1"
@@ -1970,9 +2024,48 @@ def test_social_v7_requires_typed_bounded_grounding() -> None:
         protocol.parse_social_request(json.dumps(missing).encode("utf-8"), TEST_TOKEN)
 
     future = json.loads(_social_request_payload())
-    future["schema_version"] = 8
+    future["schema_version"] = 9
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_social_request(json.dumps(future).encode("utf-8"), TEST_TOKEN)
+
+
+def test_a_v7_request_is_refused_rather_than_read_without_its_addressee_signals() -> None:
+    """The whole point of the bump. A v7 payload has no expects_answer and no addressed_to_bot, so
+    reading it would mean answering a question that may have been asked of somebody else."""
+    stale = json.loads(_social_request_payload())
+    stale["schema_version"] = 7
+    for field in ("expects_answer", "addressed_to_bot", "bot_race_id", "bot_class_id", "bot_zone"):
+        del stale[field]
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(json.dumps(stale).encode("utf-8"), TEST_TOKEN)
+
+
+def test_the_bots_own_identity_travels_and_is_bounded() -> None:
+    request = protocol.parse_social_request(
+        _social_request_payload(expects_answer=1, addressed_to_bot=1), TEST_TOKEN
+    )
+
+    assert request.expects_answer == 1
+    assert request.addressed_to_bot == 1
+    assert request.bot_race_id == 3
+    assert request.bot_class_id == 1
+    assert request.bot_zone == "Dun Morogh"
+
+    # An unknown zone is legitimately empty; the premise omits it rather than guessing.
+    assert protocol.parse_social_request(_social_request_payload(bot_zone=""), TEST_TOKEN).bot_zone == ""
+
+    # A byte budget, not a character count: multibyte names pass the character check and still
+    # overflow the frame the worldserver measured them against.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(
+            _social_request_payload(bot_zone="\u00e9" * (protocol.MAX_SOCIAL_BOT_ZONE_BYTES // 2 + 1)),
+            TEST_TOKEN,
+        )
+
+    # This value is interpolated into the TRUSTED system prompt premise.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(_social_request_payload(bot_zone="Dun\nMorogh"), TEST_TOKEN)
 
 
 def _biography_request_payload(**overrides: object) -> bytes:
@@ -2577,6 +2670,92 @@ def test_the_social_system_prompt_carries_no_untrusted_text() -> None:
     assert "a private whisper" in system
 
 
+def test_the_premise_names_who_the_bot_is_and_omits_what_nobody_read() -> None:
+    """A bot that does not know it is a dwarf warrior in Dun Morogh will invent one when asked.
+
+    Unknown components drop rather than refuse: a chat line going silent over a display name is
+    a worse failure than a slightly thinner premise.
+    """
+    known = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(bot_race_id=3, bot_class_id=1, bot_zone="Dun Morogh"), TEST_TOKEN
+        )
+    )
+    assert "a Dwarf Warrior, currently in Dun Morogh" in known
+
+    no_zone = generation.build_social_system_prompt(
+        protocol.parse_social_request(_social_request_payload(bot_zone=""), TEST_TOKEN)
+    )
+    assert "a Dwarf Warrior" in no_zone
+    assert "currently in" not in no_zone
+
+    # 0 is not a race or a class in the game's own enumeration, so it means nobody read one.
+    unknown = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(bot_race_id=0, bot_class_id=0, bot_zone=""), TEST_TOKEN
+        )
+    )
+    assert "an ordinary player at level 6, in " in unknown
+
+    roleplay = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(context=_context(prompt_mode="authorized_roleplay")), TEST_TOKEN
+        )
+    )
+    assert "a Dwarf Warrior, currently in Dun Morogh" in roleplay
+
+
+def test_exactly_one_addressee_variant_reaches_the_prompt() -> None:
+    """The bystander rule is the 2026-08-12 regression's fix, and it must not be one of three
+    alternatives the model gets to choose between."""
+    direct = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(expects_answer=1, addressed_to_bot=1), TEST_TOKEN
+        )
+    )
+    assert "asks YOU a question directly" in direct
+    assert "you are a bystander" not in direct
+    assert "asked no question" not in direct
+
+    overheard = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(expects_answer=1, addressed_to_bot=0), TEST_TOKEN
+        )
+    )
+    assert "you are a bystander" in overheard
+    assert "Never answer in the addressee's place" in overheard
+    assert "asks YOU a question directly" not in overheard
+    assert "asked no question" not in overheard
+
+    statement = generation.build_social_system_prompt(
+        protocol.parse_social_request(
+            _social_request_payload(expects_answer=0, addressed_to_bot=1), TEST_TOKEN
+        )
+    )
+    assert "asked no question" in statement
+    assert "asks YOU a question directly" not in statement
+    assert "you are a bystander" not in statement
+
+
+def test_the_prompt_defines_each_contribution_function_and_the_thread_notation() -> None:
+    system = generation.build_social_system_prompt(
+        protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
+    )
+
+    # The worldserver classifies the reply against these names and drops a mismatch, so the
+    # prompt has to say what each one means rather than list them.
+    for function in ("answer", "specific_reaction", "fact_free_banter", "gesture", "none"):
+        assert f"{function}:" in system
+
+    # Trust is confined to the renderer authored prefix. Everything a player typed lands after
+    # the first colon, and the rule has to say so or the notation becomes a forgery surface.
+    assert "`Name [race class level, zone] (to OtherName): what they said`" in system
+    assert "before the first colon" in system
+    assert "never a world observation" in system
+
+    assert "Reply as yourself, Grimbold" in system
+
+
 def test_the_social_system_prompt_models_an_mmo_player_not_an_azeroth_roleplayer() -> None:
     request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
 
@@ -2681,6 +2860,32 @@ def _social_proposal(
             "claim_subject": claim_subject,
             "cited_evidence_ids": cited_evidence_ids or [],
         }
+    )
+
+
+def test_an_answer_to_a_line_that_asked_nothing_is_refused_before_it_is_delivered() -> None:
+    """The worldserver already drops this, but only after the generation was paid for and the
+    line built. Raising here turns the mismatch into a regeneration that produces a line."""
+    asked = protocol.parse_social_request(_social_request_payload(expects_answer=1), TEST_TOKEN)
+    unasked = protocol.parse_social_request(_social_request_payload(expects_answer=0), TEST_TOKEN)
+    answer = _social_proposal(
+        "Aye, cleared it last night.",
+        contribution="answer",
+        claim_subject="candidate_bot",
+        cited_evidence_ids=["g1"],
+    )
+
+    with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+        generation.validate_social_reply(answer, unasked)
+    assert caught.value.category is generation.ModerationCategory.IRRELEVANT_CONTRIBUTION
+
+    generation.validate_social_reply(answer, asked)
+
+    # One directional, mirroring the worldserver: a casual answer to a casual question is still a
+    # legitimate reply, so reacting and bantering stay legal against a question.
+    generation.validate_social_reply(_social_proposal("Nice one."), asked)
+    generation.validate_social_reply(
+        _social_proposal("Hah, tell me about it.", contribution="fact_free_banter"), asked
     )
 
 
@@ -3920,6 +4125,7 @@ def test_a_rejection_names_an_objective_category() -> None:
         "uncited_current_claim",
         "contradicted_evidence",
         "unavailable_content",
+        "irrelevant_contribution",
     }
 
 
@@ -4081,6 +4287,18 @@ def test_every_moderation_category_is_reachable() -> None:
     )
     record(
         lambda: generation.validate_social_reply(_social_proposal("Northrend is where I'm headed."), request)
+    )
+    unasked = protocol.parse_social_request(_social_request_payload(expects_answer=0), TEST_TOKEN)
+    record(
+        lambda: generation.validate_social_reply(
+            _social_proposal(
+                "Aye, cleared it last night.",
+                contribution="answer",
+                claim_subject="candidate_bot",
+                cited_evidence_ids=["g1"],
+            ),
+            unasked,
+        )
     )
 
     assert seen == set(generation.ModerationCategory)
