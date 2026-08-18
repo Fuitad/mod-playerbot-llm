@@ -1368,11 +1368,11 @@ class MemoryRequest(BaseModel):
     memory extracted a second late costs nothing while a player watching for an answer is
     watching now.
 
-    `scope` is deliberately narrower than the memory scopes the rest of the protocol carries: a
-    whisper is never buffered on the worldserver, so a whisper scoped extraction cannot
-    legitimately exist, and one arriving here means the producer stopped honouring that. The
-    schema refuses it rather than trusting the far side, because being wrong means private
-    messages inside a provider request.
+    `scope` carries every surface a conversation can be heard on, whisper included: the
+    worldserver buffers whisper text only under the operator's whisper memory switch and the
+    speaker's consent, so a whisper scoped extraction is legitimate. The schema still refuses
+    anything outside the three named surfaces rather than trusting the far side, because being
+    wrong means private messages inside a provider request filed under a scope nobody granted.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -1384,7 +1384,7 @@ class MemoryRequest(BaseModel):
     bot_guid: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
     bot_name: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ACTOR_NAME_BYTES)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=MAX_THREAD_ID_BYTES)]
-    scope: Literal["public", "party"]
+    scope: Literal["public", "party", "whisper"]
     subjects: Annotated[list[MemorySubject], Field(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRIES)]
 
     # The same two bounds the worldserver's buffer enforces. A request past either did not come

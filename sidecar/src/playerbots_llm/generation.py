@@ -1282,7 +1282,12 @@ def build_memory_system_prompt(request: protocol.MemoryRequest) -> str:
     """
 
     named = ", ".join(f"{subject.name} (guid {subject.guid})" for subject in request.subjects)
-    surface = "a party" if request.scope == "party" else "a public channel"
+    if request.scope == "party":
+        surface = "a party"
+    elif request.scope == "whisper":
+        surface = "a private whisper conversation"
+    else:
+        surface = "a public channel"
 
     return (
         f"You are noting what {request.bot_name} would remember from a conversation that has "

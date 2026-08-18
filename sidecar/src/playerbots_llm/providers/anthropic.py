@@ -97,8 +97,30 @@ class AnthropicProvider:
         messages: list[MessageParam],
         output_format: type[BaseModel],
         max_tokens: int,
+        trace_content: bool = True,
     ) -> None:
         if self._model_io_logger is None:
+            return
+
+        if not trace_content:
+            # The call is still on the record - what was said is not. Used for whisper scoped
+            # extractions, whose prompt carries private player text that must never reach a
+            # durable log, whatever the operator's diagnostic setting.
+            self._model_io_logger(
+                json.dumps(
+                    {
+                        "phase": "request",
+                        "kind": kind,
+                        "correlation_id": correlation_id,
+                        "model": MODEL_ID,
+                        "max_tokens": max_tokens,
+                        "redacted": True,
+                        "message_count": len(messages),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
             return
 
         self._model_io_logger(
@@ -118,8 +140,26 @@ class AnthropicProvider:
             )
         )
 
-    def _trace_response(self, kind: str, correlation_id: int, response: BaseModel) -> None:
+    def _trace_response(
+        self, kind: str, correlation_id: int, response: BaseModel, trace_content: bool = True
+    ) -> None:
         if self._model_io_logger is None:
+            return
+
+        if not trace_content:
+            # A whisper extraction's reply paraphrases the same private text its prompt carried.
+            self._model_io_logger(
+                json.dumps(
+                    {
+                        "phase": "response",
+                        "kind": kind,
+                        "correlation_id": correlation_id,
+                        "redacted": True,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
             return
 
         provider_message = response.model_dump(
@@ -148,8 +188,9 @@ class AnthropicProvider:
         messages: list[MessageParam],
         output_format: type[_ResponseModelT],
         max_tokens: int,
+        trace_content: bool = True,
     ) -> ParsedMessage[_ResponseModelT]:
-        self._trace_request(kind, correlation_id, system, messages, output_format, max_tokens)
+        self._trace_request(kind, correlation_id, system, messages, output_format, max_tokens, trace_content)
         response = self._client.messages.create(
             model=MODEL_ID,
             max_tokens=max_tokens,
@@ -162,7 +203,7 @@ class AnthropicProvider:
                 }
             },
         )
-        self._trace_response(kind, correlation_id, response)
+        self._trace_response(kind, correlation_id, response, trace_content)
         return cast(
             ParsedMessage[_ResponseModelT],
             parse_response(response=response, output_format=output_format),
@@ -403,7 +444,15 @@ class AnthropicProvider:
         messages = _memory_messages(request)
         try:
             response = self._generate_structured(
-                "memory", request.memory_request_token, system, messages, MemoryReply, MAX_OUTPUT_TOKENS
+                "memory",
+                request.memory_request_token,
+                system,
+                messages,
+                MemoryReply,
+                MAX_OUTPUT_TOKENS,
+                # A whisper extraction's prompt and reply both carry private player text; the
+                # model-IO diagnostic keeps the call on the record without keeping the words.
+                trace_content=request.scope != "whisper",
             )
         except anthropic.APIError as error:
             raise _map_api_error(error) from error

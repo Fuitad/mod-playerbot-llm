@@ -496,6 +496,25 @@ def social_messages_response(
     return httpx.Response(200, json=body)
 
 
+def memory_messages_response(candidates: list[dict[str, object]]) -> httpx.Response:
+    body = {
+        "id": "msg_memory_01",
+        "type": "message",
+        "role": "assistant",
+        "model": anthropic_provider.MODEL_ID,
+        "content": [{"type": "text", "text": json.dumps({"candidates": candidates})}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 300,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    }
+    return httpx.Response(200, json=body)
+
+
 def career_messages_response(candidate_token: str, spending_style: str) -> httpx.Response:
     body = {
         "id": "msg_career_01",
@@ -3880,6 +3899,84 @@ def test_a_memory_request_round_trips_through_the_strict_parser() -> None:
     assert request.thread[0].source_kind == "human_observation"
 
 
+def test_a_whisper_memory_request_validates_and_prompts_the_whisper_surface() -> None:
+    """The schema used to refuse scope="whisper" outright; the worldserver now buffers whisper
+    text under the operator's switch and the speaker's consent, so the request is legitimate and
+    the extraction prompt must name the surface truthfully rather than calling it public."""
+
+    request = protocol.parse_memory_request(_memory_request_payload(scope="whisper"), TEST_TOKEN)
+
+    assert request.scope == "whisper"
+
+    prompt = generation.build_memory_system_prompt(request)
+    assert "a private whisper conversation" in prompt
+    assert 'scope must be exactly "whisper"' in prompt
+    assert "a public channel" not in prompt
+
+
+def test_a_party_memory_request_still_validates_and_prompts_unchanged() -> None:
+    # The widened literal must not move the two existing surfaces.
+    request = protocol.parse_memory_request(_memory_request_payload(), TEST_TOKEN)
+
+    assert request.scope == "party"
+    prompt = generation.build_memory_system_prompt(request)
+    assert "a party" in prompt
+    assert 'scope must be exactly "party"' in prompt
+
+
+def test_model_io_trace_redacts_a_whisper_memory_request() -> None:
+    """LogModelIO dumps full prompt messages to a durable log; for a whisper extraction that would
+    write raw whisper text to disk and break the no-durable-raw-text promise. The trace still
+    records that the call happened (phase, kind, correlation id), but no thread content."""
+
+    trace: list[str] = []
+    secret_line = "my brother has been ill since midsummer"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return memory_messages_response([])
+
+    adapter = anthropic_provider.AnthropicProvider(
+        client=make_mock_client(handler), model_io_logger=trace.append
+    )
+
+    whispered = protocol.parse_memory_request(_memory_request_payload(scope="whisper"), TEST_TOKEN)
+    adapter.generate_memories(whispered)
+
+    assert len(trace) == 2
+    for entry in trace:
+        assert secret_line not in entry
+    prompt_entry = json.loads(trace[0])
+    assert prompt_entry["phase"] == "request"
+    assert prompt_entry["kind"] == "memory"
+    assert prompt_entry["correlation_id"] == whispered.memory_request_token
+    assert prompt_entry.get("redacted") is True
+    assert "system" not in prompt_entry
+    assert "messages" not in prompt_entry
+    response_entry = json.loads(trace[1])
+    assert response_entry.get("redacted") is True
+    assert "provider_message" not in response_entry
+
+
+def test_model_io_trace_keeps_recording_public_and_party_extractions() -> None:
+    # Redaction is scoped to the private surface; the operator diagnostic stays whole elsewhere.
+    trace: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return memory_messages_response([])
+
+    adapter = anthropic_provider.AnthropicProvider(
+        client=make_mock_client(handler), model_io_logger=trace.append
+    )
+
+    party = protocol.parse_memory_request(_memory_request_payload(), TEST_TOKEN)
+    adapter.generate_memories(party)
+
+    assert len(trace) == 2
+    prompt_entry = json.loads(trace[0])
+    assert "my brother has been ill since midsummer" in json.dumps(prompt_entry["messages"])
+    assert prompt_entry.get("redacted") is None
+
+
 def test_memory_wire_version_six_refuses_the_old_unstructured_contract() -> None:
     assert protocol.SCHEMA_VERSION == 6
 
@@ -3903,16 +4000,16 @@ def test_a_memory_request_refuses_generated_or_malformed_sources() -> None:
         protocol.parse_memory_request(json.dumps(wrong_id).encode("utf-8"), TEST_TOKEN)
 
 
-def test_a_memory_request_cannot_be_about_a_whisper() -> None:
+def test_a_memory_request_scope_outside_the_three_surfaces_is_refused() -> None:
     """The second enforcement of a guarantee the worldserver already makes.
 
-    Whisper text is never buffered, so a whisper scoped extraction request cannot legitimately
-    exist; one arriving here means the producer changed in a way that broke that promise. The
-    schema refuses it outright rather than trusting the far side, because the cost of being
-    wrong is private messages in a provider request.
+    Whisper is a legitimate scope now that the worldserver buffers whisper text under the
+    operator's switch and the speaker's consent, but the schema still refuses any scope outside
+    the three named surfaces rather than trusting the far side, because the cost of being wrong
+    is private messages in a provider request filed under a scope nobody granted.
     """
     with pytest.raises(protocol.ProtocolError):
-        protocol.parse_memory_request(_memory_request_payload(scope="whisper"), TEST_TOKEN)
+        protocol.parse_memory_request(_memory_request_payload(scope="guild"), TEST_TOKEN)
 
 
 def test_a_memory_request_refuses_a_thread_longer_than_the_buffer_can_hold() -> None:

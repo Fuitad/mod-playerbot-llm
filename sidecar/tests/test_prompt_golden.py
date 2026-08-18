@@ -110,3 +110,45 @@ def test_annotation_shaped_text_a_player_typed_lands_in_text_position() -> None:
     # The rule that makes the position meaningful.
     assert "before the first colon" in system
     assert "never a world observation" in system
+
+
+def _memory_request(scope: str) -> protocol.MemoryRequest:
+    payload = {
+        "schema_version": protocol.SCHEMA_VERSION,
+        "token": TEST_TOKEN,
+        "kind": "memory",
+        "memory_request_token": 91,
+        "bot_guid": 500,
+        "bot_name": "Grimbold",
+        "thread_id": "thr_00000000000000000000000000000001",
+        "scope": scope,
+        "subjects": [{"guid": 900, "name": "Deszy"}],
+        "thread": [
+            {
+                "speaker_guid": 900,
+                "speaker_name": "Deszy",
+                "text": "remember that my bank alt is Coppervault",
+                "source_event_id": "evt_00000000000000000000000000000001",
+                "source_kind": "human_observation",
+            }
+        ],
+    }
+    return protocol.parse_memory_request(json.dumps(payload).encode("utf-8"), TEST_TOKEN)
+
+
+def test_the_whisper_extraction_prompt_matches_its_golden_and_names_the_surface() -> None:
+    """A whisper scoped extraction is new surface area for the highest value injection target in
+    the feature, so its composed prompt is pinned byte for byte like every social prompt."""
+
+    request = _memory_request("whisper")
+    system = generation.build_memory_system_prompt(request)
+    user = generation.build_memory_user_message(request)
+
+    assert system == _golden("whisper_memory_extraction", "system", system)
+    assert user == _golden("whisper_memory_extraction", "user", user)
+
+    # The guarantees a careless refresh must not delete: the surface is named truthfully and the
+    # candidate scope is pinned to the request's.
+    assert "a private whisper conversation" in system
+    assert 'scope must be exactly "whisper"' in system
+    assert "a public channel" not in system

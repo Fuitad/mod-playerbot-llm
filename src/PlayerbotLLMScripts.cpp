@@ -487,11 +487,9 @@ namespace
                 if (line.sourceThreadPublicId != threadPublicId)
                     return false;
 
-                bool const partyLine = line.sourceChannel == PlayerbotSocialChannel::Party;
-                bool const publicLine = line.sourceChannel == PlayerbotSocialChannel::Say ||
-                                        line.sourceChannel == PlayerbotSocialChannel::General;
-                if ((scope == PlayerbotSocialPrivacyScope::Party && !partyLine) ||
-                    (scope == PlayerbotSocialPrivacyScope::Public && !publicLine))
+                // Exhaustive per scope, whisper included: a line heard on any other surface inside
+                // a whisper request means two conversations were confused, and neither may travel.
+                if (!PlayerbotLLM::MemoryLineChannelMatchesScope(scope, line.sourceChannel))
                     return false;
 
                 std::string speaker = NameOfCharacter(line.speakerGuidCounter);

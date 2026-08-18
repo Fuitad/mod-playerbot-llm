@@ -2607,21 +2607,61 @@ TEST(PlayerbotLLMSocialProtocolTest, AGeneratedOrMalformedMemorySourceNeverCross
     EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(noSpeaker, SOCIAL_TOKEN));
 }
 
-TEST(PlayerbotLLMSocialProtocolTest, AWhisperScopedExtractionIsRefusedBeforeItIsEverSent)
+TEST(PlayerbotLLMSocialProtocolTest, AWhisperScopedExtractionIsUsableAndKeepsItsScopeOnTheWire)
 {
     /*
-     * Whisper text is never buffered on the worldserver, so a whisper scoped extraction cannot
-     * legitimately exist. This is the third place that is enforced, after the buffer that refuses
-     * to hold the text and the sidecar schema that refuses to accept the request. Three because
-     * the failure is silent and permanent: private messages inside a provider request cannot be
-     * taken back once sent, so each layer refuses independently rather than trusting the one
-     * before it.
+     * Whisper text is buffered on the worldserver under the operator's switch and the speaker's
+     * consent, so a whisper scoped extraction is legitimate now - and the wire must say so. The
+     * serializer used to collapse "not party" to public, which would have relabelled every whisper
+     * request as a public one: the sidecar would extract public scoped candidates and the
+     * coordinator's admissibility check would reject them all, leaving durable whisper memory
+     * unreachable while every layer looked healthy.
      */
     PlayerbotLLM::MemoryRequest whispered = UsableMemoryRequest();
     whispered.scope = PlayerbotSocialPrivacyScope::Whisper;
 
-    EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(whispered, SOCIAL_TOKEN));
-    EXPECT_FALSE(PlayerbotLLM::SerializeMemoryRequest(whispered, SOCIAL_TOKEN).has_value());
+    EXPECT_TRUE(PlayerbotLLM::MemoryRequestIsUsable(whispered, SOCIAL_TOKEN));
+
+    std::optional<std::string> const serialized = PlayerbotLLM::SerializeMemoryRequest(whispered, SOCIAL_TOKEN);
+    ASSERT_TRUE(serialized.has_value());
+    EXPECT_NE(serialized->find("\"scope\":\"whisper\""), std::string::npos);
+    EXPECT_EQ(serialized->find("\"scope\":\"public\""), std::string::npos)
+        << "a whisper request must never be relabelled public on the wire";
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AScopeOutsideTheEnumIsRefusedNotSerializedAsAnything)
+{
+    // The serializer maps scope exhaustively and fails closed: a corrupt value must not be sent
+    // under any label, least of all the most public one.
+    PlayerbotLLM::MemoryRequest corrupt = UsableMemoryRequest();
+    corrupt.scope = static_cast<PlayerbotSocialPrivacyScope>(200);
+
+    EXPECT_FALSE(PlayerbotLLM::MemoryRequestIsUsable(corrupt, SOCIAL_TOKEN));
+    EXPECT_FALSE(PlayerbotLLM::SerializeMemoryRequest(corrupt, SOCIAL_TOKEN).has_value());
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, EveryScopeAcceptsOnlyLinesHeardOnItsOwnSurface)
+{
+    /*
+     * The per line symmetry SubmitMemory applies before a request is built: a whisper scoped
+     * request may carry only whisper lines, exactly as party requires party and public requires the
+     * two public surfaces. A mixed request means the producer confused two conversations, and the
+     * safe answer is to send neither.
+     */
+    using PlayerbotLLM::MemoryLineChannelMatchesScope;
+
+    EXPECT_TRUE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Whisper,
+                                              PlayerbotSocialChannel::Whisper));
+    EXPECT_FALSE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Whisper,
+                                               PlayerbotSocialChannel::General));
+    EXPECT_FALSE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Public,
+                                               PlayerbotSocialChannel::Whisper));
+    EXPECT_TRUE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Public, PlayerbotSocialChannel::Say));
+    EXPECT_TRUE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Public,
+                                              PlayerbotSocialChannel::General));
+    EXPECT_FALSE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Party,
+                                               PlayerbotSocialChannel::Whisper));
+    EXPECT_TRUE(MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope::Party, PlayerbotSocialChannel::Party));
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, AnExtractionWithNothingToReadOrNobodyToBeAboutIsRefused)

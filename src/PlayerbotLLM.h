@@ -561,9 +561,10 @@ namespace PlayerbotLLM
         std::string botName;
         std::string threadPublicId;
 
-        // Public or party, never whisper. Whisper text is never buffered, so a whisper scoped
-        // extraction cannot legitimately exist, and one reaching here means the producer stopped
-        // honouring that.
+        // Public, party, or whisper - the surface the thread was heard on. Whisper is legitimate
+        // only because the worldserver buffers whisper text under the operator's switch and the
+        // speaker's consent; the scope must survive the wire exactly, because the sidecar pins
+        // extracted candidates to it and the coordinator refuses candidates whose scope drifted.
         PlayerbotSocialPrivacyScope scope = PlayerbotSocialPrivacyScope::Public;
 
         std::vector<MemorySubject> subjects;
@@ -571,6 +572,12 @@ namespace PlayerbotLLM
     };
 
     [[nodiscard]] bool MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token);
+
+    // Whether a line heard on `channel` may travel in a request of `scope`: whisper carries only
+    // whisper, party only party, public only the two public surfaces. A mixed request means the
+    // producer confused two conversations, and the safe answer is to send neither.
+    [[nodiscard]] bool MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope scope,
+                                                     PlayerbotSocialChannel channel);
 
     std::optional<std::string> SerializeMemoryRequest(MemoryRequest const& request, std::string const& token);
 

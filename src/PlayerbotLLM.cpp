@@ -2501,6 +2501,21 @@ std::vector<PlayerbotLLM::SocialRawResponse> PlayerbotLLM::Bridge::DrainSocialRe
     return drained;
 }
 
+bool PlayerbotLLM::MemoryLineChannelMatchesScope(PlayerbotSocialPrivacyScope scope, PlayerbotSocialChannel channel)
+{
+    switch (scope)
+    {
+        case PlayerbotSocialPrivacyScope::Public:
+            return channel == PlayerbotSocialChannel::Say || channel == PlayerbotSocialChannel::General;
+        case PlayerbotSocialPrivacyScope::Party:
+            return channel == PlayerbotSocialChannel::Party;
+        case PlayerbotSocialPrivacyScope::Whisper:
+            return channel == PlayerbotSocialChannel::Whisper;
+    }
+
+    return false;
+}
+
 bool PlayerbotLLM::MemoryRequestIsUsable(MemoryRequest const& request, std::string const& token)
 {
     if (!BridgeTokenIsUsable(token))
@@ -2518,11 +2533,14 @@ bool PlayerbotLLM::MemoryRequestIsUsable(MemoryRequest const& request, std::stri
         return false;
 
     /*
-     * Whisper is refused here as well as by the buffer that will not hold the text and the sidecar
-     * schema that will not accept the request. Three independent refusals, because sending a
-     * private message to a provider cannot be undone once it has happened.
+     * The scope is validated here as well as by the buffer that gates what may be held and the
+     * sidecar schema that validates what arrives. Three independent validations, because sending a
+     * private message to a provider cannot be undone once it has happened: whisper is legitimate
+     * (the buffer holds it only under the operator's switch and the speaker's consent), while a
+     * value outside the enum is refused before it can be serialized under any label.
      */
-    if (request.scope != PlayerbotSocialPrivacyScope::Public && request.scope != PlayerbotSocialPrivacyScope::Party)
+    if (request.scope != PlayerbotSocialPrivacyScope::Public && request.scope != PlayerbotSocialPrivacyScope::Party &&
+        request.scope != PlayerbotSocialPrivacyScope::Whisper)
         return false;
 
     if (request.subjects.empty() || request.subjects.size() > MAX_MEMORY_SUBJECTS)
@@ -2585,9 +2603,29 @@ std::optional<std::string> PlayerbotLLM::SerializeMemoryRequest(MemoryRequest co
     AppendJsonField(out, "thread_id", request.threadPublicId);
     // Spelled here rather than borrowed from the repository's name helper, which lives behind a
     // header this module does not otherwise need. These three strings are a WIRE contract shared
-    // with the sidecar's Literal, so they belong beside the frame that carries them.
-    AppendJsonField(out, "scope",
-                    std::string(request.scope == PlayerbotSocialPrivacyScope::Party ? "party" : "public"));
+    // with the sidecar's Literal, so they belong beside the frame that carries them - exhaustively:
+    // the old "not party means public" collapse would relabel a whisper request as public, and the
+    // sidecar would then pin every extracted candidate to the wrong scope.
+    char const* scopeName = nullptr;
+    switch (request.scope)
+    {
+        case PlayerbotSocialPrivacyScope::Public:
+            scopeName = "public";
+            break;
+        case PlayerbotSocialPrivacyScope::Party:
+            scopeName = "party";
+            break;
+        case PlayerbotSocialPrivacyScope::Whisper:
+            scopeName = "whisper";
+            break;
+    }
+
+    // Unreachable past MemoryRequestIsUsable, kept as its own refusal so the serializer can never
+    // send a corrupt scope under any label.
+    if (scopeName == nullptr)
+        return std::nullopt;
+
+    AppendJsonField(out, "scope", std::string(scopeName));
 
     out += ",\"subjects\":[";
     for (std::size_t index = 0; index < request.subjects.size(); ++index)

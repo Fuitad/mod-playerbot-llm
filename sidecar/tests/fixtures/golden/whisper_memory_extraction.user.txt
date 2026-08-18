@@ -1,0 +1,3 @@
+=== UNTRUSTED THREAD BEGINS ===
+evt_00000000000000000000000000000001 | speaker_guid=900 | Deszy: remember that my bank alt is Coppervault
+=== UNTRUSTED THREAD ENDS ===
