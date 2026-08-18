@@ -192,6 +192,18 @@ def judge_prompt(transcript: Sequence[str], bot_name: str, bot_line: str) -> str
 JudgeCall = Callable[[str], dict[str, Any]]
 
 
+def parse_judge_verdict(text: str) -> dict[str, Any]:
+    """Parse the verdict object and ignore anything the judge said after it.
+
+    The prefill pins the reply to open with the object, but nothing stops the model from
+    appending commentary once the object closes, and that commentary can contain braces.
+    Slicing to the last brace swallowed such commentary; decoding the first object does not.
+    """
+
+    verdict, _ = json.JSONDecoder().raw_decode(text)
+    return verdict
+
+
 def _anthropic_judge() -> JudgeCall:
     """A judge built from the module's own credential and model constants.
 
@@ -221,7 +233,7 @@ def _anthropic_judge() -> JudgeCall:
             ],
         )
         text = "{" + "".join(block.text for block in response.content if block.type == "text")
-        return json.loads(text[: text.rindex("}") + 1])
+        return parse_judge_verdict(text)
 
     return call
 

@@ -341,3 +341,28 @@ def test_the_default_run_is_offline_and_needs_no_credentials(
 
     assert evaluation.main([]) == 0
     assert "0 violations" in capsys.readouterr().out
+
+
+def test_a_judge_that_talks_after_its_verdict_still_parses() -> None:
+    """Live failure 2026-08-18: the judge closed its object, then kept going. The old
+    last-brace slice swallowed the commentary and raised JSONDecodeError: Extra data."""
+    reply = (
+        '{"adopted_addressee_perspective": false, "answered_what_was_asked": true,\n'
+        ' "class_consistent": true, "stayed_on_subject": true}\n\n'
+        "The line answers the question put to this bot directly {and stays on topic}."
+    )
+
+    verdict = evaluation.parse_judge_verdict(reply)
+
+    assert verdict == {
+        "adopted_addressee_perspective": False,
+        "answered_what_was_asked": True,
+        "class_consistent": True,
+        "stayed_on_subject": True,
+    }
+
+
+def test_a_clean_judge_reply_parses_unchanged() -> None:
+    verdict = evaluation.parse_judge_verdict('{"adopted_addressee_perspective": true}')
+
+    assert verdict == {"adopted_addressee_perspective": True}
