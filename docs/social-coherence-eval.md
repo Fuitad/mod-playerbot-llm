@@ -88,60 +88,65 @@ generated lines. Note the start and end as Unix timestamps.
 
 ### 2. Export it
 
-`playerbot_social_event` already stores the transcript and the reply linkage
-(`reply_to_event_public_id`). No schema change is required, and none is made; what that costs the
-export is spelled out below the query.
+Two properties of the storage decide what a window can contain, and both were confirmed against
+the live table rather than inferred from the schema:
+
+- **Only `social.delivery` rows carry text.** `social.source` rows record that a line was heard
+  and never store what it said (0 of 290549 rows on the live server). That is the privacy posture,
+  not an oversight: a human's words are held in memory under consent and are never written here.
+- **The speaker is `bot_actor_id`, not `actor_id`.** `actor_id` is null on every row that carries
+  text. `target_actor_id` is the addressee where one exists.
+
+So a live window judges **bot to bot** exchanges, where both halves are delivery rows linked by
+`reply_to_event_public_id`. A thread a human started can only ever show the bot's side, and the
+human's line is deliberately absent. Pick windows with bot conversation in them.
 
 ```sql
 SELECT
-    e.thread_public_id,
-    e.public_id            AS event_public_id,
-    e.reply_to_event_public_id,
-    e.event_type,
-    e.outcome,
-    e.channel,
-    a.display_name         AS speaker_name,
-    a.actor_kind,
-    e.message_text,
-    UNIX_TIMESTAMP(e.occurred_at) AS occurred_at
-FROM playerbot_social_event e
-LEFT JOIN playerbot_social_actor a ON a.id = e.actor_id
-WHERE e.occurred_at BETWEEN FROM_UNIXTIME(:window_start) AND FROM_UNIXTIME(:window_end)
-ORDER BY e.thread_public_id, e.occurred_at;
+    c.thread_public_id,
+    cb.display_name                 AS bot_name,
+    c.message_text                  AS bot_line,
+    pb.display_name                 AS parent_speaker,
+    p.message_text                  AS parent_line,
+    tb.display_name                 AS addressee,
+    UNIX_TIMESTAMP(c.occurred_at)   AS occurred_at
+FROM playerbot_social_event c
+LEFT JOIN playerbot_social_event p  ON p.public_id = c.reply_to_event_public_id
+LEFT JOIN playerbot_social_actor cb ON cb.id = c.bot_actor_id
+LEFT JOIN playerbot_social_actor pb ON pb.id = p.bot_actor_id
+LEFT JOIN playerbot_social_actor tb ON tb.id = c.target_actor_id
+WHERE c.event_type = 'social.delivery'
+  AND c.outcome = 'delivered'
+  AND c.message_text <> ''
+  AND c.occurred_at BETWEEN FROM_UNIXTIME(:window_start) AND FROM_UNIXTIME(:window_end)
+ORDER BY c.thread_public_id, c.occurred_at;
 ```
-
-The generated lines being judged are the rows with `event_type = 'social.delivery'` and
-`outcome = 'delivered'`; everything else in the same `thread_public_id` is the transcript they
-answered. `actor_kind` is `'bot'` or `'player'`. A row's `reply_to_event_public_id` points at the
-`event_public_id` of the line it answered, which is how the transcript recovers who addressed
-whom.
 
 **What the export can and cannot reconstruct.** The identity annotations are composed at capture
 time from the live character and are never persisted, so `[Troll Rogue 23, Durotar]` cannot be
-recovered from storage. The addressee marker can: follow `reply_to_event_public_id` to the parent
-row and take its `speaker_name`. So a live window transcript looks like this, with the addressee
-marker but without the identity bracket:
+recovered. The addressee marker can, from `parent_speaker` (or `addressee` where the row carries a
+target). A window transcript therefore looks like this, with the addressee marker but without the
+identity bracket:
 
 ```json
 [
   {
     "thread_public_id": "thr_...",
-    "bot_name": "Dodokkuli",
-    "bot_line": "mostly questing, the mobs here are decent xp",
+    "bot_name": "Ghosademuhzo",
+    "bot_line": "running beast mastery, my pet does most of the work",
     "lines": [
-      "Sweatyguest: just got here",
-      "Klara (to Sweatyguest): you leveling through here or just grinding?"
+      "Ghosademuhzo: just got here, first time in ashenvale. anybody got tips for a level 22 hunter?",
+      "Esdeline (to Ghosademuhzo): stick to the edges, lots of elves here. what spec are you running?"
     ]
   }
 ]
 ```
 
 `lines` is the transcript the bot answered, in order. `bot_line` is the generated line under
-judgement. The judge scores addressee behaviour, which is what the persisted reply linkage
-supports; class consistency is judged only from what the lines themselves reveal, because the
-class facts the prompt saw are not in the table. Recovering the full annotation would need the
-identity columns persisted on `playerbot_social_event`, which is a schema change this procedure
-deliberately does not make.
+judgement. The judge scores addressee behaviour, which the persisted reply linkage supports;
+class consistency is judged only from what the lines themselves reveal, because the class facts
+the prompt saw are not in the table. Recovering the full annotation, or the human half of a
+thread, would need schema changes this procedure deliberately does not make.
 
 ### 3. Judge it
 
