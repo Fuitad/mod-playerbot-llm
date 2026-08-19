@@ -2465,6 +2465,42 @@ TEST(PlayerbotLLMSocialTransportTest, AGestureReachesTheCoordinatorAsAnEmoteResu
     EXPECT_EQ(resolved[0].result.callMetadata->costUsd, "0.000400");
 }
 
+TEST(PlayerbotLLMSocialTransportTest, AMemoryCitingReplyReachesTheCoordinatorWithItsCitations)
+{
+    /*
+     * The parser and the delivery gate each handle memory citations correctly on their own, but the
+     * hop between them - the response-to-result copy in Resolve - is its own seam. A reply whose
+     * claim rests only on a memory must arrive at the coordinator still carrying that citation;
+     * dropped here, the delivery gate sees a claim with no support, refuses it as unsupported, and
+     * the regeneration budget turns the refusal into silence.
+     */
+    FakeSidecarServer server([](std::string const&) -> std::optional<std::string> { return std::nullopt; });
+
+    Bridge bridge(MakeSocialBridgeConfig(server.Port()));
+
+    int64 const submittedAtMs = PlayerbotLLM::SteadyNowMs();
+    PlayerbotLLM::SocialTransport transport(bridge, SOCIAL_TOKEN, DETERMINISTIC_DEADLINE_MS);
+    ASSERT_TRUE(transport.SubmitAt(MakeSocialRequest(), submittedAtMs));
+
+    std::vector<PlayerbotLLM::SocialRawResponse> const answered{PlayerbotLLM::SocialRawResponse{
+        77,
+        SocialPayload("social", 77, 500, "You mentioned you only ride your warhorse.", 0,
+                      PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0, 2, "answer", "participant", {"g1"}, {"m1", "m3"}),
+        submittedAtMs + 10}};
+
+    std::vector<PlayerbotLLM::SocialTransport::Completed> const resolved =
+        transport.Resolve(answered, submittedAtMs + 20);
+
+    ASSERT_EQ(resolved.size(), 1u);
+    ASSERT_EQ(resolved[0].outcome, PlayerbotLLM::SocialExchangeOutcome::Deliver);
+    EXPECT_EQ(resolved[0].result.kind, PlayerbotSocialOutputKind::Message);
+    ASSERT_EQ(resolved[0].result.citedEvidenceIds.size(), 1u);
+    EXPECT_EQ(resolved[0].result.citedEvidenceIds[0], "g1");
+    ASSERT_EQ(resolved[0].result.citedMemoryIds.size(), 2u);
+    EXPECT_EQ(resolved[0].result.citedMemoryIds[0], "m1");
+    EXPECT_EQ(resolved[0].result.citedMemoryIds[1], "m3");
+}
+
 TEST(PlayerbotLLMSocialProtocolTest, AnEmoteOutsideTheAgreedVocabularyIsRefused)
 {
     /*

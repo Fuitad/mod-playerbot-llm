@@ -886,6 +886,7 @@ std::vector<PlayerbotLLM::SocialTransport::Completed> PlayerbotLLM::SocialTransp
         result.contribution = response.contribution;
         result.claimSubject = response.claimSubject;
         result.citedEvidenceIds = response.citedEvidenceIds;
+        result.citedMemoryIds = response.citedMemoryIds;
 
         // Consumed either way: a result is delivered once or not at all, never retried into a
         // conversation that has already moved on.
