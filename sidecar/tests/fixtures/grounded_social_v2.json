@@ -19,7 +19,10 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "candidate_bot",
-        "cited_evidence_ids": ["g1"]
+        "cited_evidence_ids": [
+          "g1"
+        ],
+        "cited_memory_ids": []
       },
       "expected": "contradicted_evidence"
     },
@@ -42,7 +45,10 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "candidate_bot",
-        "cited_evidence_ids": ["g1"]
+        "cited_evidence_ids": [
+          "g1"
+        ],
+        "cited_memory_ids": []
       },
       "expected": "contradicted_evidence"
     },
@@ -65,7 +71,10 @@
         "emote": "",
         "contribution": "answer",
         "claim_subject": "candidate_bot",
-        "cited_evidence_ids": ["g1"]
+        "cited_evidence_ids": [
+          "g1"
+        ],
+        "cited_memory_ids": []
       },
       "expected": "accepted"
     },
@@ -88,7 +97,10 @@
         "emote": "",
         "contribution": "answer",
         "claim_subject": "candidate_bot",
-        "cited_evidence_ids": ["g1"]
+        "cited_evidence_ids": [
+          "g1"
+        ],
+        "cited_memory_ids": []
       },
       "expected": "accepted"
     },
@@ -112,7 +124,8 @@
         "emote": "",
         "contribution": "fact_free_banter",
         "claim_subject": "none",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "unavailable_content"
     },
@@ -135,7 +148,8 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "none",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "adopted_accomplishment"
     },
@@ -158,7 +172,8 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "none",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "supplied_fact_question"
     },
@@ -181,7 +196,8 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "none",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "generic_filler"
     },
@@ -204,7 +220,10 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "participant",
-        "cited_evidence_ids": ["g1"]
+        "cited_evidence_ids": [
+          "g1"
+        ],
+        "cited_memory_ids": []
       },
       "expected": "evidence_subject_mismatch"
     },
@@ -227,7 +246,8 @@
         "emote": "",
         "contribution": "specific_reaction",
         "claim_subject": "candidate_bot",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "uncited_current_claim"
     },
@@ -250,7 +270,8 @@
         "emote": "",
         "contribution": "fact_free_banter",
         "claim_subject": "none",
-        "cited_evidence_ids": []
+        "cited_evidence_ids": [],
+        "cited_memory_ids": []
       },
       "expected": "accepted"
     }

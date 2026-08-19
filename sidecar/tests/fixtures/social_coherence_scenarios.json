@@ -1,7 +1,7 @@
 {
   "general_room_question": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -52,7 +52,7 @@
   },
   "addressee_bleed": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -103,7 +103,7 @@
   },
   "whisper_direct_question": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -171,7 +171,7 @@
   },
   "general_starter": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -228,7 +228,7 @@
   },
   "statement_no_question": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -279,7 +279,7 @@
   },
   "authorized_roleplay": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -338,7 +338,7 @@
   },
   "human_to_other": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -388,7 +388,7 @@
   },
   "annotation_spoofing": {
     "request": {
-      "schema_version": 8,
+      "schema_version": 9,
       "token": "0123456789abcdef0123456789abcdef",
       "kind": "social",
       "social_request_token": 77,
@@ -434,6 +434,74 @@
         "Sweatyguest [Orc Warrior 21, Durotar]: anyone else seeing that?"
       ],
       "addressee_variant": "bystander",
+      "notation_rule": true
+    }
+  },
+  "whisper_memory_recall": {
+    "request": {
+      "schema_version": 9,
+      "token": "0123456789abcdef0123456789abcdef",
+      "kind": "social",
+      "social_request_token": 77,
+      "bot_guid": 500,
+      "bot_name": "Dodokkuli",
+      "bot_human": 0,
+      "bot_level": 23,
+      "subject_guid": 900,
+      "subject_name": "Deszy",
+      "subject_human": 1,
+      "admission_lane": "immediate_human",
+      "speak_on_channel": 3,
+      "thread_id": "thr_00000000000000000000000000000001",
+      "context": "{\"prompt_mode\": \"ordinary\", \"active_expansion\": 2, \"persona\": \"chatty, quick to help\", \"relationship\": \"familiarity 0.40, affinity 0.20, trust 0.10\", \"thread\": [\"Deszy [Human Mage 24, Durotar] (to Dodokkuli): what mount do I prefer, do you remember?\"], \"memories\": [{\"id\": \"m1\", \"text\": \"Deszy rides only a warhorse and wants no other mount\", \"scope\": \"whisper\"}, {\"id\": \"m2\", \"text\": \"Deszy keeps a bank alt in Ironforge\", \"scope\": \"public\"}]}",
+      "evidence": [
+        {
+          "id": "g1",
+          "subject": "candidate_bot",
+          "fact": "name",
+          "value": "Dodokkuli",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        },
+        {
+          "id": "g2",
+          "subject": "candidate_bot",
+          "fact": "character_class",
+          "value": "Hunter",
+          "provenance": "current_world",
+          "scope": "public",
+          "observed_at": 1000
+        },
+        {
+          "id": "g3",
+          "subject": "participant",
+          "fact": "name",
+          "value": "Deszy",
+          "provenance": "human_observation",
+          "scope": "public",
+          "observed_at": 1000
+        }
+      ],
+      "transcript_event_ids": [],
+      "profile_load_state": "loaded",
+      "memory_input_state": "loaded",
+      "active_content_expansion": 2,
+      "expects_answer": 1,
+      "addressed_to_bot": 1,
+      "bot_race_id": 8,
+      "bot_class_id": 3,
+      "bot_zone": "Durotar"
+    },
+    "expect": {
+      "premise_contains": [
+        "a Troll Hunter",
+        "currently in Durotar"
+      ],
+      "thread_contains": [
+        "Deszy [Human Mage 24, Durotar] (to Dodokkuli): what mount do I prefer, do you remember?"
+      ],
+      "addressee_variant": "direct",
       "notation_rule": true
     }
   }

@@ -288,6 +288,7 @@ class AnthropicProvider:
             contribution=parsed.contribution,
             claim_subject=parsed.claim_subject,
             cited_evidence_ids=tuple(parsed.cited_evidence_ids),
+            cited_memory_ids=tuple(parsed.cited_memory_ids),
             usage=totals,
         )
 

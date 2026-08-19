@@ -52,6 +52,7 @@ class SocialGenerationResult:
     contribution: str
     claim_subject: str
     cited_evidence_ids: tuple[str, ...]
+    cited_memory_ids: tuple[str, ...]
     usage: GenerationUsage
 
 

@@ -952,7 +952,9 @@ namespace
                               uint64 schema = PlayerbotLLM::SOCIAL_SCHEMA_VERSION, uint64 emoteId = 0,
                               uint64 channel = 2, std::string contribution = {},
                               std::string claimSubject = {},
-                              std::vector<std::string> const& citedEvidenceIds = {})
+                              std::vector<std::string> const& citedEvidenceIds = {},
+                              std::vector<std::string> const& citedMemoryIds = {},
+                              bool declareMemoryCitationCount = true)
     {
         std::string out = "{\"schema_version\":" + std::to_string(schema);
         out += ",\"token\":\"" + SOCIAL_TOKEN + "\"";
@@ -981,6 +983,12 @@ namespace
             out += ",\"citation_count\":" + std::to_string(citedEvidenceIds.size());
             for (std::size_t index = 0; index < citedEvidenceIds.size(); ++index)
                 out += ",\"citation_" + std::to_string(index) + "\":\"" + citedEvidenceIds[index] + "\"";
+            if (declareMemoryCitationCount)
+            {
+                out += ",\"memory_citation_count\":" + std::to_string(citedMemoryIds.size());
+                for (std::size_t index = 0; index < citedMemoryIds.size(); ++index)
+                    out += ",\"memory_citation_" + std::to_string(index) + "\":\"" + citedMemoryIds[index] + "\"";
+            }
         }
         out += "}";
         return out;
@@ -1060,7 +1068,7 @@ TEST(PlayerbotLLMSocialProtocolTest, ASocialRequestCarriesWhatTheLineAskedAndWho
 
     std::optional<std::string> const serialized = PlayerbotLLM::SerializeSocialRequest(request, SOCIAL_TOKEN);
     ASSERT_TRUE(serialized.has_value());
-    EXPECT_NE(serialized->find("\"schema_version\":8"), std::string::npos);
+    EXPECT_NE(serialized->find("\"schema_version\":9"), std::string::npos);
     EXPECT_NE(serialized->find("\"expects_answer\":1"), std::string::npos);
     EXPECT_NE(serialized->find("\"addressed_to_bot\":0"), std::string::npos);
     EXPECT_NE(serialized->find("\"bot_race_id\":3"), std::string::npos);
@@ -1142,7 +1150,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnUnusableActorIsRefusedBeforeItIsSerialize
 
 TEST(PlayerbotLLMSocialProtocolTest, AWellFormedSocialAnswerIsAccepted)
 {
-    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 8u);
+    EXPECT_EQ(PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 9u);
 
     std::optional<PlayerbotLLM::SocialResponse> const parsed =
         PlayerbotLLM::ParseSocialResponsePayload(SocialPayload(), SOCIAL_TOKEN, 77, 500);
@@ -2795,8 +2803,8 @@ TEST(PlayerbotLLMSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSi
     context.persona = "speaks wry, reserved toward this listener";
     context.relationship = "familiarity 0.80, affinity 0.60, trust 0.40";
     context.starter = "the harvest golems are out again";
-    context.memories.push_back({"runs the same dungeon every night", PlayerbotSocialPrivacyScope::Public});
-    context.memories.push_back({"asked about the auction house", PlayerbotSocialPrivacyScope::Party});
+    context.memories.push_back({"runs the same dungeon every night", PlayerbotSocialPrivacyScope::Public, "m1"});
+    context.memories.push_back({"asked about the auction house", PlayerbotSocialPrivacyScope::Party, "m2"});
 
     std::string const encoded = PlayerbotLLM::EncodeSocialContext(context).value();
 
@@ -2809,6 +2817,150 @@ TEST(PlayerbotLLMSocialProtocolTest, AnAssembledContextCarriesEveryFieldTheFarSi
     EXPECT_NE(encoded.find("\"prompt_mode\":\"ordinary\""), std::string::npos);
     EXPECT_NE(encoded.find("\"active_expansion\":0"), std::string::npos);
     EXPECT_LE(encoded.size(), PlayerbotLLM::MAX_SOCIAL_CONTEXT_BYTES);
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AReplyNamesTheMemoriesItDrewOn)
+{
+    /*
+     * The other half of the citation. A reply that answers from something it was told has to say
+     * which stored memory it used, and the two citation lists stay separate all the way through:
+     * merging them would lose the one distinction the design rests on, that a memory cannot license
+     * a claim about the world right now.
+     */
+    std::optional<PlayerbotLLM::SocialResponse> const parsed = PlayerbotLLM::ParseSocialResponsePayload(
+        SocialPayload("social", 77, 500, "You mentioned you only ride your warhorse.", 0,
+                      PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0, 2, "answer", "participant", {}, {"m1", "m3"}),
+        SOCIAL_TOKEN, 77, 500);
+
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->citedEvidenceIds.empty());
+    ASSERT_EQ(parsed->citedMemoryIds.size(), 2u);
+    EXPECT_EQ(parsed->citedMemoryIds[0], "m1");
+    EXPECT_EQ(parsed->citedMemoryIds[1], "m3");
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AReplyThatDoesNotDeclareItsMemoryCitationCountIsRefused)
+{
+    /*
+     * Required exactly as `citation_count` is. A missing count read as zero would let a sidecar that
+     * forgot the field deliver claims whose memory citations silently vanished, which is the shape
+     * every other required field on this frame already refuses.
+     */
+    EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
+                     SocialPayload("social", 77, 500, "Aye.", 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0, 2,
+                                   "fact_free_banter", "none", {}, {}, false),
+                     SOCIAL_TOKEN, 77, 500)
+                     .has_value());
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AMalformedOrRepeatedMemoryCitationIsRefused)
+{
+    /*
+     * An id from outside this space cannot resolve against the memories the request retained, and a
+     * repeat makes a citation ambiguous, so both are refused rather than resolved to whichever entry
+     * happened to be found first.
+     */
+    for (std::vector<std::string> const& malformed :
+         {std::vector<std::string>{"m0"}, std::vector<std::string>{"m"}, std::vector<std::string>{"g1"},
+          std::vector<std::string>{"mx"}, std::vector<std::string>{"m1", "m1"}})
+    {
+        EXPECT_FALSE(PlayerbotLLM::ParseSocialResponsePayload(
+                         SocialPayload("social", 77, 500, "You mentioned the warhorse.", 0,
+                                       PlayerbotLLM::SOCIAL_SCHEMA_VERSION, 0, 2, "answer", "participant", {},
+                                       malformed),
+                         SOCIAL_TOKEN, 77, 500)
+                         .has_value())
+            << "accepted a malformed memory citation: " << malformed.front();
+    }
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AnOrdinaryReplyThatCitesNoMemoryStillParses)
+{
+    /*
+     * The majority of live traffic, and the regression a newly required field would cause. Every
+     * ordinary shape still round-trips with the count declared and zero.
+     */
+    struct Shape
+    {
+        char const* message;
+        uint64 emoteId;
+        char const* contribution;
+        char const* claimSubject;
+        std::vector<std::string> evidence;
+    };
+
+    std::vector<Shape> const shapes = {
+        {"Aye, that pack hits hard.", 0, "answer", "participant", {"g1"}},
+        {"Nothing quite like a quiet night in Ironforge.", 0, "fact_free_banter", "none", {}},
+        {"", 78, "gesture", "none", {}},
+        {"", 0, "none", "none", {}},
+    };
+
+    for (Shape const& shape : shapes)
+    {
+        std::optional<PlayerbotLLM::SocialResponse> const parsed = PlayerbotLLM::ParseSocialResponsePayload(
+            SocialPayload("social", 77, 500, shape.message, 0, PlayerbotLLM::SOCIAL_SCHEMA_VERSION, shape.emoteId, 2,
+                          shape.contribution, shape.claimSubject, shape.evidence),
+            SOCIAL_TOKEN, 77, 500);
+
+        ASSERT_TRUE(parsed.has_value()) << "an ordinary reply stopped parsing: " << shape.contribution;
+        EXPECT_TRUE(parsed->citedMemoryIds.empty());
+    }
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AnOfferedMemoryCarriesItsWireIdAndNotItsDurableRowId)
+{
+    /*
+     * The id is the whole point of offering a memory: a reply cites it, and the worldserver turns
+     * that citation back into the row it retained. The durable row id is deliberately absent from
+     * the wire. It identifies a database row, a prompt has no use for it, and sending it would put
+     * durable identity in front of a model for no reason.
+     */
+    PlayerbotSocialRequestContext context;
+    context.persona = "speaks plainly, remembers what people tell him";
+
+    PlayerbotSocialContextMemory warhorse;
+    warhorse.text = "rides only a warhorse";
+    warhorse.scope = PlayerbotSocialPrivacyScope::Whisper;
+    warhorse.id = "m1";
+    warhorse.publicId = "mem_" + std::string(32, 'a');
+    context.memories.push_back(warhorse);
+
+    PlayerbotSocialContextMemory bankAlt;
+    bankAlt.text = "keeps a bank alt in Ironforge";
+    bankAlt.scope = PlayerbotSocialPrivacyScope::Party;
+    bankAlt.id = "m2";
+    bankAlt.publicId = "mem_" + std::string(32, 'b');
+    context.memories.push_back(bankAlt);
+
+    std::string const encoded = PlayerbotLLM::EncodeSocialContext(context).value();
+
+    EXPECT_NE(encoded.find("\"id\":\"m1\""), std::string::npos);
+    EXPECT_NE(encoded.find("\"id\":\"m2\""), std::string::npos);
+    EXPECT_EQ(encoded.find("mem_"), std::string::npos) << "a durable row id reached the wire: " << encoded;
+    EXPECT_LE(encoded.size(), PlayerbotLLM::MAX_SOCIAL_CONTEXT_BYTES);
+}
+
+TEST(PlayerbotLLMSocialProtocolTest, AMemoryWithNoWireIdIsLeftOutRatherThanCostingTheWholeContext)
+{
+    /*
+     * The far side requires the id and drops the entire context when one entry is malformed, taking
+     * persona and thread down with it. So an entry this side cannot name is skipped here, exactly as
+     * an empty one already is: a producer bug costs one memory rather than every assembled field.
+     */
+    PlayerbotSocialRequestContext context;
+    context.persona = "speaks plainly, remembers what people tell him";
+
+    PlayerbotSocialContextMemory nameless;
+    nameless.text = "rides only a warhorse";
+    nameless.scope = PlayerbotSocialPrivacyScope::Whisper;
+    context.memories.push_back(nameless);
+
+    std::string const encoded = PlayerbotLLM::EncodeSocialContext(context).value();
+
+    EXPECT_EQ(encoded.find("\"memories\":"), std::string::npos) << encoded;
+    EXPECT_EQ(encoded.find("warhorse"), std::string::npos) << "an unciteable memory reached the wire: " << encoded;
+    EXPECT_NE(encoded.find("\"persona\":"), std::string::npos) << "the rest of the context survived";
 }
 
 TEST(PlayerbotLLMSocialProtocolTest, FictionalIdentitySerializesAsOneCoherentApprovedOrWithheldGroup)
@@ -2908,7 +3060,7 @@ TEST(PlayerbotLLMSocialProtocolTest, CanonicalCountriesAndIdentityGroupSurviveBo
         full.nearby.push_back(std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'n'));
         full.thread.push_back(std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 't'));
         full.memories.push_back({std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
-                                 PlayerbotSocialPrivacyScope::Public});
+                                 PlayerbotSocialPrivacyScope::Public, "m" + std::to_string(index + 1)});
     }
 
     std::string const encoded = PlayerbotLLM::EncodeSocialContext(full).value();
@@ -2965,7 +3117,7 @@ TEST(PlayerbotLLMSocialProtocolTest, AnAssembledContextStaysWithinTheWholeContex
     context.relationship = std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'r');
     for (int index = 0; index < 12; ++index)
         context.memories.push_back({std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
-                                    PlayerbotSocialPrivacyScope::Public});
+                                    PlayerbotSocialPrivacyScope::Public, "m" + std::to_string(index + 1)});
 
     std::string const encoded = PlayerbotLLM::EncodeSocialContext(context).value();
 
@@ -2986,7 +3138,8 @@ TEST(PlayerbotLLMSocialProtocolTest, AnAssembledContextNeverEmitsMoreEntriesThan
     {
         context.thread.push_back("line " + std::to_string(index));
         context.nearby.push_back("bystander " + std::to_string(index));
-        context.memories.push_back({"detail " + std::to_string(index), PlayerbotSocialPrivacyScope::Public});
+        context.memories.push_back(
+            {"detail " + std::to_string(index), PlayerbotSocialPrivacyScope::Public, "m" + std::to_string(index + 1)});
     }
 
     std::string const encoded = PlayerbotLLM::EncodeSocialContext(context).value();
@@ -3088,7 +3241,7 @@ TEST(PlayerbotLLMSocialProtocolTest, PromptAuthoritySurvivesBoundedContextTrimmi
         full.nearby.push_back(std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'n'));
         full.thread.push_back(std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 't'));
         full.memories.push_back({std::string(PlayerbotLLM::MAX_SOCIAL_CONTEXT_ENTRY_BYTES, 'm'),
-                                 PlayerbotSocialPrivacyScope::Public});
+                                 PlayerbotSocialPrivacyScope::Public, "m" + std::to_string(index + 1)});
     }
 
     std::optional<std::string> const encoded = PlayerbotLLM::EncodeSocialContext(full);

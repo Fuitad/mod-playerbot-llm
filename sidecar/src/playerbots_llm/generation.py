@@ -160,6 +160,7 @@ class SocialReply(BaseModel):
     contribution: Literal["answer", "specific_reaction", "fact_free_banter", "gesture", "none"]
     claim_subject: Literal["candidate_bot", "participant", "none"]
     cited_evidence_ids: list[str]
+    cited_memory_ids: list[str]
 
     @model_validator(mode="after")
     def _one_coherent_answer(self) -> SocialReply:
@@ -167,6 +168,12 @@ class SocialReply(BaseModel):
             raise ValueError("too many cited evidence ids")
         if len(set(self.cited_evidence_ids)) != len(self.cited_evidence_ids):
             raise ValueError("cited evidence ids must be unique")
+        # Bounded by what a request may offer: a reply cannot have drawn on more memories than it
+        # was shown, and a repeat would make the citation ambiguous.
+        if len(self.cited_memory_ids) > protocol.MAX_SOCIAL_CONTEXT_ENTRIES:
+            raise ValueError("too many cited memory ids")
+        if len(set(self.cited_memory_ids)) != len(self.cited_memory_ids):
+            raise ValueError("cited memory ids must be unique")
 
         if self.response_kind == "message":
             if not self.message.strip() or self.emote:
@@ -178,13 +185,13 @@ class SocialReply(BaseModel):
         if self.response_kind == "emote":
             if self.message.strip() or not self.emote or self.contribution != "gesture":
                 raise ValueError("emote response carries exactly one gesture")
-            if self.claim_subject != "none" or self.cited_evidence_ids:
+            if self.claim_subject != "none" or self.cited_evidence_ids or self.cited_memory_ids:
                 raise ValueError("a gesture makes no factual claim")
             return self
 
         if self.message.strip() or self.emote or self.contribution != "none":
             raise ValueError("silence carries no generated content")
-        if self.claim_subject != "none" or self.cited_evidence_ids:
+        if self.claim_subject != "none" or self.cited_evidence_ids or self.cited_memory_ids:
             raise ValueError("silence cites nothing")
         return self
 
@@ -303,8 +310,9 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
     if request.expects_answer and request.addressed_to_bot:
         addressee_rule = (
             "- The latest line asks YOU a question directly. Answer what was actually asked, "
-            "using what THREAD has already established, and cite the EVIDENCE any factual part "
-            "of your answer rests on.\n"
+            "using what THREAD has already established or what MEMORIES records this person told "
+            "you before, and cite the EVIDENCE or the memory that any factual part of your answer "
+            "rests on.\n"
         )
     elif request.expects_answer:
         addressee_rule = (
@@ -398,6 +406,12 @@ def build_social_system_prompt(request: protocol.SocialRequest) -> str:
         "- Cite only request evidence identifiers in cited_evidence_ids. Set claim_subject to "
         "candidate_bot for claims about yourself, participant for claims about the triggering "
         "participant, or none for fact-free banter. Never cite a fact owned by another subject.\n"
+        "- MEMORIES is what this person told you in earlier conversations, each line led by the id "
+        "to cite it by. Draw on one only when it bears on what was just said, never to open a new "
+        "subject. Put its id in cited_memory_ids with claim_subject participant, and say where it "
+        'came from ("you mentioned...") rather than stating it as something you observed. A '
+        "memory records what was SAID and never what is true right now, so it can never support a "
+        "claim about anyone's current level, zone, gear, or accomplishments.\n"
         "- A current fact or accomplishment requires a compatible cited evidence id. Evidence "
         "belongs only to the subject and privacy scope written on it.\n"
         f"{identity_rules}"
@@ -521,7 +535,9 @@ def build_social_user_message(request: protocol.SocialRequest) -> str:
     # Filtered by what this channel is allowed to know, not by what was sent.
     memories = context.memories_within(request.speak_on_channel)
     if memories:
-        lines += _fenced("MEMORIES", "\n".join(memory.text for memory in memories))
+        # The id leads each line because it is what a reply has to cite. Rendering the text alone is
+        # what left the model able to read a memory but unable to name one.
+        lines += _fenced("MEMORIES", "\n".join(f"{memory.id}: {memory.text}" for memory in memories))
 
     if len(lines) == 2:
         lines += _fenced("CONTEXT", "(nothing was supplied)")
@@ -778,6 +794,27 @@ _CURRENT_CLAIM = re.compile(
     r"my (?:gear|quest|item|target|group|guild)\b)",
     re.IGNORECASE,
 )
+"""The same assertion, aimed at the OTHER person, and deliberately a separate pattern.
+
+It exists because a memory may now ground a claim about the participant, and a remembered
+conversation cannot vouch for what somebody is wearing or has finished RIGHT NOW.
+
+The verb and noun sets mirror the first-person pattern exactly, but the two are kept SEPARATE rather
+than folded into one, because they are checked in different places. `_CURRENT_CLAIM` governs every
+reply, and these second-person forms appear constantly in ordinary friendly banter ("gl with whatever
+you're fighting", "sort your gear before heading out"): measured against 3853 real delivered lines,
+folding them into the shared pattern would newly refuse 24 of them, and a refusal becomes silence
+after the single permitted regeneration, which is the very failure this feature exists to remove.
+Checked only for a reply whose sole grounding is a memory, the same set costs nothing, because banter
+carries no citations at all and so can never reach this pattern.
+"""
+_PARTICIPANT_CURRENT_CLAIM = re.compile(
+    r"\b(?:(?:you are|you're)\s+"
+    r"(?:farming|fighting|targeting|carrying|wearing|grouped|in\b|level\b|a level\b)|"
+    r"(?:you have|you've)\s+(?:completed|cleared|finished|killed|looted|equipped|unlocked|got\b)|"
+    r"your (?:gear|quest|item|target|group|guild)\b)",
+    re.IGNORECASE,
+)
 _LEVEL_CLAIM = re.compile(
     r"\b(?P<speaker>i(?: am|'m)|you(?: are|'re))\s+(?:a\s+)?level\s+(?P<value>\d{1,3})\b",
     re.IGNORECASE,
@@ -825,6 +862,24 @@ def validate_social_reply(
     if reply.response_kind == "silence":
         return "", 0
 
+    """A memory may only be cited if THIS channel was offered it.
+
+    Resolved against `memories_within` rather than the raw list, so a memory whose scope this
+    channel cannot reach is not merely absent from the prompt, it is uncitable. That keeps the
+    filter and the citation rule from disagreeing about the same memory.
+    """
+    context = protocol.parse_social_context(request.context)
+    offered_memories = {
+        memory.id: memory for memory in (context.memories_within(request.speak_on_channel) if context else [])
+    }
+    for memory_id in reply.cited_memory_ids:
+        if memory_id not in offered_memories:
+            raise provider.GenerationInvalidOutputError(
+                f"social reply cited unknown memory {memory_id!r}",
+                usage,
+                ModerationCategory.UNKNOWN_EVIDENCE,
+            )
+
     evidence_by_id = {entry.id: entry for entry in request.evidence}
     try:
         cited = [evidence_by_id[evidence_id] for evidence_id in reply.cited_evidence_ids]
@@ -851,13 +906,18 @@ def validate_social_reply(
             usage,
             ModerationCategory.IRRELEVANT_CONTRIBUTION,
         )
-    if reply.contribution == "answer" and not cited:
+    # Either list grounds an answer: evidence for what the world is now, a memory for what this
+    # person said earlier. Requiring evidence specifically is what left a bot asked about something
+    # it had been told with no legal reply but silence.
+    if reply.contribution == "answer" and not cited and not reply.cited_memory_ids:
         raise provider.GenerationInvalidOutputError(
             "social answer cited no grounding evidence",
             usage,
             ModerationCategory.UNCITED_CURRENT_CLAIM,
         )
-    if reply.contribution == "fact_free_banter" and (reply.claim_subject != "none" or cited):
+    if reply.contribution == "fact_free_banter" and (
+        reply.claim_subject != "none" or cited or reply.cited_memory_ids
+    ):
         raise provider.GenerationInvalidOutputError(
             "fact free social banter carried a factual claim",
             usage,
@@ -875,7 +935,13 @@ def validate_social_reply(
             usage,
             ModerationCategory.EVIDENCE_SUBJECT_MISMATCH,
         )
-    if reply.claim_subject == "none" and cited:
+    if reply.cited_memory_ids and reply.claim_subject != "participant":
+        raise provider.GenerationInvalidOutputError(
+            "social reply cited a memory for a claim it cannot support",
+            usage,
+            ModerationCategory.EVIDENCE_SUBJECT_MISMATCH,
+        )
+    if reply.claim_subject == "none" and (cited or reply.cited_memory_ids):
         raise provider.GenerationInvalidOutputError(
             "fact free social reply cited factual evidence",
             usage,
@@ -934,9 +1000,28 @@ def validate_social_reply(
             ModerationCategory.UNAVAILABLE_CONTENT,
         )
 
-    if (_CURRENT_CLAIM.search(message) or reply.claim_subject != "none") and not cited:
+    """Two halves of one rule, and only one of them a memory can satisfy.
+
+    A claim about the world RIGHT NOW still needs evidence: a memory records what somebody said
+    earlier, and the intervening weeks are exactly why it cannot vouch for a current level or zone.
+    A claim about the person, on the other hand, is grounded by either list, which is what lets a bot
+    answer what it was told without asserting anything about the present.
+    """
+    if _CURRENT_CLAIM.search(message) and not cited:
         raise provider.GenerationInvalidOutputError(
             "social reply made an uncited current claim",
+            usage,
+            ModerationCategory.UNCITED_CURRENT_CLAIM,
+        )
+    if reply.claim_subject != "none" and not cited and not reply.cited_memory_ids:
+        raise provider.GenerationInvalidOutputError(
+            "social reply made an uncited current claim",
+            usage,
+            ModerationCategory.UNCITED_CURRENT_CLAIM,
+        )
+    if reply.cited_memory_ids and not cited and _PARTICIPANT_CURRENT_CLAIM.search(message):
+        raise provider.GenerationInvalidOutputError(
+            "social reply used a memory to claim what the other person is doing now",
             usage,
             ModerationCategory.UNCITED_CURRENT_CLAIM,
         )

@@ -43,8 +43,16 @@ namespace PlayerbotLLM
      * (`expects_answer`, `addressed_to_bot`) plus the bot's own race, class, and zone. A sidecar
      * that does not know these fields is refused rather than left to infer an addressee, which is
      * the failure this version exists to remove.
+     *
+     * Bumped to 9 so every offered memory carries the request local id a reply cites it by, which is
+     * what lets a bot answer from something it was told rather than staying silent for want of
+     * anything it is allowed to name. The gate is deliberately the version and not the context
+     * shape: the assembled context travels as an opaque string the far side parses
+     * opportunistically, and a shape it does not recognise is discarded WHOLE, persona and thread
+     * and memories together. A version skewed pair would therefore keep talking with no context at
+     * all, so refusing on the version is what makes that failure loud instead of silent.
      */
-    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 8;
+    inline constexpr uint32 SOCIAL_SCHEMA_VERSION = 9;
     inline constexpr size_t FRAME_HEADER_BYTES = 4;
     inline constexpr size_t MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
     inline constexpr size_t MAX_RESPONSE_MESSAGE_BYTES = 240;
@@ -314,6 +322,12 @@ namespace PlayerbotLLM
         PlayerbotSocialContributionFunction contribution = PlayerbotSocialContributionFunction::None;
         PlayerbotSocialClaimSubject claimSubject = PlayerbotSocialClaimSubject::None;
         std::vector<std::string> citedEvidenceIds;
+        /*
+         * Kept separate from the evidence list all the way through. A memory says what somebody told
+         * this bot earlier; evidence says what the world is now. Merging them would let a stale
+         * recollection stand in for a current fact, which is the one thing this lane must not do.
+         */
+        std::vector<std::string> citedMemoryIds;
     };
 
     /*

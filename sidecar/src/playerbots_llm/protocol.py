@@ -26,7 +26,7 @@ from pydantic import (
 )
 
 SCHEMA_VERSION = 6
-SOCIAL_SCHEMA_VERSION = 8
+SOCIAL_SCHEMA_VERSION = 9
 MAX_FRAME_PAYLOAD_BYTES = 64 * 1024
 MAX_REQUEST_MESSAGE_BYTES = 512
 MAX_CAREER_MESSAGE_BYTES = 60 * 1024
@@ -516,7 +516,7 @@ class SocialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[8]
+    schema_version: Literal[9]
     token: str
     kind: Literal["social"]
     social_request_token: Annotated[int, Field(ge=1, le=_UINT64_MAX)]
@@ -672,10 +672,18 @@ class SocialCallMetadata(BaseModel):
 
 
 class SocialMemory(BaseModel):
-    """One remembered fact, and the privacy it was learned under."""
+    """One remembered fact, the privacy it was learned under, and the name a reply may cite it by.
+
+    The id is request local and dense (`m1`, `m2`, ...), assigned by the worldserver over the
+    entries it actually offered. It is required rather than optional because the producer already
+    skips an entry it cannot render, exactly as it does for empty text: an entry arriving without a
+    name no reply could cite is a producer bug, and refusing it here surfaces that rather than
+    offering the model a memory it can only paraphrase blind.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    id: Annotated[str, StringConstraints(pattern=r"^m[1-9][0-9]*$")]
     text: Annotated[str, StringConstraints(min_length=1, max_length=MAX_SOCIAL_CONTEXT_ENTRY_BYTES)]
     scope: Literal["public", "party", "whisper"]
 
@@ -734,6 +742,20 @@ class SocialContext(BaseModel):
             or self.fictional_home_country is not None
         ):
             raise ValueError("authorized roleplay carries no fictional player identity")
+
+        return self
+
+    @model_validator(mode="after")
+    def memory_ids_are_unique(self) -> Self:
+        """A citation has to resolve to one memory.
+
+        Two entries sharing an id would be resolved by whichever the worldserver retained first,
+        so a delivered line could be attributed to a row it was never drawn from.
+        """
+
+        ids = [memory.id for memory in self.memories]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two memories share a wire id")
 
         return self
 
@@ -1142,6 +1164,7 @@ def encode_social_response(
     contribution: str | None = None,
     claim_subject: str | None = None,
     cited_evidence_ids: tuple[str, ...] = (),
+    cited_memory_ids: tuple[str, ...] = (),
 ) -> bytes:
     """Builds the exact payload shape the C++ social response parser accepts.
 
@@ -1202,12 +1225,38 @@ def encode_social_response(
         ):
             raise ProtocolError("social response citation id is malformed")
 
+        # Bounded by what a request may offer rather than by the evidence ceiling: a reply cannot
+        # have drawn on more memories than it was shown.
+        if len(cited_memory_ids) > MAX_SOCIAL_CONTEXT_ENTRIES or len(set(cited_memory_ids)) != len(
+            cited_memory_ids
+        ):
+            raise ProtocolError("social response memory citations are not bounded and unique")
+
+        if any(
+            len(identifier) < 2
+            or identifier[0] != "m"
+            or identifier[1] == "0"
+            or not identifier[1:].isdigit()
+            for identifier in cited_memory_ids
+        ):
+            raise ProtocolError("social response memory citation id is malformed")
+
         if emote_id:
-            coherent = contribution == "gesture" and claim_subject == "none" and not cited_evidence_ids
+            coherent = (
+                contribution == "gesture"
+                and claim_subject == "none"
+                and not cited_evidence_ids
+                and not cited_memory_ids
+            )
         elif message:
             coherent = contribution in {"answer", "specific_reaction", "fact_free_banter"}
         else:
-            coherent = contribution == "none" and claim_subject == "none" and not cited_evidence_ids
+            coherent = (
+                contribution == "none"
+                and claim_subject == "none"
+                and not cited_evidence_ids
+                and not cited_memory_ids
+            )
         if not coherent:
             raise ProtocolError("social response proposal metadata is incoherent")
 
@@ -1229,6 +1278,11 @@ def encode_social_response(
         payload["citation_count"] = len(cited_evidence_ids)
         for index, evidence_id in enumerate(cited_evidence_ids):
             payload[f"citation_{index}"] = evidence_id
+        # Always declared, even at zero, because the worldserver requires the field and reads the
+        # frame's key count exactly. An omitted count is a refused frame, not an implied zero.
+        payload["memory_citation_count"] = len(cited_memory_ids)
+        for index, memory_id in enumerate(cited_memory_ids):
+            payload[f"memory_citation_{index}"] = memory_id
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 

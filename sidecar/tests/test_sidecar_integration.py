@@ -123,6 +123,7 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
             contribution="fact_free_banter",
             claim_subject="none",
             cited_evidence_ids=(),
+            cited_memory_ids=(),
             usage=provider.GenerationUsage(input_tokens=self.input_tokens, output_tokens=10),
         )
 

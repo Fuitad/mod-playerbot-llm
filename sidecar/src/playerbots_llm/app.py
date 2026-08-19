@@ -872,6 +872,7 @@ class SidecarService:
             contribution=generated.contribution,
             claim_subject=generated.claim_subject,
             cited_evidence_ids=generated.cited_evidence_ids,
+            cited_memory_ids=generated.cited_memory_ids,
         )
 
     async def _process_within_deadline(self, request: protocol.ChatRequest) -> bytes | None:

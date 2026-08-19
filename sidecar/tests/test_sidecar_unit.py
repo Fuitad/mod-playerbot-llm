@@ -461,6 +461,7 @@ def social_messages_response(
     contribution: str | None = None,
     claim_subject: str = "none",
     cited_evidence_ids: list[str] | None = None,
+    cited_memory_ids: list[str] | None = None,
 ) -> httpx.Response:
     response_kind = "emote" if emote else "message"
     resolved_contribution = contribution or ("gesture" if emote else "fact_free_banter")
@@ -480,6 +481,7 @@ def social_messages_response(
                         "contribution": resolved_contribution,
                         "claim_subject": claim_subject,
                         "cited_evidence_ids": cited_evidence_ids or [],
+                        "cited_memory_ids": cited_memory_ids or [],
                     }
                 ),
             }
@@ -657,6 +659,7 @@ def test_model_io_trace_records_the_exact_prompt_and_social_reply() -> None:
             "contribution": "fact_free_banter",
             "claim_subject": "none",
             "cited_evidence_ids": [],
+            "cited_memory_ids": [],
         }
     )
 
@@ -1160,6 +1163,7 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
                 contribution="gesture",
                 claim_subject="none",
                 cited_evidence_ids=(),
+                cited_memory_ids=(),
                 usage=usage,
             )
 
@@ -1169,6 +1173,7 @@ class FakeAdapter(anthropic_provider.AnthropicProvider):
             contribution="fact_free_banter",
             claim_subject="none",
             cited_evidence_ids=(),
+            cited_memory_ids=(),
             usage=usage,
         )
 
@@ -1978,7 +1983,7 @@ def _social_request_payload(**overrides: object) -> bytes:
 
 
 def test_social_protocol_has_an_independent_version() -> None:
-    assert protocol.SOCIAL_SCHEMA_VERSION == 8
+    assert protocol.SOCIAL_SCHEMA_VERSION == 9
 
 
 def test_the_social_schema_version_has_not_drifted_from_the_worldserver() -> None:
@@ -2027,7 +2032,7 @@ def test_the_social_request_field_names_have_not_drifted_from_the_worldserver() 
     )
 
 
-def test_social_v8_requires_typed_bounded_grounding() -> None:
+def test_social_v9_requires_typed_bounded_grounding() -> None:
     request = protocol.parse_social_request(_social_request_payload(), TEST_TOKEN)
 
     assert request.evidence[0].id == "g1"
@@ -2043,7 +2048,7 @@ def test_social_v8_requires_typed_bounded_grounding() -> None:
         protocol.parse_social_request(json.dumps(missing).encode("utf-8"), TEST_TOKEN)
 
     future = json.loads(_social_request_payload())
-    future["schema_version"] = 9
+    future["schema_version"] = 10
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_social_request(json.dumps(future).encode("utf-8"), TEST_TOKEN)
 
@@ -2269,6 +2274,7 @@ def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
         "citation_count": 2,
         "citation_0": "g1",
         "citation_1": "g3",
+        "memory_citation_count": 0,
         "model": "fixture-social-model",
         "provider_latency_ms": 42,
         "input_tokens": 100,
@@ -2277,6 +2283,90 @@ def test_social_response_encodes_the_shape_the_worldserver_accepts() -> None:
         "cache_read_input_tokens": 30,
         "cost_usd": "0.000400",
     }
+
+
+def test_a_social_response_names_the_memories_it_drew_on() -> None:
+    """A reply answering from something it was told says which stored memory it used, in its own
+    list. The two lists stay separate on the wire for the same reason they do everywhere else: a
+    memory says what somebody said earlier, evidence says what the world is now."""
+    encoded = json.loads(
+        protocol.encode_social_response(
+            77,
+            500,
+            3,
+            "You mentioned you only ride your warhorse.",
+            TEST_TOKEN,
+            metadata=_social_call_metadata(),
+            contribution="answer",
+            claim_subject="participant",
+            cited_memory_ids=("m1", "m3"),
+        )
+    )
+
+    assert encoded["citation_count"] == 0
+    assert encoded["memory_citation_count"] == 2
+    assert encoded["memory_citation_0"] == "m1"
+    assert encoded["memory_citation_1"] == "m3"
+
+
+def test_every_social_response_declares_its_memory_citation_count() -> None:
+    """The worldserver requires the field and counts the frame's keys exactly, so an omitted count is
+    a refused frame rather than an implied zero. Every ordinary shape therefore declares it, which is
+    what keeps a change aimed at recall from silencing the traffic that has nothing to recall."""
+    ordinary = (
+        {
+            "message": "Aye.",
+            "contribution": "answer",
+            "claim_subject": "participant",
+            "cited_evidence_ids": ("g1",),
+        },
+        {"message": "Quiet night.", "contribution": "fact_free_banter", "claim_subject": "none"},
+        # A gesture is only visible on the channels that carry one, so this shape names its own.
+        {"message": "", "emote_id": 78, "contribution": "gesture", "claim_subject": "none", "channel": 2},
+        {"message": "", "contribution": "none", "claim_subject": "none"},
+    )
+
+    for shape in ordinary:
+        fields = dict(shape)
+        channel = fields.pop("channel", 3)
+        encoded = json.loads(
+            protocol.encode_social_response(
+                77, 500, channel, token=TEST_TOKEN, metadata=_social_call_metadata(), **fields
+            )
+        )
+        assert encoded["memory_citation_count"] == 0, shape["contribution"]
+
+
+def test_social_response_memory_citations_are_bounded_unique_and_well_formed() -> None:
+    for malformed in (("m1", "m1"), ("m0",), ("m",), ("g1",), ("mx",), tuple(f"m{n}" for n in range(1, 15))):
+        with pytest.raises(protocol.ProtocolError):
+            protocol.encode_social_response(
+                77,
+                500,
+                3,
+                "You mentioned the warhorse.",
+                TEST_TOKEN,
+                metadata=_social_call_metadata(),
+                contribution="answer",
+                claim_subject="participant",
+                cited_memory_ids=malformed,
+            )
+
+
+def test_a_gesture_or_a_silence_cites_no_memory() -> None:
+    """Same rule the evidence list already has. Neither shape makes a claim, so neither may point at
+    a stored memory as if it had."""
+    for kind, emote, contribution in (("emote", "wave", "gesture"), ("silence", "", "none")):
+        with pytest.raises(ValidationError):
+            generation.SocialReply(
+                response_kind=kind,
+                message="",
+                emote=emote,
+                contribution=contribution,
+                claim_subject="none",
+                cited_evidence_ids=[],
+                cited_memory_ids=["m1"],
+            )
 
 
 def test_a_regeneration_carries_no_message() -> None:
@@ -2566,6 +2656,7 @@ async def test_a_social_answer_carries_exact_provider_call_metadata(tmp_path, mo
                 contribution="specific_reaction",
                 claim_subject="candidate_bot",
                 cited_evidence_ids=("g1",),
+                cited_memory_ids=(),
                 usage=provider.GenerationUsage(
                     input_tokens=100,
                     output_tokens=50,
@@ -2605,6 +2696,7 @@ async def test_a_social_cost_breach_settles_but_produces_no_response(tmp_path) -
                 contribution="fact_free_banter",
                 claim_subject="none",
                 cited_evidence_ids=(),
+                cited_memory_ids=(),
                 usage=provider.GenerationUsage(input_tokens=1_000_000, output_tokens=10),
             )
 
@@ -2859,6 +2951,9 @@ def test_a_model_cannot_vouch_for_its_own_output() -> None:
         "contribution",
         "claim_subject",
         "cited_evidence_ids",
+        # Points at a memory the request offered. Like the evidence list it names what the reply
+        # rested on, so it is a citation rather than a claim the model makes about its own answer.
+        "cited_memory_ids",
     }
     assert generation.SocialReply.model_config.get("extra") == "forbid"
 
@@ -2869,6 +2964,7 @@ def _social_proposal(
     contribution: str = "specific_reaction",
     claim_subject: str = "none",
     cited_evidence_ids: list[str] | None = None,
+    cited_memory_ids: list[str] | None = None,
 ) -> generation.SocialReply:
     return generation.SocialReply.model_validate(
         {
@@ -2878,8 +2974,201 @@ def _social_proposal(
             "contribution": contribution,
             "claim_subject": claim_subject,
             "cited_evidence_ids": cited_evidence_ids or [],
+            "cited_memory_ids": cited_memory_ids or [],
         }
     )
+
+
+def _whisper_recall_request(**overrides: object) -> protocol.SocialRequest:
+    """A whisper asking about something only a stored memory knows."""
+
+    context = _context(
+        memories=[
+            {"id": "m1", "text": "Deszy rides only a warhorse and wants no other mount", "scope": "whisper"}
+        ]
+    )
+    payload: dict[str, object] = {"speak_on_channel": 3, "context": context, "addressed_to_bot": 1}
+    payload.update(overrides)
+    return protocol.parse_social_request(_social_request_payload(**payload), TEST_TOKEN)
+
+
+def test_an_answer_may_rest_on_a_cited_memory_instead_of_world_evidence() -> None:
+    """The exchange that went silent live. The player asks what they told this bot earlier, and the
+    answer rests on a stored memory rather than on anything the world can be asked about now. Before
+    the memory lane existed an answer without evidence was refused, so the only compliant reply left
+    was silence."""
+    request = _whisper_recall_request()
+    recall = _social_proposal(
+        "You mentioned you only ride your warhorse.",
+        contribution="answer",
+        claim_subject="participant",
+        cited_memory_ids=["m1"],
+    )
+
+    message, emote = generation.validate_social_reply(recall, request)
+
+    assert "warhorse" in message
+    assert emote == 0
+
+
+def test_a_cited_memory_must_be_one_this_channel_was_offered() -> None:
+    """Resolved against `memories_within`, never the raw list, so a memory out of scope for this
+    channel cannot be cited even if one somehow arrived in the context."""
+    unknown = _social_proposal(
+        "You mentioned the warhorse.",
+        contribution="answer",
+        claim_subject="participant",
+        cited_memory_ids=["m4"],
+    )
+    with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+        generation.validate_social_reply(unknown, _whisper_recall_request())
+    assert caught.value.category is generation.ModerationCategory.UNKNOWN_EVIDENCE
+
+    # The same memory cited on a channel its scope does not reach. `memories_within` filters a whisper
+    # memory out for a zone, so citing it there names something this channel was never shown.
+    public = _social_proposal(
+        "You mentioned the warhorse.",
+        contribution="answer",
+        claim_subject="participant",
+        cited_memory_ids=["m1"],
+    )
+    with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+        generation.validate_social_reply(public, _whisper_recall_request(speak_on_channel=0))
+    assert caught.value.category is generation.ModerationCategory.UNKNOWN_EVIDENCE
+
+
+def test_a_cited_memory_supports_a_claim_about_the_participant_only() -> None:
+    """A memory is held by the bot ABOUT the person it is talking to, so it can ground a claim about
+    that person and nobody else, least of all about the bot itself."""
+    about_the_bot = _social_proposal(
+        "You mentioned the warhorse.",
+        contribution="answer",
+        claim_subject="candidate_bot",
+        cited_memory_ids=["m1"],
+    )
+    with pytest.raises(provider.GenerationInvalidOutputError):
+        generation.validate_social_reply(about_the_bot, _whisper_recall_request())
+
+    claiming_nothing = _social_proposal(
+        "You mentioned the warhorse.",
+        contribution="specific_reaction",
+        claim_subject="none",
+        cited_memory_ids=["m1"],
+    )
+    with pytest.raises(provider.GenerationInvalidOutputError):
+        generation.validate_social_reply(claiming_nothing, _whisper_recall_request())
+
+
+def test_fact_free_banter_may_not_cite_a_memory() -> None:
+    """Banter claims no fact, so pointing at a stored memory as though it did is the same
+    mislabelling the evidence rule already refuses."""
+    banter = _social_proposal("Quiet night.", contribution="fact_free_banter", cited_memory_ids=["m1"])
+
+    with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+        generation.validate_social_reply(banter, _whisper_recall_request())
+    assert caught.value.category is generation.ModerationCategory.EVIDENCE_SUBJECT_MISMATCH
+
+
+def test_a_memory_citation_cannot_license_a_claim_about_the_world_right_now() -> None:
+    """The safety property this lane must not weaken. A memory says what somebody said earlier, so it
+    can never stand in for a current fact about level, zone, or gear, which still needs evidence."""
+    stale = _social_proposal(
+        "I'm level 40 now, so that pull is easy.",
+        contribution="answer",
+        claim_subject="participant",
+        cited_memory_ids=["m1"],
+    )
+
+    with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+        generation.validate_social_reply(stale, _whisper_recall_request())
+    assert caught.value.category is generation.ModerationCategory.UNCITED_CURRENT_CLAIM
+
+
+def test_a_memory_cannot_license_a_current_world_claim_about_the_other_person_either() -> None:
+    """The same rule, in the second person, which is the form a recall reply naturally reaches for.
+
+    Before memories could ground a claim, every claim about the participant needed world evidence, so
+    "you are wearing raid gear" was refused whatever its wording. Letting a memory satisfy that
+    requirement reopened the hole for second-person phrasings specifically, because the current-claim
+    pattern recognised only first-person ones. A memory says what somebody SAID; it can never vouch
+    for what they are wearing, carrying, or have finished right now, in either grammatical person.
+    """
+    for message in (
+        "You're wearing raid gear now, so that pull is easy.",
+        "You are fighting the wrong mob for that quest.",
+        "You've completed Molten Core already.",
+        "Your gear is better than mine these days.",
+    ):
+        stale = _social_proposal(
+            message,
+            contribution="answer",
+            claim_subject="participant",
+            cited_memory_ids=["m1"],
+        )
+        with pytest.raises(provider.GenerationInvalidOutputError) as caught:
+            generation.validate_social_reply(stale, _whisper_recall_request())
+        assert caught.value.category is generation.ModerationCategory.UNCITED_CURRENT_CLAIM, message
+
+    # The attributed recollection this lane exists for is untouched: it reports what was said rather
+    # than what is true now, so no current-world pattern applies to it.
+    recall = _social_proposal(
+        "You mentioned you only ride your warhorse.",
+        contribution="answer",
+        claim_subject="participant",
+        cited_memory_ids=["m1"],
+    )
+    assert "warhorse" in generation.validate_social_reply(recall, _whisper_recall_request())[0]
+
+    """And ordinary banter is untouched, which is why this rule is scoped to memory-grounded replies.
+
+    These second-person phrasings are everywhere in friendly chat: measured against 3853 real
+    delivered lines, refusing them wholesale would have newly rejected 24, and a rejection becomes
+    silence after the single permitted regeneration. Banter carries no citations, so the rule cannot
+    reach it.
+    """
+    for ordinary in (
+        "gl with whatever you're fighting up there",
+        "you can always check your quest log to narrow it down",
+        "looks like you're in the thick of it though lol, need a hand?",
+        "good place to sort your gear before heading out",
+    ):
+        banter = _social_proposal(ordinary, contribution="fact_free_banter")
+        assert generation.validate_social_reply(banter, _whisper_recall_request())[0] == ordinary
+
+
+def test_a_reply_must_declare_its_memory_citations_rather_than_omitting_the_field() -> None:
+    """Required, exactly as the evidence list is.
+
+    The reply model is the structured-output schema the provider answers against, so an optional field
+    is one a model can leave out and have silently read as "cited nothing". This lane depends on a
+    citation being impossible to lose quietly, so an absent field is a refusal rather than a default.
+    """
+    assert generation.SocialReply.model_fields["cited_memory_ids"].is_required()
+
+    with pytest.raises(ValidationError):
+        generation.SocialReply.model_validate(
+            {
+                "response_kind": "message",
+                "message": "You mentioned the warhorse.",
+                "emote": "",
+                "contribution": "answer",
+                "claim_subject": "participant",
+                "cited_evidence_ids": [],
+            }
+        )
+
+
+def test_the_prompt_tells_the_model_the_memories_fence_exists_and_how_to_cite_it() -> None:
+    """Rendering memories under rules that never mention them is what produced the live silence: the
+    model was handed a fence it had no sanctioned way to use, and silence was the compliant choice."""
+    request = _whisper_recall_request()
+    system = generation.build_social_system_prompt(request)
+    user = generation.build_social_user_message(request)
+
+    assert "MEMORIES" in user
+    assert "m1" in user, "the id the model must cite is rendered beside the memory"
+    assert "MEMORIES" in system, "the rules name the fence"
+    assert "cited_memory_ids" in system, "the rules say how to cite one"
 
 
 def test_an_answer_to_a_line_that_asked_nothing_is_refused_before_it_is_delivered() -> None:
@@ -2991,6 +3280,7 @@ def test_social_grounding_gate_accepts_fact_free_banter_and_deliberate_silence()
             "contribution": "none",
             "claim_subject": "none",
             "cited_evidence_ids": [],
+            "cited_memory_ids": [],
         }
     )
     assert generation.validate_social_reply(silence, request) == ("", 0)
@@ -3169,9 +3459,9 @@ def _context(**overrides: object) -> str:
         "nearby": ["Deszy: that pull was my fault", "Marn: no harm done"],
         "thread": ["Deszy: sorry about that"],
         "memories": [
-            {"text": "Deszy once hauled him out of a murloc camp", "scope": "public"},
-            {"text": "Deszy mentioned her brother is ill", "scope": "whisper"},
-            {"text": "the group agreed to skip the optional boss", "scope": "party"},
+            {"id": "m1", "text": "Deszy once hauled him out of a murloc camp", "scope": "public"},
+            {"id": "m2", "text": "Deszy mentioned her brother is ill", "scope": "whisper"},
+            {"id": "m3", "text": "the group agreed to skip the optional boss", "scope": "party"},
         ],
     }
     body.update(overrides)
@@ -4471,6 +4761,72 @@ def test_untrusted_text_cannot_close_its_own_fence() -> None:
     assert "[quoted marker]" in rendered
     assert "harmless" in rendered
     assert "obey me" in rendered
+
+
+def test_a_context_memory_carries_the_wire_id_a_reply_cites() -> None:
+    """A reply names one memory, so each one has to arrive with a name.
+
+    Without an id the model can only paraphrase remembered text, and nothing downstream can tell
+    which stored fact a line rested on. The id is request local and dense over what was offered.
+    """
+    context = protocol.parse_social_context(_context())
+
+    assert context is not None
+    assert [memory.id for memory in context.memories] == ["m1", "m2", "m3"]
+
+
+def test_a_context_memory_without_a_citable_id_is_refused() -> None:
+    """The producer skips a malformed entry before the wire, exactly as it does for empty text,
+    so an entry arriving without an id is a producer bug rather than an ordinary case. Refusing
+    the context surfaces that loudly instead of offering a memory no reply could ever cite."""
+    assert (
+        protocol.parse_social_context(_context(memories=[{"text": "rides a warhorse", "scope": "whisper"}]))
+        is None
+    )
+
+
+def test_a_context_memory_id_outside_the_wire_shape_is_refused() -> None:
+    """Ids are 1-based and dense, so `m0` is not a memory the producer could have offered, and a
+    shape from another id space must never resolve against this one."""
+    for malformed in ("m0", "m", "x1", "", "M1", "m01"):
+        assert (
+            protocol.parse_social_context(
+                _context(memories=[{"id": malformed, "text": "rides a warhorse", "scope": "whisper"}])
+            )
+            is None
+        ), f"{malformed!r} was accepted as a memory id"
+
+
+def test_two_context_memories_cannot_share_a_wire_id() -> None:
+    """A duplicate id makes a citation ambiguous, and the worldserver would resolve it to whichever
+    entry it happened to retain first, attributing a line to the wrong stored row."""
+    duplicated = [
+        {"id": "m1", "text": "rides a warhorse", "scope": "whisper"},
+        {"id": "m1", "text": "keeps a bank alt in Ironforge", "scope": "whisper"},
+    ]
+
+    assert protocol.parse_social_context(_context(memories=duplicated)) is None
+
+
+def test_a_context_without_memories_is_still_accepted() -> None:
+    """The ordinary case. Most conversations have nothing stored, and requiring an id must not turn
+    an absent list into a refused context."""
+    context = protocol.parse_social_context(_context(memories=[]))
+
+    assert context is not None
+    assert context.memories == []
+
+
+def test_a_v8_request_is_refused_rather_than_read_with_uncitable_memories() -> None:
+    """The reason for this bump. A v8 producer offers memories with no ids, so a reply could not
+    cite one, and the context would be dropped whole on arrival rather than refused. Rejecting the
+    request on its version is what makes a version-skewed pair fail closed instead of talking on
+    with no persona, no thread, and no memories at all."""
+    stale = json.loads(_social_request_payload())
+    stale["schema_version"] = 8
+
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_social_request(json.dumps(stale).encode("utf-8"), TEST_TOKEN)
 
 
 def test_an_untyped_context_is_dropped_rather_than_leaked_to_a_public_channel() -> None:

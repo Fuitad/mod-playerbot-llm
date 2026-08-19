@@ -1353,15 +1353,24 @@ std::optional<std::string> PlayerbotLLM::EncodeSocialContext(PlayerbotSocialRequ
         std::size_t writtenMemories = 0;
         for (PlayerbotSocialContextMemory const& memory : context.memories)
         {
-            // Bounded here too, for the reason the string lists are: the far side drops the whole
-            // context over a list one entry too long, and this is the last place to catch it.
-            if (memory.text.empty() || writtenMemories >= MAX_SOCIAL_CONTEXT_ENTRIES)
+            /*
+             * Bounded here too, for the reason the string lists are: the far side drops the whole
+             * context over a list one entry too long, and this is the last place to catch it.
+             *
+             * An entry with no id is skipped on the same principle. The far side requires the id and
+             * refuses the whole context when one is missing, so letting a nameless entry through
+             * would cost the persona and the thread as well. A memory no reply could cite is worth
+             * less than the rest of the context it would take down with it.
+             */
+            if (memory.text.empty() || memory.id.empty() || writtenMemories >= MAX_SOCIAL_CONTEXT_ENTRIES)
                 continue;
 
             if (!firstMemory)
                 lists += ',';
 
-            lists += "{\"text\":";
+            lists += "{\"id\":";
+            AppendEscapedJsonString(lists, memory.id);
+            lists += ",\"text\":";
             AppendEscapedJsonString(
                 lists, memory.text.substr(0, Utf8PrefixLength(memory.text, MAX_SOCIAL_CONTEXT_ENTRY_BYTES)));
             lists += ",\"scope\":\"";
@@ -1705,10 +1714,11 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     auto const contributionIt = fields->find("contribution");
     auto const claimSubjectIt = fields->find("claim_subject");
     auto const citationCountIt = fields->find("citation_count");
+    auto const memoryCitationCountIt = fields->find("memory_citation_count");
     if (modelIt == fields->end() || latencyIt == fields->end() || inputIt == fields->end() ||
         outputIt == fields->end() || cacheCreationIt == fields->end() || cacheReadIt == fields->end() ||
         costIt == fields->end() || contributionIt == fields->end() || claimSubjectIt == fields->end() ||
-        citationCountIt == fields->end())
+        citationCountIt == fields->end() || memoryCitationCountIt == fields->end())
         return std::nullopt;
 
     if (!modelIt->second.isString || modelIt->second.text.empty() ||
@@ -1722,9 +1732,15 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     if (!costIt->second.isString || !FixedMicrodollarUsdIsValid(costIt->second.text))
         return std::nullopt;
 
+    /*
+     * The field count is exact, which is how an unknown key is refused, so both citation counts are
+     * part of it. A memory citation list is bounded by the number of memories a request may offer at
+     * all: a reply cannot have drawn on more than it was shown.
+     */
     if (!contributionIt->second.isString || !claimSubjectIt->second.isString || citationCountIt->second.isString ||
-        citationCountIt->second.number > MAX_SOCIAL_EVIDENCE_ENTRIES ||
-        fields->size() != 19 + citationCountIt->second.number)
+        memoryCitationCountIt->second.isString || citationCountIt->second.number > MAX_SOCIAL_EVIDENCE_ENTRIES ||
+        memoryCitationCountIt->second.number > MAX_SOCIAL_CONTEXT_ENTRIES ||
+        fields->size() != 20 + citationCountIt->second.number + memoryCitationCountIt->second.number)
         return std::nullopt;
 
     std::optional<PlayerbotSocialContributionFunction> const contribution =
@@ -1748,6 +1764,27 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
             return std::nullopt;
 
         response.citedEvidenceIds.push_back(citation->second.text);
+    }
+
+    /*
+     * The memory citations, read the same way and kept in their own list.
+     *
+     * The count is required exactly as the evidence one is. Reading a missing field as zero would let
+     * a sidecar that forgot to declare it deliver claims whose memory citations silently disappeared,
+     * and the whole point of a citation is that it cannot go missing unnoticed.
+     */
+    for (uint64 index = 0; index < memoryCitationCountIt->second.number; ++index)
+    {
+        auto const citation = fields->find("memory_citation_" + std::to_string(index));
+        if (citation == fields->end() || !citation->second.isString || citation->second.text.size() < 2 ||
+            citation->second.text.front() != 'm' || citation->second.text[1] == '0' ||
+            !std::all_of(citation->second.text.begin() + 1, citation->second.text.end(),
+                         [](char character) { return character >= '0' && character <= '9'; }) ||
+            std::find(response.citedMemoryIds.begin(), response.citedMemoryIds.end(), citation->second.text) !=
+                response.citedMemoryIds.end())
+            return std::nullopt;
+
+        response.citedMemoryIds.push_back(citation->second.text);
     }
 
     response.callMetadata = PlayerbotSocialCallMetadata{
@@ -1779,7 +1816,8 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
             return std::nullopt;
 
         if (response.contribution != PlayerbotSocialContributionFunction::Gesture ||
-            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty())
+            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty() ||
+            !response.citedMemoryIds.empty())
             return std::nullopt;
 
         return response;
@@ -1792,15 +1830,24 @@ std::optional<PlayerbotLLM::SocialResponse> PlayerbotLLM::ParseSocialResponsePay
     if (response.message.empty())
     {
         if (response.contribution != PlayerbotSocialContributionFunction::None ||
-            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty())
+            response.claimSubject != PlayerbotSocialClaimSubject::None || !response.citedEvidenceIds.empty() ||
+            !response.citedMemoryIds.empty())
             return std::nullopt;
         return response;
     }
 
+    /*
+     * A claim rests on something cited, and something cited accompanies a claim. Either list
+     * satisfies it: evidence for what the world is now, a memory for what this person said earlier.
+     *
+     * Whether a MEMORY is enough for the particular claim being made is not decided here. This is
+     * the transport, and it only refuses a frame that is incoherent on its own terms; the delivery
+     * gate holds the rules about subjects, scopes, and which memories this request actually offered.
+     */
+    bool const citesSomething = !response.citedEvidenceIds.empty() || !response.citedMemoryIds.empty();
     if (response.contribution == PlayerbotSocialContributionFunction::Gesture ||
         response.contribution == PlayerbotSocialContributionFunction::None ||
-        (response.claimSubject == PlayerbotSocialClaimSubject::None && !response.citedEvidenceIds.empty()) ||
-        (response.claimSubject != PlayerbotSocialClaimSubject::None && response.citedEvidenceIds.empty()))
+        (response.claimSubject == PlayerbotSocialClaimSubject::None) == citesSomething)
         return std::nullopt;
 
     return response;
