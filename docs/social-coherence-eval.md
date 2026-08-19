@@ -8,12 +8,13 @@ deployment.
 
 ## Deployment pairing (read this first)
 
-This change moves the social wire protocol from schema 7 to schema 8. The worldserver and the
-Python sidecar are two separate processes, and the sidecar refuses any request whose schema
-version it does not recognise.
+The social wire protocol is at schema 9 (it moved 7 to 8 for the addressee signals, then 8 to 9
+so every offered memory carries the id a reply cites it by). The worldserver and the Python
+sidecar are two separate processes, and the sidecar refuses any request whose schema version it
+does not recognise.
 
 **Both processes must be restarted from the same `mod-playerbots-llm` revision.** A worldserver
-only redeploy leaves a running v7 sidecar refusing every v8 request. The failure is silent from
+only redeploy leaves a running v8 sidecar refusing every v9 request. The failure is silent from
 a player's point of view: the entire social feature goes quiet, and the only trace is
 `provider_failed` telemetry.
 
