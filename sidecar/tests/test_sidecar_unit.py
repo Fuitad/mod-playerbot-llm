@@ -2313,28 +2313,39 @@ def test_every_social_response_declares_its_memory_citation_count() -> None:
     """The worldserver requires the field and counts the frame's keys exactly, so an omitted count is
     a refused frame rather than an implied zero. Every ordinary shape therefore declares it, which is
     what keeps a change aimed at recall from silencing the traffic that has nothing to recall."""
+
+    def encode(
+        message: str,
+        contribution: str,
+        claim_subject: str,
+        *,
+        channel: int = 3,
+        emote_id: int = 0,
+        cited_evidence_ids: tuple[str, ...] = (),
+    ) -> bytes:
+        return protocol.encode_social_response(
+            77,
+            500,
+            channel,
+            message,
+            TEST_TOKEN,
+            emote_id=emote_id,
+            metadata=_social_call_metadata(),
+            contribution=contribution,
+            claim_subject=claim_subject,
+            cited_evidence_ids=cited_evidence_ids,
+        )
+
     ordinary = (
-        {
-            "message": "Aye.",
-            "contribution": "answer",
-            "claim_subject": "participant",
-            "cited_evidence_ids": ("g1",),
-        },
-        {"message": "Quiet night.", "contribution": "fact_free_banter", "claim_subject": "none"},
-        # A gesture is only visible on the channels that carry one, so this shape names its own.
-        {"message": "", "emote_id": 78, "contribution": "gesture", "claim_subject": "none", "channel": 2},
-        {"message": "", "contribution": "none", "claim_subject": "none"},
+        ("answer", encode("Aye.", "answer", "participant", cited_evidence_ids=("g1",))),
+        ("fact_free_banter", encode("Quiet night.", "fact_free_banter", "none")),
+        ("gesture", encode("", "gesture", "none", channel=2, emote_id=78)),
+        ("none", encode("", "none", "none")),
     )
 
-    for shape in ordinary:
-        fields = dict(shape)
-        channel = fields.pop("channel", 3)
-        encoded = json.loads(
-            protocol.encode_social_response(
-                77, 500, channel, token=TEST_TOKEN, metadata=_social_call_metadata(), **fields
-            )
-        )
-        assert encoded["memory_citation_count"] == 0, shape["contribution"]
+    for contribution, response in ordinary:
+        encoded = json.loads(response)
+        assert encoded["memory_citation_count"] == 0, contribution
 
 
 def test_social_response_memory_citations_are_bounded_unique_and_well_formed() -> None:
@@ -2356,17 +2367,27 @@ def test_social_response_memory_citations_are_bounded_unique_and_well_formed() -
 def test_a_gesture_or_a_silence_cites_no_memory() -> None:
     """Same rule the evidence list already has. Neither shape makes a claim, so neither may point at
     a stored memory as if it had."""
-    for kind, emote, contribution in (("emote", "wave", "gesture"), ("silence", "", "none")):
-        with pytest.raises(ValidationError):
-            generation.SocialReply(
-                response_kind=kind,
-                message="",
-                emote=emote,
-                contribution=contribution,
-                claim_subject="none",
-                cited_evidence_ids=[],
-                cited_memory_ids=["m1"],
-            )
+    with pytest.raises(ValidationError):
+        generation.SocialReply(
+            response_kind="emote",
+            message="",
+            emote="wave",
+            contribution="gesture",
+            claim_subject="none",
+            cited_evidence_ids=[],
+            cited_memory_ids=["m1"],
+        )
+
+    with pytest.raises(ValidationError):
+        generation.SocialReply(
+            response_kind="silence",
+            message="",
+            emote="",
+            contribution="none",
+            claim_subject="none",
+            cited_evidence_ids=[],
+            cited_memory_ids=["m1"],
+        )
 
 
 def test_a_regeneration_carries_no_message() -> None:
